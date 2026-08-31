@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: talentflow-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - { key: PYTHON_VERSION, value: 3.12.7 }
+      - { key: DATABASE_URL, sync: false }
+      - { key: SUPABASE_URL, sync: false }
+      - { key: AUTH_REQUIRED, value: "true" }
+      - { key: AUTO_SEED, value: "false" }
+      - { key: CORS_ORIGINS, sync: false }
+      - { key: OPENROUTER_API_KEY, sync: false }
+      - { key: OPENROUTER_MODEL, value: minimax/minimax-m3:free }
+  - type: web
+    name: talentflow-frontend
+    runtime: node
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - { key: NODE_VERSION, value: 20.19.5 }
+      - { key: NEXT_PUBLIC_API_URL, sync: false }
+      - { key: NEXT_PUBLIC_SUPABASE_URL, sync: false }
+      - { key: NEXT_PUBLIC_SUPABASE_ANON_KEY, sync: false }

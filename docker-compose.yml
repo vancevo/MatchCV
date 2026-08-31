@@ -1,0 +1,48 @@
+services:
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on: [backend]
+
+  backend:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql://recruitment:recruitment@postgres:5432/recruitment
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    build: ./backend
+    command: python -c "from app.main import seed; seed(); print('Demo worker ready')"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [redis, postgres]
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: recruitment
+      POSTGRES_USER: recruitment
+      POSTGRES_PASSWORD: recruitment
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recruitment"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    volumes: [redis_data:/data]
+
+volumes:
+  postgres_data:
+  redis_data:
+

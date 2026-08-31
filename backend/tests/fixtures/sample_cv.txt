@@ -1,0 +1,3 @@
+Demo Candidate — Backend Engineer
+4 năm kinh nghiệm phát triển Python và FastAPI.
+Thiết kế REST API với PostgreSQL, Docker và Redis.
