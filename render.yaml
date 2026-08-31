@@ -2,6 +2,7 @@ services:
   - type: web
     name: talentflow-backend
     runtime: python
+    plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -18,6 +19,7 @@ services:
   - type: web
     name: talentflow-frontend
     runtime: node
+    plan: free
     rootDir: frontend
     buildCommand: npm ci && npm run build
     startCommand: npm start
