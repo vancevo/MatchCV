@@ -5,7 +5,11 @@ import type { Session } from "@supabase/supabase-js";
 import AuthScreen from "./AuthScreen";
 import { accessToken, supabase } from "../lib/supabase";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || (
+  process.env.NODE_ENV === "production"
+    ? "https://talentflow-backend-e5nx.onrender.com"
+    : "http://localhost:8000"
+);
 
 type Evidence = { requirement: string; matched: boolean; evidence: string; confidence: number };
 type Step = { node: string; status: string };
@@ -221,7 +225,7 @@ export default function Home() {
       <header><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
         <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.length}><Icon name="upload"/>Tải CV lên</button></section>
-        {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra API tại cổng 8000.</div>}
+        {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
 
         {(active === "Tổng quan" || active === "Pipeline") && <section className="metrics">
           {[{icon:"briefcase",label:"Việc làm đang mở",value:dashboard.metrics.open_jobs,tone:"purple"},{icon:"users",label:"Tổng ứng viên",value:dashboard.metrics.candidates,tone:"blue"},{icon:"spark",label:"Chờ đánh giá",value:dashboard.metrics.awaiting_review,tone:"amber"},{icon:"calendar",label:"Phỏng vấn đã đặt",value:dashboard.metrics.interviews,tone:"green"}].map(m =>
