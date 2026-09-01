@@ -15,6 +15,7 @@ services:
       - { key: MASTER_EMAIL, sync: false }
       - { key: MASTER_PASSWORD, sync: false }
       - { key: MASTER_FULL_NAME, value: "Master Admin" }
+      - { key: MASTER_SEED_ON_START, value: "true" }
       - { key: AUTH_REQUIRED, value: "true" }
       - { key: AUTO_SEED, value: "false" }
       - { key: CORS_ORIGINS, sync: false }

@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from .auth import current_user_id
 from .database import Base, engine, session_scope
 from .llm import extract_requirements_ai, llm_config, screen_candidate_ai
+from .master_seed import create_master_user, has_master_seed_config
 from .models import Application, AuditLog, Interview, Job, UploadBatch
 from .pipeline import extract_requirements, screen_candidate
 from .resume import candidate_identity, checksum, extract_resume
@@ -255,3 +256,16 @@ def seed(owner_id: str = "00000000-0000-0000-0000-000000000001") -> None:
 
 if os.getenv("AUTO_SEED", "true").lower() in {"1", "true", "yes"}:
     seed()
+
+
+@app.on_event("startup")
+def seed_master_on_startup() -> None:
+    enabled = os.getenv("MASTER_SEED_ON_START", "true").lower() in {"1", "true", "yes"}
+    if not enabled or not has_master_seed_config():
+        return
+    try:
+        user = create_master_user()
+        seed(user["id"])
+        print(f"Master account ready: {user['email']} ({user['id']})")
+    except Exception as exc:
+        print(f"Master account seed skipped: {exc}")
