@@ -18,7 +18,10 @@ from .pipeline import extract_requirements, screen_candidate
 from .resume import candidate_identity, checksum, extract_resume
 
 app = FastAPI(title="TalentFlow AI API", version="0.2.0")
-origins = [v.strip() for v in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if v.strip()]
+default_origins = "http://localhost:3000,https://talentflow-frontend-yifc.onrender.com"
+origins = [v.strip() for v in os.getenv("CORS_ORIGINS", default_origins).split(",") if v.strip()]
+if "https://talentflow-frontend-yifc.onrender.com" not in origins:
+    origins.append("https://talentflow-frontend-yifc.onrender.com")
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 Base.metadata.create_all(bind=engine)
 
