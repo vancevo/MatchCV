@@ -5,8 +5,9 @@ MVP tuyển dụng có pipeline sàng lọc CV giải thích được, human-in-
 ## Tính năng hiện có
 
 - Dashboard recruiter responsive, lấy metrics/ranking/chart trực tiếp từ API.
-- Tạo việc làm và upload CV PDF/DOCX/TXT ngay trên giao diện.
-- Lưu file CV gốc trong `backend/uploads` và cho recruiter mở/tải lại từ hồ sơ ứng viên.
+- Đăng ký/đăng nhập bằng Supabase Auth.
+- Tạo việc làm và upload nhiều CV PDF/DOCX/TXT ngay trên giao diện.
+- Chỉ lưu text đã extract, tên file, kích thước và checksum; không lưu file CV gốc.
 - Pipeline `extract → validate → rule match → semantic match → evidence → score`.
 - Điểm số có trọng số và evidence theo từng yêu cầu.
 - Chi tiết ứng viên, trạng thái pipeline và recruiter review: xem xét, từ chối, mời phỏng vấn, lưu trữ.
@@ -21,6 +22,12 @@ Khi có `OPENROUTER_API_KEY`, backend dùng `minimax/minimax-m3:free` để extr
 Tạo `backend/.env` từ file mẫu và dùng một API key mới (không commit file `.env`):
 
 ```env
+DATABASE_URL=postgresql://...
+SUPABASE_URL=https://...
+SUPABASE_SERVICE_ROLE_KEY=...
+MASTER_EMAIL=admin@example.com
+MASTER_PASSWORD=change-this-password
+MASTER_FULL_NAME=Master Admin
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=minimax/minimax-m3:free
 ```
@@ -65,6 +72,28 @@ cd backend && .venv/bin/pytest -q
 cd frontend && npm run build
 ```
 
+## Seed master account
+
+Script `backend/scripts/seed_master.py` tạo một tài khoản master trong Supabase Auth bằng `SUPABASE_SERVICE_ROLE_KEY`, confirm email cho tài khoản đó, rồi seed job/CV mẫu theo đúng `user.id`.
+
+Chạy local:
+
+```bash
+cd backend
+SUPABASE_URL=https://... \
+SUPABASE_SERVICE_ROLE_KEY=... \
+MASTER_EMAIL=admin@example.com \
+MASTER_PASSWORD=change-this-password \
+DATABASE_URL=postgresql://... \
+.venv/bin/python -m scripts.seed_master
+```
+
+Trên Render, thêm các env trên vào service backend rồi chạy One-Off Job:
+
+```bash
+python -m scripts.seed_master
+```
+
 ## API chính
 
 | Method | Endpoint | Mục đích |
@@ -73,8 +102,7 @@ cd frontend && npm run build
 | `POST` | `/api/jobs` | Tạo JD và extract requirements |
 | `DELETE` | `/api/jobs/{job_id}` | Xoá job nếu không còn candidate active |
 | `POST` | `/api/applications` | Tạo ứng viên và chạy screening |
-| `POST` | `/api/applications/upload` | Upload CV, trích xuất nội dung và chạy screening |
-| `GET` | `/api/applications/{id}/resume` | Mở hoặc tải file CV gốc đã lưu |
+| `POST` | `/api/application-batches` | Upload nhiều CV, trích xuất text và chạy screening |
 | `POST` | `/api/applications/{id}/review` | Human review |
 | `GET` | `/api/interviewers/{id}/available-slots` | Lấy lịch trống |
 | `POST` | `/api/applications/{id}/interview` | Đặt lịch có conflict check |
