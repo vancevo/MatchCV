@@ -1,0 +1,31 @@
+[
+  {
+    "id": "backend-python",
+    "job_description": "Yêu cầu Python, FastAPI, PostgreSQL. Ít nhất 2 năm kinh nghiệm. Ưu tiên Docker, Redis.",
+    "expected_requirements": {
+      "required_skills": ["Python", "FastAPI", "PostgreSQL"],
+      "preferred_skills": ["Docker", "Redis"],
+      "minimum_experience": 2
+    },
+    "candidates": [
+      {"id": "strong", "resume_text": "4 năm Python. Xây dựng REST API bằng FastAPI và PostgreSQL. Triển khai Docker, Redis."},
+      {"id": "partial", "resume_text": "2 năm lập trình Python và xây dựng REST API."},
+      {"id": "weak", "resume_text": "1 năm hỗ trợ nội dung và chăm sóc khách hàng."}
+    ],
+    "expected_top_candidate": "strong"
+  },
+  {
+    "id": "frontend-typescript",
+    "job_description": "Yêu cầu React, TypeScript. Ít nhất 3 năm kinh nghiệm. Ưu tiên AWS.",
+    "expected_requirements": {
+      "required_skills": ["React", "TypeScript"],
+      "preferred_skills": ["AWS"],
+      "minimum_experience": 3
+    },
+    "candidates": [
+      {"id": "partial", "resume_text": "3 năm React và phát triển giao diện web."},
+      {"id": "strong", "resume_text": "5 năm React, TypeScript; triển khai ứng dụng trên AWS."}
+    ],
+    "expected_top_candidate": "strong"
+  }
+]

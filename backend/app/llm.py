@@ -2,27 +2,23 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-from pathlib import Path
 from typing import Any
 
 import httpx
-from dotenv import load_dotenv
 
+from .config import get_settings
 from .pipeline import analyze_evidence, extract_requirements, generate_interview_kit, screen_candidate
 
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "minimax/minimax-m3:free"
 
 
 def llm_config() -> dict[str, Any]:
+    settings = get_settings()
     return {
-        "configured": bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
-        "model": os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL),
+        "configured": bool(settings.openrouter_api_key),
+        "model": settings.openrouter_model,
     }
 
 
@@ -48,11 +44,12 @@ def _json_content(response: httpx.Response) -> dict[str, Any]:
 
 
 async def _complete(system: str, user: str) -> dict[str, Any] | None:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    settings = get_settings()
+    api_key = settings.openrouter_api_key
     if not api_key:
         return None
     payload = {
-        "model": os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL),
+        "model": settings.openrouter_model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": {"type": "json_object"},
         "temperature": 0,
@@ -65,8 +62,8 @@ async def _complete(system: str, user: str) -> dict[str, Any] | None:
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000"),
-                    "X-Title": os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot"),
+                    "HTTP-Referer": settings.openrouter_site_url,
+                    "X-Title": settings.openrouter_app_title,
                 },
                 json=payload,
             )

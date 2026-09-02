@@ -11,22 +11,18 @@ services:
     ports: ["8000:8000"]
     environment:
       DATABASE_URL: postgresql://recruitment:recruitment@postgres:5432/recruitment
-      REDIS_URL: redis://redis:6379/0
+      APP_ENV: ${APP_ENV:-local}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-minimax/minimax-m3:free}
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      AUTO_SEED: ${AUTO_SEED:-true}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_started
-
-  worker:
-    build: ./backend
-    command: python -c "from app.main import seed; seed(); print('Demo worker ready')"
-    environment:
-      REDIS_URL: redis://redis:6379/0
-    depends_on: [redis, postgres]
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: postgres:16-alpine
     environment:
       POSTGRES_DB: recruitment
       POSTGRES_USER: recruitment
@@ -38,11 +34,5 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    volumes: [redis_data:/data]
-
 volumes:
   postgres_data:
-  redis_data:
-

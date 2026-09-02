@@ -1,29 +1,66 @@
 from __future__ import annotations
 
-import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from .auth import current_user_id
-from .database import Base, engine, session_scope
+from .config import get_settings
+from .database import session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
 from .master_seed import create_master_user, has_master_seed_config
 from .models import Application, AuditLog, Interview, Job, UploadBatch
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
 from .resume import candidate_identity, checksum, extract_resume
+from .statuses import ApplicationStatus, BatchStatus, InterviewStatus, JobStatus, ReviewDecision
 
-app = FastAPI(title="TalentFlow AI API", version="0.2.0")
-default_origins = "http://localhost:3000,https://talentflow-frontend-yifc.onrender.com"
-origins = [v.strip() for v in os.getenv("CORS_ORIGINS", default_origins).split(",") if v.strip()]
-if "https://talentflow-frontend-yifc.onrender.com" not in origins:
-    origins.append("https://talentflow-frontend-yifc.onrender.com")
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-Base.metadata.create_all(bind=engine)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if settings.auto_seed:
+        seed()
+    if settings.master_seed_on_start and has_master_seed_config():
+        try:
+            user = create_master_user()
+            seed(user["id"])
+            print(f"Master account ready: {user['email']} ({user['id']})")
+        except Exception as exc:
+            print(f"Master account seed skipped: {exc}")
+    yield
+
+
+settings = get_settings()
+app = FastAPI(title="TalentFlow AI API", version="0.3.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.exception_handler(HTTPException)
+async def http_error(_: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "error": {"code": f"HTTP_{exc.status_code}", "message": exc.detail}},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Request validation failed",
+            "error": {"code": "VALIDATION_ERROR", "message": "Request validation failed", "issues": jsonable_encoder(exc.errors())},
+        },
+    )
 
 SAMPLE_JD = """Tuyển Backend Python Developer. Yêu cầu Python, FastAPI, PostgreSQL và REST API.
 Ít nhất 2 năm kinh nghiệm. Ưu tiên Docker, Redis."""
@@ -65,6 +102,13 @@ class ShortlistApproval(BaseModel):
 
 class BookingCreate(BaseModel):
     slot: datetime
+
+    @field_validator("slot")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("slot must include a timezone")
+        return value.astimezone(timezone.utc)
 
 
 def pipeline(review_status: str = "waiting") -> list[dict]:
@@ -131,8 +175,12 @@ def shortlist_report(job: Job, applications: list[Application]) -> str:
 
 
 def interview_dict(item: Interview) -> dict:
-    return {"id": item.id, "application_id": item.application_id, "start_at": item.start_at.isoformat(),
-            "end_at": item.end_at.isoformat(), "status": item.status, "meeting_url": item.meeting_url}
+    def utc_iso(value: datetime) -> str:
+        normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
+        return normalized.isoformat().replace("+00:00", "Z")
+
+    return {"id": item.id, "application_id": item.application_id, "start_at": utc_iso(item.start_at),
+            "end_at": utc_iso(item.end_at), "status": item.status, "meeting_url": item.meeting_url}
 
 
 def require_job(db, job_id: str, owner_id: str) -> Job:
@@ -165,7 +213,7 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "service": "talentflow-api", "ai": llm_config(),
-            "auth_required": os.getenv("AUTH_REQUIRED", "false").lower() in {"1", "true", "yes"}}
+            "auth_required": get_settings().auth_required, "environment": get_settings().environment}
 
 
 @app.get("/api/dashboard")
@@ -177,15 +225,50 @@ def dashboard(owner_id: str = Depends(current_user_id)) -> dict:
         counts = dict(db.execute(select(Application.job_id, func.count()).where(Application.owner_id == owner_id).group_by(Application.job_id)).all())
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
         return {"metrics": {"open_jobs": len(jobs), "candidates": len(apps),
-                            "awaiting_review": sum(a.status == "WAITING_REVIEW" for a in apps), "interviews": len(interviews)},
+                            "awaiting_review": sum(a.status == ApplicationStatus.WAITING_REVIEW.value for a in apps), "interviews": len(interviews)},
                 "applications": [application_dict(a) for a in ranked], "jobs": [job_dict(j, counts.get(j.id, 0)) for j in jobs],
                 "interviews": [interview_dict(i) for i in interviews]}
 
 
 @app.get("/api/jobs")
-def list_jobs(owner_id: str = Depends(current_user_id)) -> list[dict]:
+def list_jobs(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: JobStatus | None = None,
+    q: str | None = Query(None, max_length=200),
+    owner_id: str = Depends(current_user_id),
+) -> list[dict]:
     with session_scope() as db:
-        return [job_dict(j) for j in db.scalars(select(Job).where(Job.owner_id == owner_id))]
+        statement = select(Job).where(Job.owner_id == owner_id)
+        if status:
+            statement = statement.where(Job.status == status.value)
+        if q and q.strip():
+            pattern = f"%{q.strip()}%"
+            statement = statement.where(or_(Job.title.ilike(pattern), Job.department.ilike(pattern), Job.location.ilike(pattern)))
+        statement = statement.order_by(Job.created_at.desc()).offset(offset).limit(limit)
+        return [job_dict(j) for j in db.scalars(statement)]
+
+
+@app.get("/api/applications")
+def list_applications(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: ApplicationStatus | None = None,
+    job_id: str | None = None,
+    q: str | None = Query(None, max_length=200),
+    owner_id: str = Depends(current_user_id),
+) -> list[dict]:
+    with session_scope() as db:
+        statement = select(Application).where(Application.owner_id == owner_id)
+        if status:
+            statement = statement.where(Application.status == status.value)
+        if job_id:
+            statement = statement.where(Application.job_id == job_id)
+        if q and q.strip():
+            pattern = f"%{q.strip()}%"
+            statement = statement.where(or_(Application.candidate_name.ilike(pattern), Application.candidate_email.ilike(pattern)))
+        statement = statement.order_by(Application.created_at.desc()).offset(offset).limit(limit)
+        return [application_dict(item) for item in db.scalars(statement)]
 
 
 @app.post("/api/jobs", status_code=201)
@@ -262,8 +345,8 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
         if missing:
             raise HTTPException(422, "Shortlist contains applications outside this job")
         for item in apps:
-            if item.id in selected and item.status == "WAITING_REVIEW":
-                item.status = "SHORTLISTED"
+            if item.id in selected and item.status == ApplicationStatus.WAITING_REVIEW.value:
+                item.status = ApplicationStatus.SHORTLISTED.value
         job.requirements = {
             **(job.requirements or {}),
             "shortlist_approval": {
@@ -283,7 +366,7 @@ def delete_job(job_id: str, owner_id: str = Depends(current_user_id)) -> dict:
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         linked = list(db.scalars(select(Application).where(Application.job_id == job_id, Application.owner_id == owner_id)))
-        if any(a.status not in {"REJECTED", "ARCHIVED"} for a in linked):
+        if any(a.status not in {ApplicationStatus.REJECTED.value, ApplicationStatus.ARCHIVED.value} for a in linked):
             raise HTTPException(409, "Only jobs with no candidates or rejected/archived candidates can be deleted")
         db.delete(job)
         return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked)}
@@ -331,7 +414,8 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                 batch.failed += 1; results.append({"filename": file.filename, "status": "FAILED", "error": exc.detail})
             except Exception:
                 batch.failed += 1; results.append({"filename": file.filename, "status": "FAILED", "error": "Không thể xử lý CV"})
-        batch.status = "COMPLETED" if not batch.failed else "PARTIAL" if batch.completed else "FAILED"
+        batch.status = (BatchStatus.COMPLETED.value if not batch.failed else
+                        BatchStatus.PARTIAL.value if batch.completed else BatchStatus.FAILED.value)
         return {"batch_id": batch.id, "status": batch.status, "total": batch.total, "completed": batch.completed,
                 "failed": batch.failed, "items": results}
 
@@ -349,7 +433,12 @@ def get_batch(batch_id: str, owner_id: str = Depends(current_user_id)) -> dict:
 
 @app.post("/api/applications/{application_id}/review")
 def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(current_user_id)) -> dict:
-    statuses = {"INTERVIEW": "INTERVIEW_PENDING", "MANUAL_REVIEW": "REVIEWED", "REJECT": "REJECTED", "ARCHIVE": "ARCHIVED"}
+    statuses = {
+        ReviewDecision.INTERVIEW.value: ApplicationStatus.INTERVIEW_PENDING.value,
+        ReviewDecision.MANUAL_REVIEW.value: ApplicationStatus.REVIEWED.value,
+        ReviewDecision.REJECT.value: ApplicationStatus.REJECTED.value,
+        ReviewDecision.ARCHIVE.value: ApplicationStatus.ARCHIVED.value,
+    }
     decision = payload.decision.upper()
     if decision not in statuses:
         raise HTTPException(422, "Unsupported decision")
@@ -378,19 +467,37 @@ def book_interview(application_id: str, payload: BookingCreate, owner_id: str = 
             raise HTTPException(409, "Slot is no longer available")
         interview_id = str(uuid4())
         value = Interview(id=interview_id, owner_id=owner_id, application_id=item.id, start_at=payload.slot,
-                          end_at=payload.slot + timedelta(hours=1), status="SCHEDULED",
+                          end_at=payload.slot + timedelta(hours=1), status=InterviewStatus.SCHEDULED.value,
                           meeting_url=f"https://meet.example/{interview_id[:8]}")
-        db.add(value); item.status = "INTERVIEW_SCHEDULED"
+        db.add(value); item.status = ApplicationStatus.INTERVIEW_SCHEDULED.value
         audit(db, owner_id, item.id, "INTERVIEW_SCHEDULED", {"interview_id": interview_id})
+        try:
+            db.flush()
+        except IntegrityError:
+            raise HTTPException(409, "Slot is no longer available") from None
         return interview_dict(value)
 
 
 @app.get("/api/audit-logs")
-def logs(owner_id: str = Depends(current_user_id)) -> list[dict]:
+def logs(
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    action: str | None = Query(None, max_length=80),
+    application_id: str | None = None,
+    owner_id: str = Depends(current_user_id),
+) -> list[dict]:
     with session_scope() as db:
-        values = db.scalars(select(AuditLog).where(AuditLog.owner_id == owner_id).order_by(AuditLog.created_at.desc()))
+        statement = select(AuditLog).where(AuditLog.owner_id == owner_id)
+        if action:
+            statement = statement.where(AuditLog.action == action)
+        if application_id:
+            statement = statement.where(AuditLog.application_id == application_id)
+        statement = statement.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
+        values = db.scalars(statement)
         return [{"id": v.id, "application_id": v.application_id, "action": v.action,
-                 "metadata": v.metadata_json, "created_at": v.created_at.isoformat()} for v in values]
+                 "metadata": v.metadata_json,
+                 "created_at": v.created_at.replace(tzinfo=v.created_at.tzinfo or timezone.utc).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
+                for v in values]
 
 
 def seed(owner_id: str = "00000000-0000-0000-0000-000000000001") -> None:
@@ -406,20 +513,3 @@ def seed(owner_id: str = "00000000-0000-0000-0000-000000000001") -> None:
         db.add(Application(id="app-001", owner_id=owner_id, job_id=job.id, candidate_name="Nguyễn Minh Anh",
                            candidate_email="minhanh@example.com", resume_text=SAMPLE_CV,
                            screening=screening, pipeline=pipeline()))
-
-
-if os.getenv("AUTO_SEED", "true").lower() in {"1", "true", "yes"}:
-    seed()
-
-
-@app.on_event("startup")
-def seed_master_on_startup() -> None:
-    enabled = os.getenv("MASTER_SEED_ON_START", "true").lower() in {"1", "true", "yes"}
-    if not enabled or not has_master_seed_config():
-        return
-    try:
-        user = create_master_user()
-        seed(user["id"])
-        print(f"Master account ready: {user['email']} ({user['id']})")
-    except Exception as exc:
-        print(f"Master account seed skipped: {exc}")

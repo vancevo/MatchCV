@@ -9,18 +9,18 @@ from docx import Document
 from fastapi import HTTPException, UploadFile
 from pypdf import PdfReader
 
+from .config import get_settings
+
 
 ALLOWED_SUFFIXES = {".pdf", ".docx", ".txt"}
-MAX_FILE_SIZE = 10 * 1024 * 1024
-
-
 async def extract_resume(file: UploadFile) -> tuple[bytes, str]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
         raise HTTPException(415, f"{file.filename}: chỉ hỗ trợ PDF, DOCX và TXT")
     content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, f"{file.filename}: file vượt quá 10 MB")
+    max_file_size = get_settings().max_upload_mb * 1024 * 1024
+    if len(content) > max_file_size:
+        raise HTTPException(413, f"{file.filename}: file vượt quá {get_settings().max_upload_mb} MB")
     try:
         if suffix == ".pdf":
             text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(content)).pages)

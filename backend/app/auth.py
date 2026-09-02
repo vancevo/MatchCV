@@ -1,22 +1,23 @@
 from __future__ import annotations
 
-import os
-
 import jwt
 from fastapi import Header, HTTPException
+
+from .config import get_settings
 
 
 DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 
 def current_user_id(authorization: str | None = Header(default=None)) -> str:
-    if os.getenv("AUTH_REQUIRED", "false").lower() not in {"1", "true", "yes"}:
+    settings = get_settings()
+    if not settings.auth_required:
         return DEV_USER_ID
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Authentication required")
     token = authorization.removeprefix("Bearer ").strip()
-    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
+    supabase_url = settings.supabase_url
+    jwt_secret = settings.supabase_jwt_secret
     try:
         if jwt_secret:
             payload = jwt.decode(token, jwt_secret, algorithms=["HS256"], audience="authenticated")

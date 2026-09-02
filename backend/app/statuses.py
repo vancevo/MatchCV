@@ -1,0 +1,37 @@
+from enum import Enum
+
+
+class JobStatus(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    ARCHIVED = "ARCHIVED"
+
+
+class BatchStatus(str, Enum):
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+
+
+class ApplicationStatus(str, Enum):
+    WAITING_REVIEW = "WAITING_REVIEW"
+    SHORTLISTED = "SHORTLISTED"
+    REVIEWED = "REVIEWED"
+    REJECTED = "REJECTED"
+    ARCHIVED = "ARCHIVED"
+    INTERVIEW_PENDING = "INTERVIEW_PENDING"
+    INTERVIEW_SCHEDULED = "INTERVIEW_SCHEDULED"
+
+
+class InterviewStatus(str, Enum):
+    SCHEDULED = "SCHEDULED"
+    CANCELLED = "CANCELLED"
+    COMPLETED = "COMPLETED"
+
+
+class ReviewDecision(str, Enum):
+    INTERVIEW = "INTERVIEW"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+    REJECT = "REJECT"
+    ARCHIVE = "ARCHIVE"

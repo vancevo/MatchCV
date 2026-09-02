@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from .config import get_settings
+
 
 def database_url() -> str:
-    configured = os.getenv("DATABASE_URL", "").strip()
+    configured = get_settings().database_url
     if configured.startswith("postgres://"):
         configured = configured.replace("postgres://", "postgresql+psycopg://", 1)
     elif configured.startswith("postgresql://"):
