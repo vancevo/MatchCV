@@ -37,6 +37,7 @@ type Dashboard = {
 };
 type ReviewDecision = "MANUAL_REVIEW" | "REJECT" | "INTERVIEW" | "ARCHIVE";
 type ProgressState = { value: number; label: string; detail: string };
+type PendingAction = { key: string; label: string };
 
 const emptyDashboard: Dashboard = {
   metrics: { open_jobs: 0, candidates: 0, awaiting_review: 0, interviews: 0 },
@@ -114,8 +115,17 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<ProgressState | null>(null);
   const [jobProgress, setJobProgress] = useState<ProgressState | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 3000); };
+  const actionBusy = submitting || Boolean(pendingAction);
+  const runAction = async (key: string, label: string, task: () => Promise<void>) => {
+    if (actionBusy) return;
+    setPendingAction({ key, label });
+    try { await task(); }
+    catch (err) { notify(err instanceof Error ? err.message : "Thao tác thất bại"); }
+    finally { setPendingAction(null); }
+  };
   const loadDashboard = async () => {
     try { setDashboard(await request<Dashboard>("/api/dashboard")); setError(""); }
     catch (err) { setError(err instanceof Error ? err.message : "Không thể tải dữ liệu"); }
@@ -145,7 +155,9 @@ export default function Home() {
   const chartScores = dashboard.applications.slice(0, 7).reverse().map(item => item.screening.final_score);
 
   const createJob = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setSubmitting(true);
+    event.preventDefault();
+    if (actionBusy) return;
+    setSubmitting(true);
     const form = new FormData(event.currentTarget);
     setJobProgress({ value: 12, label: "Đang lưu JD", detail: "Gửi mô tả công việc lên backend" });
     const timers = [
@@ -163,7 +175,9 @@ export default function Home() {
   };
 
   const uploadCV = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setSubmitting(true);
+    event.preventDefault();
+    if (actionBusy) return;
+    setSubmitting(true);
     const formData = new FormData(event.currentTarget);
     const files = formData.getAll("files") as File[];
     setUploadProgress({ value: 4, label: "Đang chuẩn bị CV", detail: `${files.length} file được chọn` });
@@ -201,7 +215,12 @@ export default function Home() {
 
   const review = async (decision: ReviewDecision) => {
     if (!current) return;
-    try {
+    await runAction(`review-${decision}-${current.id}`, {
+      INTERVIEW: "Đang chuẩn bị lịch phỏng vấn",
+      MANUAL_REVIEW: "Đang lưu đánh giá",
+      REJECT: "Đang từ chối ứng viên",
+      ARCHIVE: "Đang lưu trữ hồ sơ",
+    }[decision], async () => {
       const note = {
         INTERVIEW: "Mời phỏng vấn từ dashboard",
         MANUAL_REVIEW: "Cần recruiter kiểm tra thêm",
@@ -214,47 +233,54 @@ export default function Home() {
         setSlots(await request("/api/interviewers/recruiter-1/available-slots"));
         setModal("schedule");
       } else { setSelected(null); notify(`Đã cập nhật: ${statusLabel(updated.status)}`); }
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể cập nhật đánh giá"); }
+    });
   };
 
   const approveCriteria = async (jobId: string) => {
-    try {
+    await runAction(`criteria-${jobId}`, "Đang duyệt tiêu chí", async () => {
       await request(`/api/jobs/${jobId}/approve-criteria`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true, note: "Recruiter approved criteria" }) });
       await loadDashboard(); notify("Đã duyệt tiêu chí tuyển dụng");
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể duyệt tiêu chí"); }
+    });
   };
 
   const approveShortlist = async (jobId: string) => {
-    try {
+    await runAction(`shortlist-${jobId}`, "Đang duyệt Top 5", async () => {
       const data = await request<{ items: Application[] }>(`/api/jobs/${jobId}/shortlist?limit=5`);
       const application_ids = data.items.map(item => item.id);
       if (!application_ids.length) { notify("Job này chưa có CV để shortlist"); return; }
       await request(`/api/jobs/${jobId}/approve-shortlist`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ application_ids, note: "Recruiter approved AI top 5 shortlist" }) });
       await loadDashboard(); notify(`Đã duyệt Top ${application_ids.length} ứng viên`);
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể duyệt shortlist"); }
+    });
   };
 
   const exportReport = async (job: Job) => {
-    try {
+    await runAction(`export-${job.id}`, "Đang xuất report", async () => {
       await download(`/api/jobs/${job.id}/shortlist-report`, `${job.title.toLowerCase().replace(/\s+/g, "-")}-shortlist.md`);
       notify("Đã xuất shortlist report");
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể xuất báo cáo"); }
+    });
   };
 
   const deleteJob = async (jobId: string) => {
-    try {
+    await runAction(`delete-${jobId}`, "Đang xoá việc làm", async () => {
       await request(`/api/jobs/${jobId}`, { method: "DELETE" });
       await loadDashboard(); notify("Đã xoá việc làm");
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể xoá việc làm"); }
+    });
   };
 
   const book = async (slot: string) => {
-    if (!current) return; setSubmitting(true);
-    try {
+    if (!current) return;
+    await runAction(`book-${slot}`, "Đang đặt lịch phỏng vấn", async () => {
       await request(`/api/applications/${current.id}/interview`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slot }) });
       setModal(null); setSelected(null); await loadDashboard(); notify(`Đã đặt lịch ${dateLabel(slot)}`);
-    } catch (err) { notify(err instanceof Error ? err.message : "Không thể đặt lịch"); }
-    finally { setSubmitting(false); }
+    });
+  };
+
+  const signOut = async () => {
+    await runAction("signout", "Đang đăng xuất", async () => {
+      if (!supabase) return;
+      const { error } = await supabase.auth.signOut();
+      if (error) throw new Error(error.message);
+    });
   };
 
   if (!authReady) return <main className="auth-page"><div className="auth-card">Đang kiểm tra phiên đăng nhập...</div></main>;
@@ -268,21 +294,23 @@ export default function Home() {
         <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
       </nav>
       <div className="agent-card"><div className="agent-icon"><Icon name="spark"/></div><b>Agent đang hoạt động</b><p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p><div className="agent-progress"><span/></div><small>Dữ liệu đồng bộ từ API</small></div>
-      <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || "Vinh Nguyễn"}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" onClick={() => void supabase?.auth.signOut()}>↪</button></div>
+      <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || "Vinh Nguyễn"}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
     </aside>
 
     <main>
-      <header><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
+      <header><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
-        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.length}><Icon name="upload"/>Tải CV lên</button></section>
+        {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
+        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.length || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
         {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
+        {loading && <DashboardSkeleton/>}
 
         {(active === "Tổng quan" || active === "Pipeline") && <section className="metrics">
           {[{icon:"briefcase",label:"Việc làm đang mở",value:dashboard.metrics.open_jobs,tone:"purple"},{icon:"users",label:"Tổng ứng viên",value:dashboard.metrics.candidates,tone:"blue"},{icon:"spark",label:"Chờ đánh giá",value:dashboard.metrics.awaiting_review,tone:"amber"},{icon:"calendar",label:"Phỏng vấn đã đặt",value:dashboard.metrics.interviews,tone:"green"}].map(m =>
             <article className="metric" key={m.label}><div className={`metric-icon ${m.tone}`}><Icon name={m.icon}/></div><div><p>{m.label}</p><strong>{loading ? "—" : m.value}</strong><span className={`delta ${m.tone}`}>Live</span></div></article>)}
         </section>}
 
-        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} onCreate={() => setModal("job")} onDelete={deleteJob} onApproveCriteria={approveCriteria} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
+        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onApproveCriteria={approveCriteria} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard}/>
         : <><div className="dashboard-grid">
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
@@ -305,28 +333,46 @@ export default function Home() {
       </div>
     </main>
 
-    {current && <CandidateDrawer application={current} scoreClass={scoreClass} onClose={() => setSelected(null)} onReview={review}/>}
+    {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
-    {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p><div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={submitting} onClick={() => void book(slot.start_at)}>{dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
+    {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
 }
 
-function JobsView({ jobs, onCreate, onDelete, onApproveCriteria, onApproveShortlist, onExportReport }: {
+function GlobalActionStatus({ label }: { label: string }) {
+  return <div className="action-status" role="status" aria-live="polite"><span>{label}</span><i/></div>;
+}
+
+function InlineProgress({ label }: { label: string }) {
+  return <div className="inline-progress" role="status" aria-live="polite"><div><b>{label}</b><span>Vui lòng đợi, thao tác đang được xử lý</span></div><i/></div>;
+}
+
+function DashboardSkeleton() {
+  return <section className="skeleton-grid" aria-label="Đang tải dữ liệu">
+    {[0, 1, 2, 3].map(item => <article className="skeleton-card" key={item}><i/><span/><b/></article>)}
+    <article className="skeleton-panel"><span/><span/><span/><span/></article>
+    <article className="skeleton-panel compact-panel"><span/><span/><span/></article>
+  </section>;
+}
+
+function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onApproveCriteria, onApproveShortlist, onExportReport }: {
   jobs: Job[];
+  actionBusy: boolean;
+  pendingAction: PendingAction | null;
   onCreate: () => void;
   onDelete: (jobId: string) => Promise<void>;
   onApproveCriteria: (jobId: string) => Promise<void>;
   onApproveShortlist: (jobId: string) => Promise<void>;
   onExportReport: (job: Job) => Promise<void>;
 }) {
-  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div><button onClick={onCreate}><Icon name="plus"/>Tạo mới</button></div>{jobs.map(job => {
+  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div><button disabled={actionBusy} onClick={onCreate}><Icon name="plus"/>Tạo mới</button></div>{jobs.map(job => {
     const required = job.requirements?.required_skills || [];
     const preferred = job.requirements?.preferred_skills || [];
     const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
     const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
-    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={criteriaApproved} onClick={() => void onApproveCriteria(job.id)}>Duyệt tiêu chí</button><button className="primary compact" disabled={!job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={!job.applications_count} onClick={() => void onExportReport(job)}>Xuất report</button><button className="danger-link" onClick={() => void onDelete(job.id)}>Xoá</button></div></article>;
+    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => void onApproveCriteria(job.id)}>{pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Duyệt tiêu chí"}</button><button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={actionBusy || !job.applications_count} onClick={() => void onExportReport(job)}>{pendingAction?.key === `export-${job.id}` ? "Đang xuất..." : "Xuất report"}</button><button className="danger-link" disabled={actionBusy} onClick={() => void onDelete(job.id)}>{pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}</button></div></article>;
   })}</section>;
 }
 
@@ -334,9 +380,9 @@ function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
   return <section className="panel jobs-view"><div className="panel-head"><div><h2>Lịch phỏng vấn</h2><p>Các lịch đã đặt thành công</p></div></div>{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const person = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{person?.candidate.name || "Ứng viên"}</p></div><a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a><i className="status review">Đã đặt</i></article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Mở hồ sơ ứng viên để mời phỏng vấn.</div>}</section>;
 }
 
-function CandidateDrawer({ application, scoreClass, onClose, onReview }: { application: Application; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
+function CandidateDrawer({ application, actionBusy, pendingAction, scoreClass, onClose, onReview }: { application: Application; actionBusy: boolean; pendingAction: PendingAction | null; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
   const kit = application.screening.interview_kit;
-  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div><h3 className="evidence-title">AI Evidence</h3><div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" onClick={() => void onReview("MANUAL_REVIEW")}>Xem xét</button><button className="danger" onClick={() => void onReview("REJECT")}>Từ chối</button><button className="secondary" onClick={() => void onReview("ARCHIVE")}>Lưu trữ</button><button className="primary" onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>Mời PV</button></div></aside></div>;
+  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3><div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : "Mời PV"}</button></div></aside></div>;
 }
 
 function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {
