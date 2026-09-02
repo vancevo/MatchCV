@@ -13,13 +13,23 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || (
 
 type Evidence = { requirement: string; matched: boolean; evidence: string; confidence: number };
 type Step = { node: string; status: string };
+type InterviewQuestion = { type: string; question: string; signal: string };
+type InterviewKit = {
+  summary: string;
+  questions: InterviewQuestion[];
+  rubric: { criterion: string; weight: number }[];
+  source: string;
+};
 type Application = {
   id: string; job_id: string; status: string; resume_filename?: string;
   candidate: { name: string; email: string };
-  screening: { final_score: number; recommendation: string; evidence: Evidence[]; experience_years: number };
+  screening: { final_score: number; recommendation: string; evidence: Evidence[]; experience_years: number; interview_kit?: InterviewKit };
   pipeline: Step[];
 };
-type Job = { id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number };
+type Job = {
+  id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
+  requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string }; shortlist_approval?: { status: string; application_ids?: string[] } };
+};
 type Interview = { id: string; application_id: string; start_at: string; status: string; meeting_url: string };
 type Dashboard = {
   metrics: { open_jobs: number; candidates: number; awaiting_review: number; interviews: number };
@@ -60,9 +70,25 @@ async function request<T = unknown>(path: string, init?: RequestInit): Promise<T
   return response.json();
 }
 
+async function download(path: string, filename: string) {
+  const token = await accessToken();
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${API_URL}${path}`, { headers });
+  if (!response.ok) throw new Error("Không thể tải báo cáo");
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 const initials = (name: string) => name.split(/\s+/).slice(-2).map(part => part[0]).join("").toUpperCase();
 const statusLabel = (status: string) => ({
   WAITING_REVIEW: "Chờ duyệt",
+  SHORTLISTED: "Shortlist",
   REVIEWED: "Đã xem xét",
   REJECTED: "Đã từ chối",
   ARCHIVED: "Lưu trữ",
@@ -191,6 +217,30 @@ export default function Home() {
     } catch (err) { notify(err instanceof Error ? err.message : "Không thể cập nhật đánh giá"); }
   };
 
+  const approveCriteria = async (jobId: string) => {
+    try {
+      await request(`/api/jobs/${jobId}/approve-criteria`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true, note: "Recruiter approved criteria" }) });
+      await loadDashboard(); notify("Đã duyệt tiêu chí tuyển dụng");
+    } catch (err) { notify(err instanceof Error ? err.message : "Không thể duyệt tiêu chí"); }
+  };
+
+  const approveShortlist = async (jobId: string) => {
+    try {
+      const data = await request<{ items: Application[] }>(`/api/jobs/${jobId}/shortlist?limit=5`);
+      const application_ids = data.items.map(item => item.id);
+      if (!application_ids.length) { notify("Job này chưa có CV để shortlist"); return; }
+      await request(`/api/jobs/${jobId}/approve-shortlist`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ application_ids, note: "Recruiter approved AI top 5 shortlist" }) });
+      await loadDashboard(); notify(`Đã duyệt Top ${application_ids.length} ứng viên`);
+    } catch (err) { notify(err instanceof Error ? err.message : "Không thể duyệt shortlist"); }
+  };
+
+  const exportReport = async (job: Job) => {
+    try {
+      await download(`/api/jobs/${job.id}/shortlist-report`, `${job.title.toLowerCase().replace(/\s+/g, "-")}-shortlist.md`);
+      notify("Đã xuất shortlist report");
+    } catch (err) { notify(err instanceof Error ? err.message : "Không thể xuất báo cáo"); }
+  };
+
   const deleteJob = async (jobId: string) => {
     try {
       await request(`/api/jobs/${jobId}`, { method: "DELETE" });
@@ -232,7 +282,7 @@ export default function Home() {
             <article className="metric" key={m.label}><div className={`metric-icon ${m.tone}`}><Icon name={m.icon}/></div><div><p>{m.label}</p><strong>{loading ? "—" : m.value}</strong><span className={`delta ${m.tone}`}>Live</span></div></article>)}
         </section>}
 
-        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} onCreate={() => setModal("job")} onDelete={deleteJob}/>
+        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} onCreate={() => setModal("job")} onDelete={deleteJob} onApproveCriteria={approveCriteria} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard}/>
         : <><div className="dashboard-grid">
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
@@ -263,8 +313,21 @@ export default function Home() {
   </div>;
 }
 
-function JobsView({ jobs, onCreate, onDelete }: { jobs: Job[]; onCreate: () => void; onDelete: (jobId: string) => Promise<void> }) {
-  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div><button onClick={onCreate}><Icon name="plus"/>Tạo mới</button></div>{jobs.map(job => <article className="job-row" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p></div><span>{job.applications_count} ứng viên</span><i className="status review">{job.status === "OPEN" ? "Đang mở" : job.status}</i><button className="danger-link" onClick={() => void onDelete(job.id)}>Xoá</button></article>)}</section>;
+function JobsView({ jobs, onCreate, onDelete, onApproveCriteria, onApproveShortlist, onExportReport }: {
+  jobs: Job[];
+  onCreate: () => void;
+  onDelete: (jobId: string) => Promise<void>;
+  onApproveCriteria: (jobId: string) => Promise<void>;
+  onApproveShortlist: (jobId: string) => Promise<void>;
+  onExportReport: (job: Job) => Promise<void>;
+}) {
+  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div><button onClick={onCreate}><Icon name="plus"/>Tạo mới</button></div>{jobs.map(job => {
+    const required = job.requirements?.required_skills || [];
+    const preferred = job.requirements?.preferred_skills || [];
+    const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
+    const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
+    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={criteriaApproved} onClick={() => void onApproveCriteria(job.id)}>Duyệt tiêu chí</button><button className="primary compact" disabled={!job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={!job.applications_count} onClick={() => void onExportReport(job)}>Xuất report</button><button className="danger-link" onClick={() => void onDelete(job.id)}>Xoá</button></div></article>;
+  })}</section>;
 }
 
 function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
@@ -272,7 +335,8 @@ function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
 }
 
 function CandidateDrawer({ application, scoreClass, onClose, onReview }: { application: Application; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
-  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div><h3 className="evidence-title">AI Evidence</h3><div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div><h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" onClick={() => void onReview("MANUAL_REVIEW")}>Xem xét</button><button className="danger" onClick={() => void onReview("REJECT")}>Từ chối</button><button className="secondary" onClick={() => void onReview("ARCHIVE")}>Lưu trữ</button><button className="primary" onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>Mời PV</button></div></aside></div>;
+  const kit = application.screening.interview_kit;
+  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div><h3 className="evidence-title">AI Evidence</h3><div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" onClick={() => void onReview("MANUAL_REVIEW")}>Xem xét</button><button className="danger" onClick={() => void onReview("REJECT")}>Từ chối</button><button className="secondary" onClick={() => void onReview("ARCHIVE")}>Lưu trữ</button><button className="primary" onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>Mời PV</button></div></aside></div>;
 }
 
 function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {

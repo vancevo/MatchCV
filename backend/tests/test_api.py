@@ -23,6 +23,11 @@ def test_end_to_end_screen_review_and_schedule():
     assert application.status_code == 201
     body = application.json()
     assert body["screening"]["recommendation"] == "Strong Match"
+    assert body["screening"]["interview_kit"]["questions"]
+
+    kit = client.get(f"/api/applications/{body['id']}/interview-kit")
+    assert kit.status_code == 200
+    assert len(kit.json()["questions"]) >= 5
 
     reviewed = client.post(f"/api/applications/{body['id']}/review", json={"decision": "INTERVIEW", "note": "Good evidence"})
     assert reviewed.status_code == 200
@@ -49,7 +54,51 @@ def test_batch_upload_extracts_all_without_storing_original():
     assert body["failed"] == 0
     assert len(body["items"]) == 2
     assert body["items"][0]["application"]["screening"]["final_score"] >= 80
+    assert body["items"][0]["application"]["screening"]["interview_kit"]["rubric"]
     assert "resume_storage_key" not in body["items"][0]["application"]
+
+
+def test_criteria_and_shortlist_approval():
+    job = client.post("/api/jobs", json={
+        "title": "Shortlist Backend",
+        "description": "Yêu cầu Python, FastAPI, PostgreSQL. Ít nhất 2 năm kinh nghiệm. Ưu tiên Docker.",
+        "department": "Engineering",
+        "location": "Remote",
+    }).json()
+    criteria = client.post(f"/api/jobs/{job['id']}/approve-criteria", json={"approved": True, "note": "Looks right"})
+    assert criteria.status_code == 200
+    assert criteria.json()["requirements"]["approval"]["status"] == "APPROVED"
+
+    first = client.post("/api/applications", json={
+        "job_id": job["id"],
+        "candidate_name": "Strong Shortlist",
+        "candidate_email": "strong@example.com",
+        "resume_text": "4 năm Python FastAPI PostgreSQL REST API Docker.",
+    }).json()
+    client.post("/api/applications", json={
+        "job_id": job["id"],
+        "candidate_name": "Review Shortlist",
+        "candidate_email": "review@example.com",
+        "resume_text": "2 năm Python và REST API.",
+    })
+
+    shortlist = client.get(f"/api/jobs/{job['id']}/shortlist?limit=1")
+    assert shortlist.status_code == 200
+    assert shortlist.json()["items"][0]["id"] == first["id"]
+
+    approved = client.post(f"/api/jobs/{job['id']}/approve-shortlist", json={
+        "application_ids": [first["id"]],
+        "note": "Approve top candidate",
+    })
+    assert approved.status_code == 200
+    assert approved.json()["items"][0]["status"] == "SHORTLISTED"
+
+    report = client.get(f"/api/jobs/{job['id']}/shortlist-report")
+    assert report.status_code == 200
+    assert "text/markdown" in report.headers["content-type"]
+    assert "Strong Shortlist" in report.text
+    assert "Interview questions" in report.text
+    assert "CV verification" in report.text
 
 
 def test_batch_upload_reports_per_file_failure():

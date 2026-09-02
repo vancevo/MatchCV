@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from .pipeline import analyze_evidence, extract_requirements, screen_candidate
+from .pipeline import analyze_evidence, extract_requirements, generate_interview_kit, screen_candidate
 
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -62,7 +62,12 @@ async def _complete(system: str, user: str) -> dict[str, Any] | None:
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
                 OPENROUTER_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000"),
+                    "X-Title": os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot"),
+                },
                 json=payload,
             )
         return _json_content(response)
@@ -174,3 +179,75 @@ If no exact evidence exists, set matched=false and evidence="". Never infer prot
         "screening_source": "openrouter_with_verified_evidence",
         "candidate_profile": _profile(result.get("candidate_profile"), cv_text),
     }
+
+
+def _interview_kit(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return fallback
+    questions = value.get("questions")
+    rubric = value.get("rubric")
+    if not isinstance(questions, list) or not questions:
+        return fallback
+    normalized_questions = []
+    for item in questions[:8]:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "")).strip()
+        if not question:
+            continue
+        normalized_questions.append({
+            "type": str(item.get("type", "Interview")).strip()[:80],
+            "question": question[:500],
+            "signal": str(item.get("signal", "")).strip()[:500],
+        })
+    normalized_rubric = []
+    if isinstance(rubric, list):
+        for item in rubric[:6]:
+            if not isinstance(item, dict):
+                continue
+            criterion = str(item.get("criterion", "")).strip()
+            if not criterion:
+                continue
+            try:
+                weight = int(item.get("weight", 0))
+            except (TypeError, ValueError):
+                weight = 0
+            normalized_rubric.append({"criterion": criterion[:160], "weight": max(0, min(100, weight))})
+    if not normalized_questions:
+        return fallback
+    return {
+        "summary": str(value.get("summary", fallback["summary"])).strip()[:700],
+        "questions": normalized_questions,
+        "rubric": normalized_rubric or fallback["rubric"],
+        "source": "openrouter",
+    }
+
+
+async def generate_interview_kit_ai(
+    cv_text: str,
+    requirements: dict[str, Any],
+    screening: dict[str, Any],
+    job_title: str = "",
+    candidate_name: str = "",
+    candidate_email: str = "",
+) -> dict[str, Any]:
+    fallback = generate_interview_kit(cv_text, requirements, screening, job_title)
+    result = await _complete(
+        """You are a recruiter copilot. Create a structured interview kit from a CV screening result.
+Return JSON only:
+{"summary":"","questions":[{"type":"","question":"","signal":""}],"rubric":[{"criterion":"","weight":0}]}.
+Create 5-7 concise Vietnamese questions. Include CV verification, technical depth, scenario, and gap probing.
+Do not ask about age, gender, marital status, address, religion, ethnicity, health, or other protected traits.""",
+        json.dumps({
+            "job_title": job_title,
+            "requirements": requirements,
+            "screening": {
+                "final_score": screening.get("final_score"),
+                "recommendation": screening.get("recommendation"),
+                "evidence": screening.get("evidence", []),
+                "candidate_profile": screening.get("candidate_profile"),
+            },
+            "cv_text": _redact(cv_text, candidate_name, candidate_email),
+        }, ensure_ascii=False),
+    )
+    return _interview_kit(result, fallback) if result else fallback

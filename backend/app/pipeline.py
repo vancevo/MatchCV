@@ -93,3 +93,61 @@ def screen_candidate(cv_text: str, requirements: dict) -> dict:
         "experience_years": years,
     }
 
+
+def generate_interview_kit(cv_text: str, requirements: dict, screening: dict, job_title: str = "") -> dict:
+    """Create a deterministic interview kit when an LLM is unavailable."""
+    evidence = screening.get("evidence", [])
+    matched = [item["requirement"] for item in evidence if item.get("matched")]
+    missing = [item["requirement"] for item in evidence if not item.get("matched")]
+    focus = matched[:3] or requirements.get("required_skills", [])[:3] or ["kinh nghiệm phù hợp"]
+    gap = missing[0] if missing else ""
+    title = job_title or "vị trí đang tuyển"
+    gap_question = (
+        f"CV chưa thể hiện rõ {gap}. Bạn đã từng dùng hoặc học phần này trong bối cảnh nào?"
+        if gap else
+        "Trong các kỹ năng đã nêu ở CV, phần nào bạn tự tin nhất và phần nào vẫn muốn phát triển thêm?"
+    )
+    gap_signal = (
+        "Ứng viên phân biệt được kinh nghiệm thật, mức độ tự học và khả năng tiếp thu."
+        if gap else
+        "Ứng viên tự đánh giá thực tế, biết điểm mạnh và kế hoạch phát triển tiếp theo."
+    )
+    questions = [
+        {
+            "type": "CV verification",
+            "question": f"Bạn hãy mô tả dự án gần nhất thể hiện rõ kinh nghiệm {focus[0]} cho {title}.",
+            "signal": "Ứng viên nêu được vai trò cá nhân, phạm vi công việc, kết quả và bằng chứng cụ thể.",
+        },
+        {
+            "type": "Technical depth",
+            "question": f"Nếu phải thiết kế một tính năng production dùng {focus[-1]}, bạn sẽ xử lý lỗi, logging và kiểm thử như thế nào?",
+            "signal": "Câu trả lời có trade-off kỹ thuật, cách kiểm chứng và hiểu biết vận hành.",
+        },
+        {
+            "type": "Gap probing",
+            "question": gap_question,
+            "signal": gap_signal,
+        },
+        {
+            "type": "Scenario",
+            "question": "Khi yêu cầu thay đổi sát deadline và có rủi ro ảnh hưởng chất lượng, bạn sẽ trao đổi với team như thế nào?",
+            "signal": "Tư duy ưu tiên, giao tiếp minh bạch và biết bảo vệ chất lượng sản phẩm.",
+        },
+        {
+            "type": "Decision support",
+            "question": "Sau buổi phỏng vấn này, điểm mạnh nào của bạn khiến team nên chọn bạn cho vị trí này?",
+            "signal": "Ứng viên tự liên hệ năng lực với JD, không trả lời chung chung.",
+        },
+    ]
+    return {
+        "summary": f"Bộ câu hỏi tập trung kiểm chứng evidence trong CV và làm rõ các khoảng thiếu so với {title}.",
+        "questions": questions,
+        "rubric": [
+            {"criterion": "Độ khớp với yêu cầu bắt buộc", "weight": 35},
+            {"criterion": "Chiều sâu kinh nghiệm thực tế", "weight": 25},
+            {"criterion": "Tư duy giải quyết vấn đề", "weight": 20},
+            {"criterion": "Giao tiếp và phối hợp", "weight": 10},
+            {"criterion": "Khả năng học phần còn thiếu", "weight": 10},
+        ],
+        "source": "rules",
+    }

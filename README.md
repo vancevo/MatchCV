@@ -10,6 +10,8 @@ MVP tuyển dụng có pipeline sàng lọc CV giải thích được, human-in-
 - Chỉ lưu text đã extract, tên file, kích thước và checksum; không lưu file CV gốc.
 - Pipeline `extract → validate → rule match → semantic match → evidence → score`.
 - Điểm số có trọng số và evidence theo từng yêu cầu.
+- Agent tạo shortlist Top 5 theo từng job và chờ recruiter phê duyệt.
+- Agent sinh bộ câu hỏi phỏng vấn cá nhân hóa cho từng ứng viên.
 - Chi tiết ứng viên, trạng thái pipeline và recruiter review: xem xét, từ chối, mời phỏng vấn, lưu trữ.
 - Chia tab ứng viên theo trạng thái để recruiter dễ theo dõi.
 - Xoá việc làm khi chưa có ứng viên hoặc mọi ứng viên liên quan đã bị từ chối/lưu trữ.
@@ -100,9 +102,14 @@ python -m scripts.seed_master
 |---|---|---|
 | `GET` | `/api/dashboard` | Metrics, jobs và ranking |
 | `POST` | `/api/jobs` | Tạo JD và extract requirements |
+| `POST` | `/api/jobs/{job_id}/approve-criteria` | Recruiter duyệt tiêu chí AI đã extract |
+| `GET` | `/api/jobs/{job_id}/shortlist` | Lấy Top 5 ứng viên theo điểm phù hợp |
+| `POST` | `/api/jobs/{job_id}/approve-shortlist` | Recruiter duyệt shortlist |
+| `GET` | `/api/jobs/{job_id}/shortlist-report` | Xuất shortlist và interview kit dạng Markdown |
 | `DELETE` | `/api/jobs/{job_id}` | Xoá job nếu không còn candidate active |
 | `POST` | `/api/applications` | Tạo ứng viên và chạy screening |
 | `POST` | `/api/application-batches` | Upload nhiều CV, trích xuất text và chạy screening |
+| `GET` | `/api/applications/{id}/interview-kit` | Lấy bộ câu hỏi phỏng vấn cho ứng viên |
 | `POST` | `/api/applications/{id}/review` | Human review |
 | `GET` | `/api/interviewers/{id}/available-slots` | Lấy lịch trống |
 | `POST` | `/api/applications/{id}/interview` | Đặt lịch có conflict check |
