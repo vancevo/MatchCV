@@ -17,8 +17,33 @@ services:
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       AUTO_SEED: ${AUTO_SEED:-true}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_EAGER: "false"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./backend
+    command: rq worker --url redis://redis:6379/0 talentflow-screening
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgresql://recruitment:recruitment@postgres:5432/recruitment
+      APP_ENV: ${APP_ENV:-local}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-minimax/minimax-m3:free}
+      AUTO_SEED: "false"
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_EAGER: "false"
+      TASK_MAX_ATTEMPTS: ${TASK_MAX_ATTEMPTS:-3}
+      TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-120}
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   postgres:
@@ -34,5 +59,16 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   postgres_data:
+  redis_data:

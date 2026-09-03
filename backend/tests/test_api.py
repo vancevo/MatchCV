@@ -48,7 +48,7 @@ def test_batch_upload_extracts_all_without_storing_original():
             ("files", ("tran-thi-b.txt", "Trần Thị B\nb@example.com\n3 năm Python FastAPI PostgreSQL và REST API".encode(), "text/plain")),
         ],
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
     assert body["completed"] == 2
     assert body["failed"] == 0
@@ -110,7 +110,7 @@ def test_batch_upload_reports_per_file_failure():
             ("files", ("bad.exe", b"not accepted", "application/octet-stream")),
         ],
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json()["completed"] == 1
     assert response.json()["failed"] == 1
     assert response.json()["status"] == "PARTIAL"

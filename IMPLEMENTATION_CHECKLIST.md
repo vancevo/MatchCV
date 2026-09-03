@@ -20,12 +20,16 @@ Trạng thái: **Hoàn thành**.
 
 ## Mốc 2 — Phase 1: Async screening
 
-- [ ] Thiết kế `agent_runs`, `agent_steps`, `tasks` và idempotency key.
-- [ ] Bổ sung Redis và worker thật.
-- [ ] Đổi batch upload sang enqueue + trạng thái bất đồng bộ.
-- [ ] Retry/backoff, timeout và dead-letter queue.
-- [ ] Dedupe CV theo policy owner/job.
-- [ ] Progress thật bằng polling hoặc SSE; retry riêng từng CV.
+- [x] Thiết kế `agent_runs`, `agent_steps`, `agent_tasks`, `batch_items` và idempotency key.
+- [x] Bổ sung Redis và RQ worker thật trong Docker Compose.
+- [x] Đổi batch upload sang `202 Accepted`, persist task rồi enqueue từng CV.
+- [x] Retry/backoff, timeout callback, RQ failed registry và trạng thái failure bền vững.
+- [x] Dedupe checksum theo owner/job, dùng application ID xác định để giảm race.
+- [x] Progress thật bằng polling; hiển thị batch và retry riêng từng CV trên UI.
+- [x] Lưu provider/model/prompt version/fallback reason và execution step.
+- [x] Bổ sung migration, tenant-scoped API và tests cho resume/dedupe/retry.
+
+Trạng thái: **Hoàn thành**.
 
 ## Mốc 3 — Phase 2: Bounded screening/shortlist agent
 

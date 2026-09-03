@@ -20,8 +20,8 @@ Kết quả kỳ vọng:
 | Năng lực | Hiện tại | Khoảng trống để thành agentic |
 |---|---|---|
 | Phân tích JD | Gọi OpenRouter, fallback rules | Chưa có version, confidence gate, vòng lặp chỉnh sửa |
-| Nhận CV | Recruiter upload thủ công | Chưa có inbox/source connector, duplicate policy |
-| Screening | Xử lý tuần tự trong HTTP request | Chưa có queue, retry, checkpoint, resume |
+| Nhận CV | Recruiter upload; hệ thống dedupe theo owner/job/checksum | Chưa có inbox/source connector |
+| Screening | Durable task + Redis/RQ worker, retry và resume | Chưa có confidence routing và semantic embedding |
 | Evidence | Xác minh exact quote | Chưa có citation span/page, eval độ chính xác |
 | Semantic match | Lexical proxy | Chưa có embedding, pgvector, calibration |
 | Shortlist | Sort theo `final_score`, recruiter bấm duyệt | Chưa tự tạo proposal khi batch hoàn tất, chưa có policy/rationale cấp job |
@@ -29,8 +29,8 @@ Kết quả kỳ vọng:
 | Review | Recruiter mở từng hồ sơ | Chưa ưu tiên ngoại lệ/rủi ro, chưa gom approval inbox |
 | Scheduling | Slot và meeting URL giả lập | Chưa kết nối calendar, email, timezone, reschedule |
 | Follow-up | Chưa có | Chưa gửi reminder, theo dõi phản hồi hoặc escalation |
-| Audit | Có log hành động chính | Chưa có agent run, tool call, prompt/model/cost và lineage |
-| Hạ tầng | Compose chỉ chạy PostgreSQL thường | Redis/worker/pgvector chỉ thêm khi có execution path thật |
+| Audit | Có audit log, agent run/step, provider/model/prompt/fallback | Chưa có token/cost và artifact lineage |
+| Hạ tầng | Compose chạy PostgreSQL, Redis và RQ worker | pgvector sẽ được thêm ở Phase 2 |
 
 ## 3. Phân chia mức tự động hóa
 
@@ -189,9 +189,11 @@ Mục tiêu: có baseline đáng tin trước khi tăng quyền tự động.
 
 ### Phase 1 — Async screening có khả năng resume
 
+**Trạng thái: hoàn thành.** API extract text mà không lưu file gốc, persist task trước khi enqueue; chi tiết kiểm chứng nằm trong [implementation checklist](./IMPLEMENTATION_CHECKLIST.md).
+
 Mục tiêu: upload trả về nhanh, worker tự xử lý an toàn.
 
-- `POST /application-batches` chỉ lưu metadata và enqueue task.
+- `POST /application-batches` extract text, không lưu file gốc, persist metadata/task rồi enqueue screening.
 - Worker xử lý độc lập từng CV; batch aggregate progress từ task states.
 - Retry exponential backoff, timeout, dead-letter queue và nút retry thủ công.
 - Dedupe bằng checksum trong phạm vi owner/job và policy rõ ràng.

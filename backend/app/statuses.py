@@ -14,7 +14,17 @@ class BatchStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class BatchItemStatus(str, Enum):
+    QUEUED = "QUEUED"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    DUPLICATE = "DUPLICATE"
+
+
 class ApplicationStatus(str, Enum):
+    PROCESSING = "PROCESSING"
+    SCREENING_FAILED = "SCREENING_FAILED"
     WAITING_REVIEW = "WAITING_REVIEW"
     SHORTLISTED = "SHORTLISTED"
     REVIEWED = "REVIEWED"
@@ -35,3 +45,18 @@ class ReviewDecision(str, Enum):
     MANUAL_REVIEW = "MANUAL_REVIEW"
     REJECT = "REJECT"
     ARCHIVE = "ARCHIVE"
+
+
+class TaskStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    RETRYING = "RETRYING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class RunStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"

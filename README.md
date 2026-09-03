@@ -2,7 +2,7 @@
 
 TalentFlow là MVP hỗ trợ recruiter tạo vị trí tuyển dụng, tiếp nhận CV, chấm mức độ phù hợp có evidence, duyệt shortlist và đặt lịch phỏng vấn. Hệ thống ưu tiên **decision support**: AI chuẩn bị dữ liệu và đề xuất, recruiter vẫn phê duyệt tiêu chí, shortlist và quyết định với ứng viên.
 
-> Trạng thái hiện tại: workflow AI-assisted đã chạy end-to-end và mốc củng cố nền tảng đã hoàn thành. Queue xử lý nền, calendar/email thật, semantic vector search và agent orchestration chưa được triển khai. Xem [checklist triển khai](./IMPLEMENTATION_CHECKLIST.md) và [kế hoạch mở rộng Agentic AI](./AGENTIC_AI_EXPANSION_PLAN.md).
+> Trạng thái hiện tại: Mốc 1–2 đã hoàn thành. Batch CV có durable task, Redis/RQ worker, retry/DLQ, dedupe và progress thật. Calendar/email thật, semantic vector search và bounded shortlist agent chưa được triển khai. Xem [checklist triển khai](./IMPLEMENTATION_CHECKLIST.md) và [kế hoạch mở rộng Agentic AI](./AGENTIC_AI_EXPANSION_PLAN.md).
 
 ## Luồng đang hoạt động
 
@@ -11,9 +11,9 @@ Tạo JD
   -> trích xuất requirements bằng OpenRouter hoặc rules fallback
   -> recruiter duyệt tiêu chí
   -> upload tối đa 20 CV PDF/DOCX/TXT
-  -> extract text và nhận diện ứng viên
-  -> đối chiếu kỹ năng + kinh nghiệm + evidence
-  -> tính điểm và sinh interview kit
+  -> extract text, nhận diện ứng viên và tạo durable task
+  -> Redis/RQ worker đối chiếu kỹ năng + kinh nghiệm + evidence
+  -> retry nếu lỗi; tính điểm và sinh interview kit
   -> recruiter review / duyệt shortlist
   -> chọn slot demo và tạo lịch phỏng vấn
 ```
@@ -25,6 +25,10 @@ Tạo JD
 - Tạo job và trích xuất kỹ năng bắt buộc, ưu tiên, số năm kinh nghiệm từ JD.
 - Recruiter phê duyệt tiêu chí trước khi dùng cho quy trình tuyển dụng.
 - Upload một batch từ 1–20 CV, hỗ trợ PDF, DOCX, TXT; mỗi file tối đa 10 MB.
+- API trả `202 Accepted`; từng CV có task/run/step bền vững và được worker xử lý độc lập.
+- Retry có backoff, timeout, RQ failed registry và nút retry từng CV lỗi.
+- Dedupe bằng SHA-256 trong phạm vi recruiter + job; CV trùng liên kết về application đã có.
+- Frontend polling trạng thái thật của batch thay cho progress timer mô phỏng.
 - Chỉ lưu text đã extract, metadata và SHA-256 checksum; không lưu file CV gốc.
 - Screening có điểm rule, kinh nghiệm, semantic proxy, kỹ năng ưu tiên và evidence theo yêu cầu.
 - Xếp hạng Top N, duyệt shortlist và xuất report Markdown kèm interview kit.
@@ -38,8 +42,6 @@ Tạo JD
 
 Các điểm sau **chưa phải tích hợp production**:
 
-- API xử lý từng batch CV ngay trong request; Redis chưa được dùng làm queue.
-- Redis/worker chưa được đưa vào stack vì background processing chưa được triển khai.
 - PostgreSQL hiện chưa bật pgvector; code chưa tạo embedding hay vector index.
 - `semantic_score` hiện là lexical proxy, không phải semantic search bằng embedding.
 - Chưa dùng LangGraph/agent runtime; workflow được điều phối trực tiếp trong FastAPI.
@@ -52,7 +54,9 @@ Các điểm sau **chưa phải tích hợp production**:
 | Thành phần | Công nghệ | Vai trò |
 |---|---|---|
 | Frontend | Next.js 16, React 19, TypeScript | Dashboard recruiter |
-| Backend | FastAPI, SQLAlchemy | REST API và workflow đồng bộ |
+| Backend | FastAPI, SQLAlchemy | REST API, persistence và tạo durable task |
+| Queue | Redis, RQ | Durable background screening, retry và failed registry |
+| Worker | RQ worker | Screening từng CV và ghi agent run/step |
 | AI | OpenRouter | Extract requirements/profile/evidence và interview kit |
 | Fallback | Python rules | Duy trì luồng offline khi AI lỗi/hết quota |
 | CV parser | pypdf, python-docx | Extract text PDF/DOCX/TXT |
@@ -102,6 +106,10 @@ SUPABASE_URL=
 SUPABASE_JWT_SECRET=
 AUTH_REQUIRED=false
 AUTO_SEED=true
+REDIS_URL=
+QUEUE_EAGER=true
+TASK_MAX_ATTEMPTS=3
+TASK_TIMEOUT_SECONDS=120
 CORS_ORIGINS=http://localhost:3000
 ```
 
@@ -125,6 +133,11 @@ Các biến quan trọng:
 | `SUPABASE_URL` | Khi bật auth | Endpoint Supabase, đồng thời dùng để đọc JWKS |
 | `SUPABASE_JWT_SECRET` | Tuỳ cấu hình | Xác minh JWT HS256; bỏ trống để dùng JWKS |
 | `AUTO_SEED` | Không | Seed job/CV demo khi backend khởi động |
+| `REDIS_URL` | Khi chạy async | Redis URL dùng chung cho API và worker |
+| `QUEUE_EAGER` | Không | `true` chạy inline cho development/test; `false` bắt buộc Redis |
+| `QUEUE_NAME` | Không | Tên queue, mặc định `talentflow-screening` |
+| `TASK_MAX_ATTEMPTS` | Không | Tổng số lần worker thử một task |
+| `TASK_TIMEOUT_SECONDS` | Không | Timeout mỗi RQ job |
 | `CORS_ORIGINS` | Khi deploy | Danh sách origin frontend, phân cách bằng dấu phẩy |
 
 Kiểm tra `GET /api/health`: `ai.configured=true` nghĩa là backend đã đọc được OpenRouter key; trường này không khẳng định provider đang sẵn sàng hay còn quota.
@@ -135,7 +148,15 @@ Kiểm tra `GET /api/health`: `ai.configured=true` nghĩa là backend đã đọ
 docker compose up --build
 ```
 
-Stack hiện chỉ khởi động frontend, backend và PostgreSQL. Backend tự chạy Alembic trước khi phục vụ API; Redis, worker và pgvector sẽ được thêm lại khi Phase 1–2 có execution path thật.
+Stack khởi động frontend, backend, PostgreSQL, Redis và RQ worker thật. Backend chạy Alembic trước khi phục vụ API; worker chỉ khởi động sau khi backend/Redis healthy.
+
+Khi chạy backend trực tiếp mà chưa có Redis, giữ `QUEUE_EAGER=true` để xử lý inline. Để thử đúng execution path async ngoài Docker, chạy Redis rồi đặt `REDIS_URL`, `QUEUE_EAGER=false` và mở worker:
+
+```bash
+make worker
+```
+
+Blueprint Render hiện giữ `QUEUE_EAGER=true` để không tự tạo resource có chi phí. Khi deploy async trên Render, cần chủ động tạo Key Value + Background Worker, cấp cùng `DATABASE_URL`, `REDIS_URL`, OpenRouter config và chuyển backend sang `QUEUE_EAGER=false`.
 
 ## Kiểm thử và build
 
@@ -178,8 +199,10 @@ Không commit `.env`, API key hoặc service-role key vào repository.
 | `DELETE` | `/api/jobs/{job_id}` | Xóa job nếu không còn candidate active |
 | `POST` | `/api/applications` | Tạo application từ resume text |
 | `GET` | `/api/applications` | Danh sách application có filter/pagination |
-| `POST` | `/api/application-batches` | Upload và xử lý batch CV |
+| `POST` | `/api/application-batches` | Upload, dedupe và enqueue batch (`202`) |
 | `GET` | `/api/application-batches/{batch_id}` | Đọc kết quả batch |
+| `POST` | `/api/application-batches/{batch_id}/items/{item_id}/retry` | Retry một CV screening lỗi |
+| `GET` | `/api/agent-runs/{run_id}` | Trạng thái và execution steps của agent run |
 | `GET` | `/api/applications/{id}/interview-kit` | Lấy hoặc sinh interview kit |
 | `POST` | `/api/applications/{id}/review` | Ghi quyết định recruiter |
 | `GET` | `/api/interviewers/{id}/available-slots` | Lấy slot demo còn trống |

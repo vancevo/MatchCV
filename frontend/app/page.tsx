@@ -38,6 +38,11 @@ type Dashboard = {
 type ReviewDecision = "MANUAL_REVIEW" | "REJECT" | "INTERVIEW" | "ARCHIVE";
 type ProgressState = { value: number; label: string; detail: string };
 type PendingAction = { key: string; label: string };
+type BatchResult = {
+  batch_id: string; status: "PROCESSING" | "COMPLETED" | "PARTIAL" | "FAILED";
+  total: number; processed: number; completed: number; failed: number; skipped: number;
+  items: { id: string; filename: string; status: string; application?: Application; error?: string }[];
+};
 
 const emptyDashboard: Dashboard = {
   metrics: { open_jobs: 0, candidates: 0, awaiting_review: 0, interviews: 0 },
@@ -88,6 +93,8 @@ async function download(path: string, filename: string) {
 
 const initials = (name: string) => name.split(/\s+/).slice(-2).map(part => part[0]).join("").toUpperCase();
 const statusLabel = (status: string) => ({
+  PROCESSING: "Đang screening",
+  SCREENING_FAILED: "Screening lỗi",
   WAITING_REVIEW: "Chờ duyệt",
   SHORTLISTED: "Shortlist",
   REVIEWED: "Đã xem xét",
@@ -116,6 +123,7 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState<ProgressState | null>(null);
   const [jobProgress, setJobProgress] = useState<ProgressState | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+  const [lastBatch, setLastBatch] = useState<BatchResult | null>(null);
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 3000); };
   const actionBusy = submitting || Boolean(pendingAction);
@@ -181,13 +189,8 @@ export default function Home() {
     const formData = new FormData(event.currentTarget);
     const files = formData.getAll("files") as File[];
     setUploadProgress({ value: 4, label: "Đang chuẩn bị CV", detail: `${files.length} file được chọn` });
-    const timers = [
-      window.setTimeout(() => setUploadProgress({ value: 48, label: "Đang đọc tài liệu", detail: "Trích xuất nội dung từ CV" }), 450),
-      window.setTimeout(() => setUploadProgress({ value: 67, label: "AI đang phân tích", detail: "Trích xuất kỹ năng và kinh nghiệm" }), 1300),
-      window.setTimeout(() => setUploadProgress({ value: 84, label: "Đang đối chiếu JD", detail: "Kiểm chứng evidence và tính điểm" }), 3000),
-    ];
     try {
-      const result = await new Promise<{ completed: number; failed: number; items: { status: string; application?: Application; error?: string }[] }>((resolve, reject) => {
+      let result = await new Promise<BatchResult>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `${API_URL}/api/application-batches`);
         void accessToken().then(token => { if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`); xhr.send(formData); });
@@ -196,7 +199,7 @@ export default function Home() {
           const value = Math.max(6, Math.min(38, Math.round(progressEvent.loaded / progressEvent.total * 38)));
           setUploadProgress({ value, label: "Đang tải CV lên", detail: `${Math.round(progressEvent.loaded / progressEvent.total * 100)}% dữ liệu đã gửi` });
         };
-        xhr.upload.onload = () => setUploadProgress({ value: 42, label: "Đã tải file", detail: "Backend đang xử lý tài liệu" });
+        xhr.upload.onload = () => setUploadProgress({ value: 42, label: "Đã tải file", detail: "Đang tạo task screening" });
         xhr.onerror = () => reject(new Error("Mất kết nối khi tải CV"));
         xhr.onload = () => {
           const body = (() => { try { return JSON.parse(xhr.responseText); } catch { return {}; } })();
@@ -204,13 +207,43 @@ export default function Home() {
           else reject(new Error(body.detail || "Tải CV thất bại"));
         };
       });
-      setUploadProgress({ value: 100, label: "Hoàn tất", detail: `${result.completed} thành công, ${result.failed} lỗi` });
+      setLastBatch(result);
+      let polls = 0;
+      while (result.status === "PROCESSING" && polls < 120) {
+        const active = result.items.filter(item => ["QUEUED", "PROCESSING"].includes(item.status)).length;
+        const value = Math.min(96, 45 + Math.round(result.processed / Math.max(result.total, 1) * 51));
+        setUploadProgress({ value, label: "Agent đang screening", detail: `${result.processed}/${result.total} xong · ${active} đang chờ/xử lý` });
+        await new Promise(resolve => window.setTimeout(resolve, 1000));
+        result = await request<BatchResult>(`/api/application-batches/${result.batch_id}`);
+        setLastBatch(result);
+        polls += 1;
+      }
+      const finished = result.status !== "PROCESSING";
+      setLastBatch(result);
+      setUploadProgress({ value: finished ? 100 : 96, label: finished ? "Hoàn tất" : "Đang chạy nền",
+        detail: `${result.completed} thành công, ${result.failed} lỗi, ${result.skipped} trùng` });
       await new Promise(resolve => window.setTimeout(resolve, 450));
       setModal(null); await loadDashboard();
-      const first = result.items.find(item => item.application)?.application; if (first) setSelected(first);
-      notify(`Đã extract ${result.completed}/${result.completed + result.failed} CV`);
+      const first = result.items.find(item => item.status === "COMPLETED" && item.application)?.application; if (first) setSelected(first);
+      notify(finished ? `Đã screening ${result.completed}/${result.total} CV` : "Screening tiếp tục chạy nền");
     } catch (err) { notify(err instanceof Error ? err.message : "Tải CV thất bại"); }
-    finally { timers.forEach(timer => window.clearTimeout(timer)); setSubmitting(false); setUploadProgress(null); }
+    finally { setSubmitting(false); setUploadProgress(null); }
+  };
+
+  const retryBatchItem = async (batchId: string, itemId: string) => {
+    await runAction(`retry-${itemId}`, "Đang retry screening", async () => {
+      let result = await request<BatchResult>(`/api/application-batches/${batchId}/items/${itemId}/retry`, { method: "POST" });
+      setLastBatch(result);
+      let polls = 0;
+      while (result.status === "PROCESSING" && polls < 120) {
+        await new Promise(resolve => window.setTimeout(resolve, 1000));
+        result = await request<BatchResult>(`/api/application-batches/${batchId}`);
+        setLastBatch(result);
+        polls += 1;
+      }
+      await loadDashboard();
+      notify(result.status === "PROCESSING" ? "Task vẫn tiếp tục chạy nền" : "Đã hoàn tất retry screening");
+    });
   };
 
   const review = async (decision: ReviewDecision) => {
@@ -303,6 +336,7 @@ export default function Home() {
         {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
         <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.length || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
         {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
+        {lastBatch && <BatchStatusPanel batch={lastBatch} actionBusy={actionBusy} pendingAction={pendingAction} onRetry={retryBatchItem}/>}
         {loading && <DashboardSkeleton/>}
 
         {(active === "Tổng quan" || active === "Pipeline") && <section className="metrics">
@@ -380,9 +414,14 @@ function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
   return <section className="panel jobs-view"><div className="panel-head"><div><h2>Lịch phỏng vấn</h2><p>Các lịch đã đặt thành công</p></div></div>{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const person = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{person?.candidate.name || "Ứng viên"}</p></div><a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a><i className="status review">Đã đặt</i></article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Mở hồ sơ ứng viên để mời phỏng vấn.</div>}</section>;
 }
 
+function BatchStatusPanel({ batch, actionBusy, pendingAction, onRetry }: { batch: BatchResult; actionBusy: boolean; pendingAction: PendingAction | null; onRetry: (batchId: string, itemId: string) => Promise<void> }) {
+  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Batch screening gần nhất</h2><p>{batch.processed}/{batch.total} hoàn tất · {batch.completed} thành công · {batch.skipped} trùng · {batch.failed} lỗi</p></div><i className={`status ${batch.status === "COMPLETED" ? "interview" : batch.status === "PROCESSING" ? "review" : "rejected"}`}>{batch.status}</i></div>{batch.items.map(item => <article className="job-row" key={item.id}><div className="metric-icon blue"><Icon name="spark"/></div><div><h3>{item.application?.candidate.name || item.filename}</h3><p>{item.filename}{item.error ? ` · ${item.error}` : ""}</p></div><i className={`status ${item.status === "COMPLETED" || item.status === "DUPLICATE" ? "interview" : item.status === "FAILED" ? "rejected" : "review"}`}>{item.status}</i>{item.status === "FAILED" && item.application && <button className="secondary compact" disabled={actionBusy} onClick={() => void onRetry(batch.batch_id, item.id)}>{pendingAction?.key === `retry-${item.id}` ? "Đang retry..." : "Retry"}</button>}</article>)}</section>;
+}
+
 function CandidateDrawer({ application, actionBusy, pendingAction, scoreClass, onClose, onReview }: { application: Application; actionBusy: boolean; pendingAction: PendingAction | null; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
   const kit = application.screening.interview_kit;
-  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3><div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : "Mời PV"}</button></div></aside></div>;
+  const unavailable = ["PROCESSING", "SCREENING_FAILED"].includes(application.status);
+  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3>{unavailable && <p className="kit-summary">{application.status === "PROCESSING" ? "Agent đang xử lý hồ sơ này." : "Screening thất bại; hãy retry từ batch."}</p>}<div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy || unavailable} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy || unavailable} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : "Mời PV"}</button></div></aside></div>;
 }
 
 function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {

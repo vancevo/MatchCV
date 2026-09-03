@@ -23,6 +23,9 @@ services:
       - { key: OPENROUTER_API_KEY, sync: false }
       - { key: OPENROUTER_MODEL, value: minimax/minimax-m3:free }
       - { key: MAX_UPLOAD_MB, value: 10 }
+      - { key: QUEUE_EAGER, value: "true" }
+      - { key: TASK_MAX_ATTEMPTS, value: 3 }
+      - { key: TASK_TIMEOUT_SECONDS, value: 120 }
   - type: web
     name: talentflow-frontend
     runtime: node

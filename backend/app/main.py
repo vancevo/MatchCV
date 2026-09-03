@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -18,10 +18,22 @@ from .config import get_settings
 from .database import session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
 from .master_seed import create_master_user, has_master_seed_config
-from .models import Application, AuditLog, Interview, Job, UploadBatch
+from .models import AgentRun, AgentStep, AgentTask, Application, AuditLog, BatchItem, Interview, Job, UploadBatch
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
 from .resume import candidate_identity, checksum, extract_resume
-from .statuses import ApplicationStatus, BatchStatus, InterviewStatus, JobStatus, ReviewDecision
+from .statuses import (
+    ApplicationStatus,
+    BatchItemStatus,
+    BatchStatus,
+    InterviewStatus,
+    JobStatus,
+    RunStatus,
+    ReviewDecision,
+    TaskStatus,
+)
+from .task_queue import enqueue_screening_async, queue_summary
+from .worker import mark_enqueue_failed
+from .workflow import screening_pipeline
 
 
 @asynccontextmanager
@@ -112,8 +124,8 @@ class BookingCreate(BaseModel):
 
 
 def pipeline(review_status: str = "waiting") -> list[dict]:
-    nodes = ["CV Uploaded", "Document Parsed", "Candidate Extracted", "Rule Matching", "Semantic Matching", "Evidence Generated", "Interview Kit Generated"]
-    return [{"node": n, "status": "completed"} for n in nodes] + [{"node": "Recruiter Review", "status": review_status}]
+    completed_through = "Recruiter Review" if review_status == "completed" else "Interview Kit Generated"
+    return screening_pipeline(completed_through)
 
 
 def audit(db, owner_id: str, application_id: str | None, action: str, metadata: dict | None = None) -> None:
@@ -126,10 +138,50 @@ def job_dict(job: Job, count: int = 0) -> dict:
 
 
 def application_dict(item: Application) -> dict:
+    screening = item.screening or {}
+    if "final_score" not in screening:
+        screening = {
+            "final_score": 0,
+            "recommendation": "Processing" if item.status == ApplicationStatus.PROCESSING.value else "Screening Failed",
+            "evidence": [],
+            "experience_years": 0,
+        }
     return {"id": item.id, "job_id": item.job_id, "batch_id": item.batch_id,
             "candidate": {"name": item.candidate_name, "email": item.candidate_email}, "status": item.status,
             "resume_filename": item.resume_filename, "resume_size": item.resume_size,
-            "screening": item.screening, "pipeline": item.pipeline, "review": item.review}
+            "screening": screening, "pipeline": item.pipeline, "review": item.review}
+
+
+def batch_dict(db, batch: UploadBatch) -> dict:
+    items = list(db.scalars(select(BatchItem).where(BatchItem.batch_id == batch.id).order_by(BatchItem.created_at)))
+    applications = {
+        item.id: item for item in db.scalars(
+            select(Application).where(
+                Application.owner_id == batch.owner_id,
+                Application.id.in_([value.application_id for value in items if value.application_id]),
+            )
+        )
+    } if any(value.application_id for value in items) else {}
+    return {
+        "batch_id": batch.id,
+        "status": batch.status,
+        "total": batch.total,
+        "completed": batch.completed,
+        "failed": batch.failed,
+        "skipped": batch.skipped,
+        "processed": batch.completed + batch.failed + batch.skipped,
+        "items": [
+            {
+                "id": item.id,
+                "filename": item.filename,
+                "status": item.status,
+                "error": item.error,
+                "task_id": item.task_id,
+                "application": application_dict(applications[item.application_id]) if item.application_id in applications else None,
+            }
+            for item in items
+        ],
+    }
 
 
 def shortlist_report(job: Job, applications: list[Application]) -> str:
@@ -212,8 +264,10 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "service": "talentflow-api", "ai": llm_config(),
-            "auth_required": get_settings().auth_required, "environment": get_settings().environment}
+    queue = queue_summary()
+    return {"status": "ok" if queue["reachable"] else "degraded", "service": "talentflow-api", "ai": llm_config(),
+            "queue": queue, "auth_required": get_settings().auth_required,
+            "environment": get_settings().environment}
 
 
 @app.get("/api/dashboard")
@@ -303,7 +357,9 @@ def shortlist(job_id: str, limit: int = 5, owner_id: str = Depends(current_user_
     limit = min(max(limit, 1), 20)
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        apps = list(db.scalars(select(Application).where(Application.job_id == job.id, Application.owner_id == owner_id)))
+        apps = [item for item in db.scalars(select(Application).where(
+            Application.job_id == job.id, Application.owner_id == owner_id
+        )) if "final_score" in (item.screening or {})]
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
         return {
             "job": job_dict(job, len(apps)),
@@ -318,7 +374,9 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
     limit = min(max(limit, 1), 20)
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        apps = list(db.scalars(select(Application).where(Application.job_id == job.id, Application.owner_id == owner_id)))
+        apps = [item for item in db.scalars(select(Application).where(
+            Application.job_id == job.id, Application.owner_id == owner_id
+        )) if "final_score" in (item.screening or {})]
         approved_ids = (job.requirements or {}).get("shortlist_approval", {}).get("application_ids") or []
         if approved_ids:
             approved = set(approved_ids)
@@ -339,7 +397,9 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
     selected = set(payload.application_ids)
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        apps = list(db.scalars(select(Application).where(Application.job_id == job.id, Application.owner_id == owner_id)))
+        apps = [item for item in db.scalars(select(Application).where(
+            Application.job_id == job.id, Application.owner_id == owner_id
+        )) if "final_score" in (item.screening or {})]
         known = {item.id for item in apps}
         missing = selected - known
         if missing:
@@ -384,6 +444,8 @@ async def create_application(payload: ApplicationCreate, owner_id: str = Depends
 async def get_interview_kit(application_id: str, owner_id: str = Depends(current_user_id)) -> dict:
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
+        if item.status in {ApplicationStatus.PROCESSING.value, ApplicationStatus.SCREENING_FAILED.value}:
+            raise HTTPException(409, "Application screening is not complete")
         job = require_job(db, item.job_id, owner_id)
         kit = (item.screening or {}).get("interview_kit")
         if not kit:
@@ -394,30 +456,111 @@ async def get_interview_kit(application_id: str, owner_id: str = Depends(current
         return kit
 
 
-@app.post("/api/application-batches", status_code=201)
+@app.post("/api/application-batches", status_code=202)
 async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(...), owner_id: str = Depends(current_user_id)) -> dict:
     if not 1 <= len(files) <= 20:
         raise HTTPException(422, "Mỗi batch phải có từ 1 đến 20 CV")
+    task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         batch = UploadBatch(owner_id=owner_id, job_id=job_id, total=len(files)); db.add(batch); db.flush()
-        results: list[dict] = []
         for file in files:
+            filename = (file.filename or "unnamed")[:255]
             try:
                 content, text = await extract_resume(file)
-                name, email = candidate_identity(text, file.filename)
-                item = await build_application(db, owner_id, job, name, email, text, file.filename, len(content), checksum(content), batch.id)
-                batch.completed += 1
-                audit(db, owner_id, item.id, "CV_EXTRACTED", {"filename": file.filename, "size": len(content), "stored_original": False})
-                results.append({"filename": file.filename, "status": "COMPLETED", "application": application_dict(item)})
+                digest = checksum(content)
+                duplicate = db.scalar(select(Application).where(
+                    Application.owner_id == owner_id,
+                    Application.job_id == job_id,
+                    Application.resume_checksum == digest,
+                ))
+                if duplicate:
+                    db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=duplicate.id,
+                                     filename=filename, checksum=digest, status=BatchItemStatus.DUPLICATE.value,
+                                     error="CV trùng checksum trong cùng job"))
+                    batch.skipped += 1
+                    audit(db, owner_id, duplicate.id, "CV_DUPLICATE_SKIPPED", {"filename": filename, "checksum": digest})
+                    continue
+
+                name, email = candidate_identity(text, filename)
+                application_id = str(uuid5(NAMESPACE_URL, f"talentflow:{owner_id}:{job_id}:{digest}"))
+                application = Application(
+                    id=application_id,
+                    owner_id=owner_id,
+                    job_id=job.id,
+                    batch_id=batch.id,
+                    candidate_name=name,
+                    candidate_email=email,
+                    status=ApplicationStatus.PROCESSING.value,
+                    resume_filename=filename,
+                    resume_size=len(content),
+                    resume_checksum=digest,
+                    resume_text=text,
+                    screening={},
+                    pipeline=screening_pipeline("Candidate Extracted"),
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(application)
+                        db.flush()
+                except IntegrityError:
+                    duplicate = db.scalar(select(Application).where(
+                        Application.owner_id == owner_id,
+                        Application.job_id == job_id,
+                        Application.resume_checksum == digest,
+                    ))
+                    if not duplicate:
+                        raise
+                    db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=duplicate.id,
+                                     filename=filename, checksum=digest, status=BatchItemStatus.DUPLICATE.value,
+                                     error="CV trùng checksum trong cùng job"))
+                    batch.skipped += 1
+                    audit(db, owner_id, duplicate.id, "CV_DUPLICATE_SKIPPED",
+                          {"filename": filename, "checksum": digest, "reason": "concurrent_insert"})
+                    continue
+                batch_item = BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=application.id,
+                                       filename=filename, checksum=digest, status=BatchItemStatus.QUEUED.value)
+                db.add(batch_item); db.flush()
+                ai = llm_config()
+                run = AgentRun(owner_id=owner_id, application_id=application.id, status=RunStatus.QUEUED.value,
+                               provider="openrouter" if ai["configured"] else "rules",
+                               model=ai["model"] if ai["configured"] else None,
+                               prompt_version="screening-v1+interview-kit-v1",
+                               fallback_reason=None if ai["configured"] else "openrouter_not_configured",
+                               idempotency_key=f"screening:{application.id}:v1")
+                db.add(run); db.flush()
+                task = AgentTask(owner_id=owner_id, application_id=application.id, batch_id=batch.id,
+                                 batch_item_id=batch_item.id, run_id=run.id, status=TaskStatus.QUEUED.value,
+                                 max_attempts=get_settings().task_max_attempts,
+                                 idempotency_key=f"screening-task:{application.id}:v1")
+                db.add(task); db.flush()
+                batch_item.task_id = task.id
+                task_ids.append(task.id)
+                audit(db, owner_id, application.id, "CV_EXTRACTED",
+                      {"filename": filename, "size": len(content), "checksum": digest, "stored_original": False})
+                audit(db, owner_id, application.id, "SCREENING_QUEUED", {"task_id": task.id, "run_id": run.id})
             except HTTPException as exc:
-                batch.failed += 1; results.append({"filename": file.filename, "status": "FAILED", "error": exc.detail})
-            except Exception:
-                batch.failed += 1; results.append({"filename": file.filename, "status": "FAILED", "error": "Không thể xử lý CV"})
-        batch.status = (BatchStatus.COMPLETED.value if not batch.failed else
-                        BatchStatus.PARTIAL.value if batch.completed else BatchStatus.FAILED.value)
-        return {"batch_id": batch.id, "status": batch.status, "total": batch.total, "completed": batch.completed,
-                "failed": batch.failed, "items": results}
+                batch.failed += 1
+                db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, filename=filename,
+                                 status=BatchItemStatus.FAILED.value, error=str(exc.detail)))
+            except Exception as exc:
+                batch.failed += 1
+                db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, filename=filename,
+                                 status=BatchItemStatus.FAILED.value,
+                                 error=f"Không thể chuẩn bị CV: {str(exc)[:500]}"))
+        terminal = batch.failed + batch.skipped
+        if terminal == batch.total:
+            batch.status = BatchStatus.FAILED.value if batch.failed and not batch.skipped else BatchStatus.PARTIAL.value if batch.failed else BatchStatus.COMPLETED.value
+        batch_id = batch.id
+
+    for task_id in task_ids:
+        try:
+            await enqueue_screening_async(task_id)
+        except Exception as exc:
+            mark_enqueue_failed(task_id, str(exc))
+
+    with session_scope() as db:
+        return batch_dict(db, db.get(UploadBatch, batch_id))
 
 
 @app.get("/api/application-batches/{batch_id}")
@@ -426,9 +569,85 @@ def get_batch(batch_id: str, owner_id: str = Depends(current_user_id)) -> dict:
         batch = db.scalar(select(UploadBatch).where(UploadBatch.id == batch_id, UploadBatch.owner_id == owner_id))
         if not batch:
             raise HTTPException(404, "Batch not found")
-        apps = list(db.scalars(select(Application).where(Application.batch_id == batch_id, Application.owner_id == owner_id)))
-        return {"batch_id": batch.id, "status": batch.status, "total": batch.total, "completed": batch.completed,
-                "failed": batch.failed, "items": [{"filename": a.resume_filename, "status": "COMPLETED", "application": application_dict(a)} for a in apps]}
+        return batch_dict(db, batch)
+
+
+@app.post("/api/application-batches/{batch_id}/items/{item_id}/retry", status_code=202)
+async def retry_batch_item(batch_id: str, item_id: str, owner_id: str = Depends(current_user_id)) -> dict:
+    with session_scope() as db:
+        item = db.scalar(select(BatchItem).where(
+            BatchItem.id == item_id, BatchItem.batch_id == batch_id, BatchItem.owner_id == owner_id
+        ))
+        if not item:
+            raise HTTPException(404, "Batch item not found")
+        if item.status != BatchItemStatus.FAILED.value or not item.task_id:
+            raise HTTPException(409, "Only failed screening items can be retried")
+        previous_task = db.get(AgentTask, item.task_id)
+        application = db.get(Application, item.application_id) if item.application_id else None
+        if not all((previous_task, application)):
+            raise HTTPException(409, "Failed item has no retryable screening task")
+        retry_id = str(uuid4())
+        ai = llm_config()
+        run = AgentRun(owner_id=owner_id, application_id=application.id, trigger="manual_retry",
+                       status=RunStatus.QUEUED.value,
+                       provider="openrouter" if ai["configured"] else "rules",
+                       model=ai["model"] if ai["configured"] else None,
+                       prompt_version="screening-v1+interview-kit-v1",
+                       fallback_reason=None if ai["configured"] else "openrouter_not_configured",
+                       current_node="manual_retry_queued",
+                       idempotency_key=f"screening:{application.id}:retry:{retry_id}")
+        db.add(run); db.flush()
+        task = AgentTask(owner_id=owner_id, application_id=application.id, batch_id=batch_id,
+                         batch_item_id=item.id, run_id=run.id, status=TaskStatus.QUEUED.value,
+                         max_attempts=get_settings().task_max_attempts,
+                         idempotency_key=f"screening-task:{application.id}:retry:{retry_id}")
+        db.add(task); db.flush()
+        item.task_id = task.id
+        application.status = ApplicationStatus.PROCESSING.value
+        application.pipeline = screening_pipeline("Candidate Extracted")
+        item.status = BatchItemStatus.QUEUED.value
+        item.error = None
+        batch = db.get(UploadBatch, batch_id)
+        if batch:
+            batch.failed = max(0, batch.failed - 1)
+            batch.status = BatchStatus.PROCESSING.value
+        audit(db, owner_id, application.id, "SCREENING_RETRY_REQUESTED",
+              {"task_id": task.id, "previous_task_id": previous_task.id, "run_id": run.id})
+        task_id = task.id
+    try:
+        await enqueue_screening_async(task_id)
+    except Exception as exc:
+        mark_enqueue_failed(task_id, str(exc))
+        raise HTTPException(503, f"Queue unavailable: {str(exc)[:500]}") from exc
+    with session_scope() as db:
+        return batch_dict(db, db.get(UploadBatch, batch_id))
+
+
+@app.get("/api/agent-runs/{run_id}")
+def get_agent_run(run_id: str, owner_id: str = Depends(current_user_id)) -> dict:
+    with session_scope() as db:
+        run = db.scalar(select(AgentRun).where(AgentRun.id == run_id, AgentRun.owner_id == owner_id))
+        if not run:
+            raise HTTPException(404, "Agent run not found")
+        steps = list(db.scalars(select(AgentStep).where(
+            AgentStep.run_id == run.id, AgentStep.owner_id == owner_id
+        ).order_by(AgentStep.created_at)))
+        return {
+            "id": run.id,
+            "application_id": run.application_id,
+            "workflow": run.workflow,
+            "trigger": run.trigger,
+            "status": run.status,
+            "current_node": run.current_node,
+            "provider": run.provider,
+            "model": run.model,
+            "prompt_version": run.prompt_version,
+            "fallback_reason": run.fallback_reason,
+            "error": run.error,
+            "steps": [{"node": step.node, "status": step.status, "attempt": step.attempt,
+                       "latency_ms": step.latency_ms, "error": step.error, "metadata": step.metadata_json}
+                      for step in steps],
+        }
 
 
 @app.post("/api/applications/{application_id}/review")
@@ -444,6 +663,8 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         raise HTTPException(422, "Unsupported decision")
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
+        if item.status in {ApplicationStatus.PROCESSING.value, ApplicationStatus.SCREENING_FAILED.value}:
+            raise HTTPException(409, "Application screening is not ready for review")
         item.status = statuses[decision]; item.review = payload.model_dump(); item.pipeline = pipeline("completed")
         audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump())
         return application_dict(item)

@@ -25,6 +25,13 @@ def test_config_rejects_invalid_boolean(monkeypatch):
         Settings.from_env()
 
 
+def test_config_requires_redis_when_queue_is_not_eager(monkeypatch):
+    monkeypatch.setenv("QUEUE_EAGER", "false")
+    monkeypatch.setenv("REDIS_URL", "")
+    with pytest.raises(RuntimeError, match="REDIS_URL"):
+        Settings.from_env()
+
+
 def test_booking_rejects_datetime_without_timezone():
     response = client.post("/api/applications/app-001/interview", json={"slot": "2030-01-01T09:00:00"})
     assert response.status_code == 422
@@ -108,7 +115,7 @@ def test_upload_limit_comes_from_validated_config(monkeypatch):
             data={"job_id": "job-backend-01"},
             files={"files": ("large.txt", b"x" * (1024 * 1024 + 1), "text/plain")},
         )
-        assert response.status_code == 201
+        assert response.status_code == 202
         assert response.json()["failed"] == 1
         assert "1 MB" in response.json()["items"][0]["error"]
     finally:

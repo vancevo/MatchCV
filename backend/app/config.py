@@ -49,6 +49,11 @@ class Settings:
     openrouter_site_url: str
     openrouter_app_title: str
     max_upload_mb: int
+    redis_url: str
+    queue_name: str
+    queue_eager: bool
+    task_max_attempts: int
+    task_timeout_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,6 +71,11 @@ class Settings:
         if auth_required and not (supabase_url or jwt_secret):
             raise RuntimeError("AUTH_REQUIRED=true requires SUPABASE_URL or SUPABASE_JWT_SECRET")
 
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        queue_eager = _boolean("QUEUE_EAGER", not bool(redis_url))
+        if not queue_eager and not redis_url:
+            raise RuntimeError("QUEUE_EAGER=false requires REDIS_URL")
+
         return cls(
             environment=environment,
             database_url=os.getenv("DATABASE_URL", "").strip(),
@@ -80,6 +90,11 @@ class Settings:
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
             openrouter_app_title=os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot").strip(),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
+            redis_url=redis_url,
+            queue_name=os.getenv("QUEUE_NAME", "talentflow-screening").strip() or "talentflow-screening",
+            queue_eager=queue_eager,
+            task_max_attempts=_positive_int("TASK_MAX_ATTEMPTS", 3, 10),
+            task_timeout_seconds=_positive_int("TASK_TIMEOUT_SECONDS", 120, 3600),
         )
 
 
