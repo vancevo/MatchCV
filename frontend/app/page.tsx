@@ -51,6 +51,9 @@ type Approval = {
 type MailSandbox = {
   enabled: boolean; base_email: string; max_alias: number; sample_aliases: string[]; delivery_note: string;
 };
+type Integration = {
+  provider: string; status: string; account_email: string; scopes: string[]; expires_at: string | null;
+};
 
 const emptyDashboard: Dashboard = {
   metrics: { open_jobs: 0, candidates: 0, awaiting_review: 0, interviews: 0 },
@@ -568,6 +571,7 @@ function InterviewsView({ dashboard, onChanged }: { dashboard: Dashboard; onChan
 
 function MailSandboxView() {
   const [config, setConfig] = useState<MailSandbox | null>(null);
+  const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [enabled, setEnabled] = useState(true);
   const [baseEmail, setBaseEmail] = useState("vinhvp.khmtk36@gmail.com");
   const [maxAlias, setMaxAlias] = useState(100);
@@ -580,7 +584,18 @@ function MailSandboxView() {
       setConfig(value); setEnabled(value.enabled); setBaseEmail(value.base_email || "vinhvp.khmtk36@gmail.com"); setMaxAlias(value.max_alias || 100);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Không tải được Mail Sandbox"); }
   };
-  useEffect(() => { void load(); }, []);
+  const loadIntegrations = async () => {
+    try { setIntegrations(await request<Integration[]>("/api/integrations")); }
+    catch { setIntegrations([]); }
+  };
+  useEffect(() => { void load(); void loadIntegrations(); }, []);
+  const connectGoogle = async () => {
+    setBusy(true); setMessage("");
+    try {
+      const result = await request<{ authorization_url: string }>("/api/integrations/google/authorize", { method: "POST" });
+      window.location.href = result.authorization_url;
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Không mở được Google OAuth"); setBusy(false); }
+  };
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setBusy(true); setMessage("");
     try {
@@ -605,9 +620,11 @@ function MailSandboxView() {
   };
   const [local, domain] = baseEmail.toLowerCase().split("@");
   const preview = local && domain ? `${local}+${aliasNumber}@${domain}` : "Alias chưa hợp lệ";
+  const google = integrations.find(item => item.provider === "google" && item.status === "ACTIVE");
   return <section className="panel jobs-view mail-sandbox-view"><div className="panel-head"><div><h2>Mail Sandbox</h2><p>Whitelist Gmail plus alias cho tester; alias được giữ nguyên trong dữ liệu và email header.</p></div><span className={`sandbox-state ${config?.enabled ? "on" : "off"}`}>{config?.enabled ? "ENABLED" : "DISABLED"}</span></div>
     <div className="mail-sandbox-grid"><form onSubmit={save}><h3>Cấu hình whitelist</h3><label><span>Email inbox chính</span><input type="email" value={baseEmail} onChange={event => setBaseEmail(event.target.value)} required/></label><label><span>Alias tối đa</span><input type="number" min="1" max="10000" value={maxAlias} onChange={event => setMaxAlias(Number(event.target.value))} required/></label><label className="sandbox-toggle"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)}/><span>Bật chặn recipient ngoài whitelist</span></label><button className="primary compact" disabled={busy}>Lưu whitelist</button></form>
       <div><h3>Gửi email thử</h3><label><span>Hậu tố + number</span><input type="number" min="1" max={maxAlias} value={aliasNumber} onChange={event => setAliasNumber(Number(event.target.value))}/></label><div className="alias-preview"><small>Email sẽ gửi tới</small><b>{preview}</b><span>Gmail nhận tại {baseEmail}; TalentFlow vẫn lưu địa chỉ alias phía trên.</span></div><button className="primary compact" type="button" disabled={busy || !config?.enabled} onClick={() => void sendTest()}>{busy ? "Đang xử lý..." : "Gửi email test"}</button></div></div>
+    <div className="gmail-connect"><div><h3>Gmail gửi thật</h3><p>{google ? `Đã kết nối ${google.account_email || "Google"}` : "Kết nối tài khoản Gmail gửi qua OAuth. Mail Sandbox vẫn chặn mọi email ngoài whitelist."}</p></div><button className={google ? "secondary compact" : "primary compact"} type="button" disabled={busy || !config?.enabled} onClick={() => void connectGoogle()}>{google ? "Kết nối lại Gmail" : "Kết nối Gmail"}</button></div>
     {message && <p className="operations-message">{message}</p>}
     <div className="alias-list"><h3>Alias mẫu trong whitelist</h3><div>{config?.sample_aliases.map(alias => <code key={alias}>{alias}</code>)}</div></div>
   </section>;

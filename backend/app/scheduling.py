@@ -413,6 +413,15 @@ def process_outbox_event(event_id: str) -> None:
             interview = db.get(Interview, event.aggregate_id)
             application = db.get(Application, interview.application_id) if interview else None
             sandbox_recipient = application.candidate_email if application else ""
+        settings = get_settings()
+        if event.operation == "EMAIL_SEND" and settings.integration_provider != "local" and (
+            not policy or not policy.mail_sandbox_enabled or not policy.mail_sandbox_base_email
+        ):
+            event.status = "BLOCKED"
+            event.last_error = "Mail Sandbox must be enabled before real email dispatch"
+            db.add(AuditLog(owner_id=event.owner_id, application_id=None, action="MAIL_SANDBOX_REQUIRED",
+                            metadata_json={"outbox_id": event.id, "operation": event.operation}))
+            return
         if sandbox_recipient and not mail_sandbox_recipient_allowed(policy, sandbox_recipient):
             event.status = "BLOCKED"
             event.last_error = "Recipient is outside the tenant mail sandbox whitelist"

@@ -24,6 +24,15 @@ services:
       - { key: OPENROUTER_MODEL, value: minimax/minimax-m3:free }
       - { key: MAX_UPLOAD_MB, value: 10 }
       - { key: QUEUE_EAGER, value: "true" }
+      - { key: ALLOW_EAGER_REAL_INTEGRATIONS, value: "true" }
+      - { key: INTEGRATION_PROVIDER, value: google }
+      - { key: PUBLIC_APP_URL, value: "https://talentflow-frontend-yifc.onrender.com" }
+      - { key: GOOGLE_CLIENT_ID, sync: false }
+      - { key: GOOGLE_CLIENT_SECRET, sync: false }
+      - { key: GOOGLE_REDIRECT_URI, value: "https://talentflow-backend-e5nx.onrender.com/api/integrations/google/callback" }
+      - { key: INTEGRATION_TOKEN_SECRET, sync: false }
+      - { key: OAUTH_STATE_SECRET, sync: false }
+      - { key: PROVIDER_WEBHOOK_SECRET, sync: false }
       - { key: TASK_MAX_ATTEMPTS, value: 3 }
       - { key: TASK_TIMEOUT_SECONDS, value: 120 }
   - type: web

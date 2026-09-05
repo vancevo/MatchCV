@@ -1008,7 +1008,8 @@ def health() -> dict:
             "queue": queue, "auth_required": get_settings().auth_required,
             "environment": get_settings().environment,
             "integrations": {"provider": get_settings().integration_provider,
-                             "real_side_effects": get_settings().integration_provider != "local"}}
+                             "real_side_effects": get_settings().integration_provider != "local",
+                             "free_demo_direct_dispatch": get_settings().allow_eager_real_integrations}}
 
 
 @app.get("/api/ready")

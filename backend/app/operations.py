@@ -58,7 +58,12 @@ def readiness_report(db, settings, queue: dict, *, owner_id: str | None = None) 
         checks.extend([
             _check("authentication", settings.auth_required, "AUTH_REQUIRED must be true"),
             _check("seed_data", not settings.auto_seed, "AUTO_SEED must be false"),
-            _check("durable_queue", not settings.queue_eager, "QUEUE_EAGER must be false"),
+            _check(
+                "durable_queue",
+                not settings.queue_eager or settings.allow_eager_real_integrations,
+                "QUEUE_EAGER=false is recommended; ALLOW_EAGER_REAL_INTEGRATIONS=true permits free/demo direct dispatch",
+                required=not settings.allow_eager_real_integrations,
+            ),
             _check("database_engine", settings.database_url.startswith(("postgres://", "postgresql://")),
                    "PostgreSQL is required"),
             _check("public_url", settings.public_app_url.startswith("https://"), "PUBLIC_APP_URL must use HTTPS"),
@@ -85,6 +90,12 @@ def readiness_report(db, settings, queue: dict, *, owner_id: str | None = None) 
                    "Provider webhook secret is non-placeholder"),
         ])
         if owner_id and database_ok:
+            policy = db.scalar(select(TenantPolicy).where(TenantPolicy.owner_id == owner_id))
+            checks.append(_check(
+                "mail_sandbox",
+                bool(policy and policy.mail_sandbox_enabled and policy.mail_sandbox_base_email),
+                "Mail Sandbox must be enabled before real email dispatch",
+            ))
             connection = db.scalar(select(IntegrationConnection).where(
                 IntegrationConnection.owner_id == owner_id,
                 IntegrationConnection.provider == provider,

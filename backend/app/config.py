@@ -55,6 +55,7 @@ class Settings:
     task_max_attempts: int
     task_timeout_seconds: int
     integration_provider: str
+    allow_eager_real_integrations: bool
     integration_token_secret: str
     oauth_state_secret: str
     public_app_url: str
@@ -91,13 +92,17 @@ class Settings:
         integration_provider = os.getenv("INTEGRATION_PROVIDER", "local").strip().lower()
         if integration_provider not in {"local", "google", "microsoft"}:
             raise RuntimeError("INTEGRATION_PROVIDER must be local, google, or microsoft")
+        allow_eager_real_integrations = _boolean("ALLOW_EAGER_REAL_INTEGRATIONS", False)
         token_secret = os.getenv("INTEGRATION_TOKEN_SECRET", jwt_secret or "talentflow-local-token-key").strip()
         oauth_state_secret = os.getenv("OAUTH_STATE_SECRET", jwt_secret or "talentflow-local-oauth-state").strip()
         if environment in {"staging", "production"} and integration_provider != "local":
             if token_secret == "talentflow-local-token-key" or oauth_state_secret == "talentflow-local-oauth-state":
                 raise RuntimeError("Real integrations require INTEGRATION_TOKEN_SECRET and OAUTH_STATE_SECRET")
-            if queue_eager:
-                raise RuntimeError("Real integrations in staging/production require QUEUE_EAGER=false for durable outbox retry")
+            if queue_eager and not allow_eager_real_integrations:
+                raise RuntimeError(
+                    "Real integrations in staging/production require QUEUE_EAGER=false, "
+                    "or ALLOW_EAGER_REAL_INTEGRATIONS=true for free/demo deployments"
+                )
 
         return cls(
             environment=environment,
@@ -119,6 +124,7 @@ class Settings:
             task_max_attempts=_positive_int("TASK_MAX_ATTEMPTS", 3, 10),
             task_timeout_seconds=_positive_int("TASK_TIMEOUT_SECONDS", 120, 3600),
             integration_provider=integration_provider,
+            allow_eager_real_integrations=allow_eager_real_integrations,
             integration_token_secret=token_secret,
             oauth_state_secret=oauth_state_secret,
             public_app_url=os.getenv("PUBLIC_APP_URL", "http://localhost:3000").strip().rstrip("/"),

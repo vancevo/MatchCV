@@ -122,7 +122,7 @@ def test_oauth_start_fails_closed_without_client_credentials():
     assert "not configured" in response.json()["detail"]
 
 
-def test_real_provider_requires_durable_queue_in_production(monkeypatch):
+def test_real_provider_requires_durable_queue_or_free_demo_override_in_production(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("INTEGRATION_PROVIDER", "google")
     monkeypatch.setenv("INTEGRATION_TOKEN_SECRET", "test-token-secret")
@@ -130,8 +130,11 @@ def test_real_provider_requires_durable_queue_in_production(monkeypatch):
     monkeypatch.setenv("QUEUE_EAGER", "true")
     try:
         import pytest
-        with pytest.raises(RuntimeError, match="QUEUE_EAGER=false"):
+        with pytest.raises(RuntimeError, match="ALLOW_EAGER_REAL_INTEGRATIONS"):
             Settings.from_env()
+        monkeypatch.setenv("ALLOW_EAGER_REAL_INTEGRATIONS", "true")
+        assert Settings.from_env().allow_eager_real_integrations is True
     finally:
         monkeypatch.setenv("APP_ENV", "test")
         monkeypatch.setenv("INTEGRATION_PROVIDER", "local")
+        monkeypatch.delenv("ALLOW_EAGER_REAL_INTEGRATIONS", raising=False)
