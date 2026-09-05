@@ -141,6 +141,17 @@ class CriteriaApproval(BaseModel):
     note: str = ""
 
 
+class ClearRecruitmentData(BaseModel):
+    confirmation: str
+
+    @field_validator("confirmation")
+    @classmethod
+    def require_confirmation(cls, value: str) -> str:
+        if value.strip().upper() != "XOA TOAN BO":
+            raise ValueError("confirmation must be XOA TOAN BO")
+        return value
+
+
 class CriteriaUpdate(BaseModel):
     required_skills: list[str] = Field(min_length=1, max_length=30)
     preferred_skills: list[str] = Field(default_factory=list, max_length=30)
@@ -201,6 +212,10 @@ class SchedulingInvitationCreate(BaseModel):
         except ZoneInfoNotFoundError as exc:
             raise ValueError("timezone_name must be a valid IANA timezone") from exc
         return value
+
+
+class InterviewConfirmation(BaseModel):
+    note: str = Field(default="", max_length=2000)
 
 
 class EmailTemplateCreate(BaseModel):
@@ -1193,6 +1208,29 @@ def dashboard(owner_id: str = Depends(current_tenant_id)) -> dict:
                 "interviews": [interview_dict(i) for i in interviews]}
 
 
+@app.post("/api/data/clear")
+def clear_recruitment_data(
+    payload: ClearRecruitmentData,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    """Remove recruitment records for one tenant while preserving its account and settings."""
+    with session_scope() as db:
+        counts = {
+            "jobs": db.scalar(select(func.count()).select_from(Job).where(Job.owner_id == owner_id)) or 0,
+            "applications": db.scalar(select(func.count()).select_from(Application).where(Application.owner_id == owner_id)) or 0,
+            "interviews": db.scalar(select(func.count()).select_from(Interview).where(Interview.owner_id == owner_id)) or 0,
+        }
+        # Delete in dependency order so the operation behaves consistently in SQLite and PostgreSQL.
+        for model in (
+            FeedbackSummary, InterviewScorecard, OutboxEvent, SchedulingInvitation, Interview,
+            ScreeningArtifact, AgentTask, AgentStep, AgentRun, BatchItem, ShortlistProposal,
+            ApprovalRequest, CriteriaVersion, UploadBatch, Application, Job, AuditLog,
+        ):
+            db.execute(sql_delete(model).where(model.owner_id == owner_id))
+        audit(db, owner_id, None, "RECRUITMENT_DATA_CLEARED", counts)
+        return {"status": "cleared", "removed": counts}
+
+
 @app.get("/api/jobs")
 def list_jobs(
     limit: int = Query(50, ge=1, le=100),
@@ -1420,6 +1458,8 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
 @app.post("/api/jobs/{job_id}/approve-shortlist")
 def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id)) -> dict:
     selected = set(payload.application_ids)
+    invitations: list[dict] = []
+    outbox_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         criteria = latest_criteria(db, job.id, approved_only=True)
@@ -1460,7 +1500,28 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
                 request.resolution = {"note": payload.note, "application_ids": payload.application_ids}
                 request.decided_at = utcnow()
         ranked = sorted([item for item in apps if item.id in selected], key=lambda a: a.screening.get("final_score", 0), reverse=True)
-        return {"job": job_dict(job, len(apps)), "items": [application_dict(item) for item in ranked]}
+        invitation_payload = SchedulingInvitationCreate()
+        for item in ranked:
+            if not item.candidate_email:
+                continue
+            existing = db.scalar(select(SchedulingInvitation).where(
+                SchedulingInvitation.application_id == item.id,
+                SchedulingInvitation.owner_id == owner_id,
+                SchedulingInvitation.purpose == "SCHEDULE",
+                SchedulingInvitation.status == "ACTIVE",
+            ))
+            if existing:
+                continue
+            invitation, outbox_id = _create_scheduling_invitation(db, item, invitation_payload)
+            invitations.append(invitation)
+            outbox_ids.append(outbox_id)
+        response = {"job": job_dict(job, len(apps)), "items": [application_dict(item) for item in ranked],
+                    "invitations": invitations}
+    for outbox_id in outbox_ids:
+        dispatch_outbox(outbox_id)
+    for invitation in invitations:
+        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
+    return response
 
 
 @app.get("/api/approvals")
@@ -1487,6 +1548,8 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
     if decision not in {"APPROVE", "REJECT"}:
         raise HTTPException(422, "decision must be APPROVE or REJECT")
     task_ids: list[str] = []
+    invitation_outbox_ids: list[str] = []
+    invitations: list[dict] = []
     with session_scope() as db:
         request = db.scalar(select(ApprovalRequest).where(
             ApprovalRequest.id == approval_id, ApprovalRequest.owner_id == owner_id
@@ -1535,6 +1598,21 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                     "status": "APPROVED", "application_ids": selected, "note": payload.note,
                     "approved_at": utcnow().isoformat(), "proposal_id": proposal.id,
                 }}
+                invitation_payload = SchedulingInvitationCreate()
+                for item in apps:
+                    if item.id not in selected or not item.candidate_email:
+                        continue
+                    existing = db.scalar(select(SchedulingInvitation).where(
+                        SchedulingInvitation.application_id == item.id,
+                        SchedulingInvitation.owner_id == owner_id,
+                        SchedulingInvitation.purpose == "SCHEDULE",
+                        SchedulingInvitation.status == "ACTIVE",
+                    ))
+                    if existing:
+                        continue
+                    invitation, outbox_id = _create_scheduling_invitation(db, item, invitation_payload)
+                    invitations.append(invitation)
+                    invitation_outbox_ids.append(outbox_id)
         audit(db, owner_id, request.application_id, f"{request.request_type}_{request.status}",
               {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note})
         response = approval_dict(request)
@@ -1543,6 +1621,10 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             await enqueue_screening_async(task_id)
         except Exception as exc:
             mark_enqueue_failed(task_id, str(exc))
+    for outbox_id in invitation_outbox_ids:
+        dispatch_outbox(outbox_id)
+    for invitation in invitations:
+        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
     return response
 
 
@@ -1986,43 +2068,47 @@ def run_due_interview_operations(owner_id: str = Depends(current_tenant_id)) -> 
     return result
 
 
+def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvitationCreate) -> tuple[dict, str]:
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    invitation = SchedulingInvitation(
+        owner_id=item.owner_id, application_id=item.id, token_hash=token_hash,
+        timezone_name=payload.timezone_name, duration_minutes=payload.duration_minutes,
+        expires_at=utcnow() + timedelta(hours=payload.expires_in_hours),
+    )
+    db.add(invitation); db.flush()
+    public_url = f"{get_settings().public_app_url}/?schedule={raw_token}"
+    rendered = render_template(
+        db, item.owner_id, "scheduling_invitation", "Mời chọn lịch phỏng vấn",
+        "Chào {candidate_name},\n\nBạn đã vào danh sách phỏng vấn. Vui lòng chọn lịch tại: {public_url}\n"
+        "Liên kết hết hạn lúc {expires_at}. Lịch bạn chọn sẽ được giữ riêng và chờ HR xác nhận.",
+        {"candidate_name": item.candidate_name, "public_url": public_url,
+         "expires_at": invitation.expires_at.isoformat()},
+    )
+    outbox = add_outbox(
+        db, owner_id=item.owner_id, aggregate_type="scheduling_invitation", aggregate_id=invitation.id,
+        operation="EMAIL_SEND", idempotency_key=f"scheduling-invitation:{invitation.id}", payload={
+            "to": item.candidate_email,
+            **rendered,
+        },
+    )
+    item.status = ApplicationStatus.INTERVIEW_PENDING.value
+    audit(db, item.owner_id, item.id, "SCHEDULING_INVITATION_CREATED", {"invitation_id": invitation.id})
+    return ({"id": invitation.id, "status": invitation.status, "public_url": public_url,
+             "expires_at": invitation.expires_at.isoformat(), "delivery_status": outbox.status}, outbox.id)
+
+
 @app.post("/api/applications/{application_id}/scheduling-invitations", status_code=201)
 def create_scheduling_invitation(application_id: str, payload: SchedulingInvitationCreate,
                                  owner_id: str = Depends(current_tenant_id)) -> dict:
-    raw_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     outbox_id = ""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
         if not item.candidate_email:
             raise HTTPException(409, "Candidate email is required")
-        invitation = SchedulingInvitation(
-            owner_id=owner_id, application_id=item.id, token_hash=token_hash,
-            timezone_name=payload.timezone_name, duration_minutes=payload.duration_minutes,
-            expires_at=utcnow() + timedelta(hours=payload.expires_in_hours),
-        )
-        db.add(invitation); db.flush()
-        public_url = f"{get_settings().public_app_url}/?schedule={raw_token}"
-        rendered = render_template(
-            db, owner_id, "scheduling_invitation", "Mời chọn lịch phỏng vấn",
-            "Chào {candidate_name},\n\nVui lòng chọn lịch phỏng vấn tại: {public_url}\nLiên kết hết hạn lúc {expires_at}.",
-            {"candidate_name": item.candidate_name, "public_url": public_url,
-             "expires_at": invitation.expires_at.isoformat()},
-        )
-        outbox = add_outbox(
-            db, owner_id=owner_id, aggregate_type="scheduling_invitation", aggregate_id=invitation.id,
-            operation="EMAIL_SEND", idempotency_key=f"scheduling-invitation:{invitation.id}", payload={
-                "to": item.candidate_email,
-                **rendered,
-            },
-        )
-        outbox_id = outbox.id
-        item.status = ApplicationStatus.INTERVIEW_PENDING.value
-        audit(db, owner_id, item.id, "SCHEDULING_INVITATION_CREATED", {"invitation_id": invitation.id})
-        response = {"id": invitation.id, "status": invitation.status, "public_url": public_url,
-                    "expires_at": invitation.expires_at.isoformat(), "delivery_status": outbox.status}
+        response, outbox_id = _create_scheduling_invitation(db, item, payload)
     dispatch_outbox(outbox_id)
-    schedule_follow_up_sweep(owner_id, invitation.expires_at, f"invitation:{invitation.id}")
+    schedule_follow_up_sweep(owner_id, datetime.fromisoformat(response["expires_at"]), f"invitation:{response['id']}")
     return response
 
 
@@ -2109,18 +2195,50 @@ def book_public_interview(token: str, payload: BookingCreate) -> dict:
                 return interview_dict(existing)
             value = Interview(owner_id=invitation.owner_id, application_id=item.id, start_at=payload.slot,
                               end_at=payload.slot + timedelta(minutes=invitation.duration_minutes),
-                              status="PENDING_EXTERNAL", meeting_url="", timezone_name=payload.timezone_name,
+                              status=InterviewStatus.PENDING_CONFIRMATION.value, meeting_url="", timezone_name=payload.timezone_name,
                               provider=get_settings().integration_provider, idempotency_key=idem)
-            db.add(value); db.flush()
-            outbox = add_outbox(db, owner_id=invitation.owner_id, aggregate_type="interview", aggregate_id=value.id,
-                                operation="CALENDAR_CREATE", idempotency_key=f"calendar-create:{idem}", payload={})
-            outbox_id = outbox.id
+            db.add(value)
+            try:
+                db.flush()
+            except IntegrityError:
+                raise HTTPException(409, "Slot is no longer available") from None
             invitation.status = "USED"; invitation.selected_at = utcnow()
             item.status = ApplicationStatus.INTERVIEW_PENDING.value
-            audit(db, invitation.owner_id, item.id, "INTERVIEW_SLOT_SELECTED", {"interview_id": value.id})
+            audit(db, invitation.owner_id, item.id, "INTERVIEW_SLOT_HELD", {"interview_id": value.id})
             response = interview_dict(value)
     if blocked_reason:
         raise HTTPException(409, blocked_reason)
+    if outbox_id:
+        dispatch_outbox(outbox_id)
+    with session_scope() as db:
+        return interview_dict(db.get(Interview, response["id"]))
+
+
+@app.post("/api/interviews/{interview_id}/confirm")
+def confirm_interview(interview_id: str, payload: InterviewConfirmation,
+                      owner_id: str = Depends(current_tenant_id)) -> dict:
+    outbox_id = ""
+    with session_scope() as db:
+        value = db.scalar(select(Interview).where(
+            Interview.id == interview_id, Interview.owner_id == owner_id,
+        ))
+        if not value:
+            raise HTTPException(404, "Interview not found")
+        if value.status == InterviewStatus.SCHEDULED.value:
+            return interview_dict(value)
+        if value.status != InterviewStatus.PENDING_CONFIRMATION.value:
+            raise HTTPException(409, "Only a candidate-held slot can be confirmed")
+        application = require_application(db, value.application_id, owner_id)
+        value.status = "PENDING_EXTERNAL"
+        outbox = add_outbox(
+            db, owner_id=owner_id, aggregate_type="interview", aggregate_id=value.id,
+            operation="CALENDAR_CREATE", idempotency_key=f"calendar-confirm:{value.id}", payload={},
+        )
+        outbox_id = outbox.id
+        audit(db, owner_id, application.id, "INTERVIEW_CONFIRMED_BY_HR", {
+            "interview_id": value.id, "note": payload.note,
+        })
+        response = interview_dict(value)
     dispatch_outbox(outbox_id)
     with session_scope() as db:
         return interview_dict(db.get(Interview, response["id"]))

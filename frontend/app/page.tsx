@@ -131,7 +131,8 @@ function RecruiterApp() {
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [modal, setModal] = useState<"job" | "upload" | "schedule" | null>(null);
+  const [modal, setModal] = useState<"job" | "upload" | "schedule" | "criteria" | null>(null);
+  const [criteriaJob, setCriteriaJob] = useState<Job | null>(null);
   const [candidateTab, setCandidateTab] = useState("all");
   const [slots, setSlots] = useState<{ start_at: string; duration_minutes: number }[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -295,10 +296,11 @@ function RecruiterApp() {
     });
   };
 
-  const approveCriteria = async (jobId: string) => {
+  const approveCriteria = async (jobId: string, criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => {
     await runAction(`criteria-${jobId}`, "Đang duyệt tiêu chí", async () => {
+      await request(`/api/jobs/${jobId}/criteria`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...criteria, note: "Recruiter reviewed criteria" }) });
       await request(`/api/jobs/${jobId}/approve-criteria`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true, note: "Recruiter approved criteria" }) });
-      await loadDashboard(); notify("Đã duyệt tiêu chí tuyển dụng");
+      setModal(null); setCriteriaJob(null); await loadDashboard(); notify("Đã lưu và duyệt tiêu chí tuyển dụng");
     });
   };
 
@@ -307,8 +309,8 @@ function RecruiterApp() {
       const data = await request<{ items: Application[] }>(`/api/jobs/${jobId}/shortlist?limit=5`);
       const application_ids = data.items.map(item => item.id);
       if (!application_ids.length) { notify("Job này chưa có CV để shortlist"); return; }
-      await request(`/api/jobs/${jobId}/approve-shortlist`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ application_ids, note: "Recruiter approved AI top 5 shortlist" }) });
-      await loadDashboard(); notify(`Đã duyệt Top ${application_ids.length} ứng viên`);
+      const approved = await request<{ invitations?: unknown[] }>(`/api/jobs/${jobId}/approve-shortlist`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ application_ids, note: "Recruiter approved AI top 5 shortlist" }) });
+      await loadDashboard(); notify(`Đã duyệt Top ${application_ids.length} và gửi ${approved.invitations?.length || 0} email mời đặt lịch`);
     });
   };
 
@@ -359,7 +361,7 @@ function RecruiterApp() {
     <aside className="sidebar">
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
       <nav><p className="nav-label">WORKSPACE</p>
-        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Mail Sandbox","bell"]].map(([label,icon]) =>
+        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
           <button key={label} className={active === label ? "nav-item active" : "nav-item"} onClick={() => setActive(label)}><Icon name={icon}/>{label}{label === "Ứng viên" && <span className="count">{dashboard.metrics.awaiting_review}</span>}{label === "Phê duyệt" && approvals.length > 0 && <span className="count">{approvals.length}</span>}</button>)}
         <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
       </nav>
@@ -381,10 +383,11 @@ function RecruiterApp() {
             <article className="metric" key={m.label}><div className={`metric-icon ${m.tone}`}><Icon name={m.icon}/></div><div><p>{m.label}</p><strong>{loading ? "—" : m.value}</strong><span className={`delta ${m.tone}`}>Live</span></div></article>)}
         </section>}
 
-        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onApproveCriteria={approveCriteria} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
+        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
-        : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard}/>
+        : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
+        : active === "Xoá dữ liệu" ? <ClearDataView dashboard={dashboard} onCleared={async () => { setSelected(null); setLastBatch(null); await loadDashboard(); }}/>
         : <><div className="dashboard-grid">
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
             {active === "Ứng viên" && <div className="candidate-tabs">{[
@@ -409,6 +412,7 @@ function RecruiterApp() {
     {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
+    {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => approveCriteria(criteriaJob.id, criteria)}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
@@ -440,7 +444,7 @@ function PublicScheduling({ token }: { token: string }) {
   return <main className="public-schedule-page"><section className="public-schedule-card">
     <div className="brand public-brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>Candidate Scheduling</span></div></div>
     {error ? <div className="error-banner"><b>Không thể tiếp tục.</b> {error}</div>
-    : booked ? <div className="booking-success"><i><Icon name="check"/></i><span className="eyebrow">ĐÃ XÁC NHẬN</span><h1>{data?.mode === "reschedule" ? "Lịch phỏng vấn đã được đổi" : "Lịch phỏng vấn đã được giữ"}</h1><p>{dateLabel(booked.start_at)}</p>{booked.meeting_url && <a href={booked.meeting_url}>Mở phòng họp</a>}</div>
+    : booked ? <div className="booking-success"><i><Icon name="check"/></i><span className="eyebrow">ĐÃ GIỮ LỊCH</span><h1>{data?.mode === "reschedule" ? "Yêu cầu đổi lịch đã được ghi nhận" : "Khung giờ đã được giữ cho bạn"}</h1><p>{dateLabel(booked.start_at)}</p><small>HR sẽ xác nhận và gửi email kèm thông tin tham gia.</small>{booked.meeting_url && <a href={booked.meeting_url}>Mở phòng họp</a>}</div>
     : !data ? <InlineProgress label="Đang kiểm tra lịch trống"/>
     : <><span className="eyebrow">{data.mode === "reschedule" ? "ĐỔI LỊCH TRONG POLICY" : "CHỌN LỊCH PHỎNG VẤN"}</span><h1>Chào {data.candidate_name}</h1><p>{data.mode === "reschedule" && data.interview ? <>Lịch hiện tại: <b>{dateLabel(data.interview.start_at)}</b>. </> : null}Chọn một khung giờ cho vị trí <b>{data.job_title}</b>. Thời lượng {data.duration_minutes} phút; giờ hiển thị theo thiết bị của bạn.</p><div className="slots public-slots">{data.slots.map(slot => <button key={slot.start_at} disabled={Boolean(busy)} onClick={() => void choose(slot.start_at)}>{busy === slot.start_at ? "Đang giữ lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div>{!data.slots.length && <div className="empty-state">Hiện chưa có lịch phù hợp. Vui lòng liên hệ recruiter.</div>}</>}
   </section></main>;
@@ -462,13 +466,13 @@ function DashboardSkeleton() {
   </section>;
 }
 
-function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onApproveCriteria, onApproveShortlist, onExportReport }: {
+function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
   jobs: Job[];
   actionBusy: boolean;
   pendingAction: PendingAction | null;
   onCreate: () => void;
   onDelete: (jobId: string) => Promise<void>;
-  onApproveCriteria: (jobId: string) => Promise<void>;
+  onReviewCriteria: (job: Job) => void;
   onApproveShortlist: (jobId: string) => Promise<void>;
   onExportReport: (job: Job) => Promise<void>;
 }) {
@@ -477,8 +481,49 @@ function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onAppro
     const preferred = job.requirements?.preferred_skills || [];
     const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
     const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
-    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => void onApproveCriteria(job.id)}>{pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Duyệt tiêu chí"}</button><button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={actionBusy || !job.applications_count} onClick={() => void onExportReport(job)}>{pendingAction?.key === `export-${job.id}` ? "Đang xuất..." : "Xuất report"}</button><button className="danger-link" disabled={actionBusy} onClick={() => void onDelete(job.id)}>{pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}</button></div></article>;
+    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => onReviewCriteria(job)}>{pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Kiểm tra tiêu chí"}</button><button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={actionBusy || !job.applications_count} onClick={() => void onExportReport(job)}>{pendingAction?.key === `export-${job.id}` ? "Đang xuất..." : "Xuất report"}</button><button className="danger-link" disabled={actionBusy} onClick={() => void onDelete(job.id)}>{pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}</button></div></article>;
   })}</section>;
+}
+
+function CriteriaModal({ job, busy, onClose, onSubmit }: {
+  job: Job; busy: boolean; onClose: () => void;
+  onSubmit: (criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => Promise<void>;
+}) {
+  const [required, setRequired] = useState((job.requirements?.required_skills || []).map(value => ({ value, checked: true })));
+  const [preferred, setPreferred] = useState((job.requirements?.preferred_skills || []).map(value => ({ value, checked: true })));
+  const [newCriterion, setNewCriterion] = useState("");
+  const [newKind, setNewKind] = useState<"required" | "preferred">("required");
+  const [experience, setExperience] = useState(Number(job.requirements?.minimum_experience || 0));
+  const add = () => {
+    const value = newCriterion.trim();
+    if (!value) return;
+    const setter = newKind === "required" ? setRequired : setPreferred;
+    setter(items => items.some(item => item.value.toLowerCase() === value.toLowerCase()) ? items : [...items, { value, checked: true }]);
+    setNewCriterion("");
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const required_skills = required.filter(item => item.checked).map(item => item.value);
+    if (!required_skills.length) return;
+    await onSubmit({ required_skills, preferred_skills: preferred.filter(item => item.checked).map(item => item.value), minimum_experience: experience });
+  };
+  return <div className="modal-layer"><form className="modal form-modal criteria-modal" onSubmit={submit}><button type="button" className="close" disabled={busy} onClick={onClose}>×</button><span className="eyebrow">HUMAN REVIEW</span><h2>Duyệt tiêu chí · {job.title}</h2><p>Check/uncheck tiêu chí AI đã tách, hoặc bổ sung tiêu chí mới trước khi phê duyệt.</p><fieldset disabled={busy}><h3>Bắt buộc</h3><div className="criteria-checks">{required.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setRequired(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}</div><h3>Ưu tiên</h3><div className="criteria-checks">{preferred.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setPreferred(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}{!preferred.length && <small>Chưa có tiêu chí ưu tiên.</small>}</div><div className="criteria-add"><input value={newCriterion} onChange={event => setNewCriterion(event.target.value)} placeholder="Bổ sung kỹ năng/tiêu chí"/><select value={newKind} onChange={event => setNewKind(event.target.value as "required" | "preferred")}><option value="required">Bắt buộc</option><option value="preferred">Ưu tiên</option></select><button type="button" className="secondary compact" onClick={add}>Thêm</button></div><label><span>Kinh nghiệm tối thiểu (năm)</span><input type="number" min="0" max="60" value={experience} onChange={event => setExperience(Number(event.target.value))}/></label><button className="primary submit" disabled={!required.some(item => item.checked)}>{busy ? "Đang lưu và duyệt..." : "Lưu & duyệt tiêu chí"}</button></fieldset></form></div>;
+}
+
+function ClearDataView({ dashboard, onCleared }: { dashboard: Dashboard; onCleared: () => Promise<void> }) {
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const clear = async () => {
+    setBusy(true); setMessage("");
+    try {
+      const result = await request<{ removed: { jobs: number; applications: number; interviews: number } }>("/api/data/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation }) });
+      await onCleared(); setConfirmation("");
+      setMessage(`Đã xoá ${result.removed.jobs} việc làm, ${result.removed.applications} CV/ứng viên và ${result.removed.interviews} lịch phỏng vấn.`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Không thể xoá dữ liệu"); }
+    finally { setBusy(false); }
+  };
+  return <section className="panel clear-data-view"><div className="panel-head"><div><h2>Xoá toàn bộ dữ liệu tuyển dụng</h2><p>Giữ nguyên tài khoản, phân quyền, kết nối và cấu hình hệ thống.</p></div><span className="status rejected">DANGER ZONE</span></div><div className="clear-data-body"><h3>Sẽ xoá vĩnh viễn</h3><div className="clear-summary"><span><b>{dashboard.jobs.length}</b> việc làm</span><span><b>{dashboard.applications.length}</b> CV / ứng viên</span><span><b>{dashboard.interviews?.length || 0}</b> lịch phỏng vấn</span></div><p>Nhập chính xác <code>XOA TOAN BO</code> để xác nhận.</p><input value={confirmation} onChange={event => setConfirmation(event.target.value)} placeholder="XOA TOAN BO"/><button className="danger" disabled={busy || confirmation.trim().toUpperCase() !== "XOA TOAN BO"} onClick={() => void clear()}>{busy ? "Đang xoá..." : "Xoá toàn bộ dữ liệu"}</button>{message && <p className="operations-message">{message}</p>}</div></section>;
 }
 
 function ApprovalInbox({ approvals, actionBusy, pendingAction, onResolve }: {
@@ -489,7 +534,7 @@ function ApprovalInbox({ approvals, actionBusy, pendingAction, onResolve }: {
   return <section className="panel approval-view"><div className="panel-head"><div><h2>Approval inbox</h2><p>{approvals.length} quyết định cần recruiter xử lý</p></div><span className="bounded-badge">Bounded agent</span></div>{approvals.length ? approvals.map(item => <article className="approval-row" key={item.id}><div className={`approval-type ${item.type.toLowerCase()}`}><Icon name={item.type === "SHORTLIST" ? "users" : item.type === "CRITERIA" ? "briefcase" : "spark"}/></div><div><span className="eyebrow">{labels[item.type]}</span><h3>{item.title}</h3><p>{item.summary}</p>{item.type === "EVIDENCE" && <small>Confidence: {Math.round(Number(item.payload.confidence || 0) * 100)}% · {(item.payload.reasons as string[] || []).join(", ")}</small>}{item.type === "SHORTLIST" && <small>{(item.payload.application_ids as string[] || []).length} ứng viên được đề xuất · Chưa outreach</small>}</div><div className="approval-actions"><button className="secondary compact" disabled={actionBusy} onClick={() => void onResolve(item, "REJECT")}>Trả lại</button><button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(item, "APPROVE")}>{pendingAction?.key === `approval-${item.id}` ? "Đang xử lý..." : item.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}</button></div></article>) : <div className="empty-state">Inbox đã sạch. Agent chỉ chuyển tới đây các quyết định cần người.</div>}</section>;
 }
 
-function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
+function InterviewsView({ dashboard, onChanged }: { dashboard: Dashboard; onChanged: () => Promise<void> }) {
   type Ops = { reminders: { id: string; status: string; due_at: string }[]; scorecards: { id: string; interviewer_email: string; recommendation: string }[]; feedback_summary?: { summary: string; strengths: string[]; concerns: string[]; conflicts: unknown[]; sources: unknown[] } };
   const [selectedId, setSelectedId] = useState("");
   const [ops, setOps] = useState<Ops | null>(null);
@@ -507,8 +552,16 @@ function InterviewsView({ dashboard }: { dashboard: Dashboard }) {
     } catch (error) { setMessage(error instanceof Error ? error.message : "Không lưu được scorecard"); setBusy(false); }
   };
   const markNoShow = async () => { if (!selectedInterview) return; setBusy(true); try { await request(`/api/interviews/${selectedInterview.id}/no-show`, { method: "POST" }); setMessage("Đã chuyển no-show vào approval inbox."); await loadOps(selectedInterview.id); } catch (error) { setMessage(error instanceof Error ? error.message : "Không cập nhật được"); setBusy(false); } };
+  const confirmInterview = async (id: string) => {
+    setBusy(true); setMessage("");
+    try {
+      await request(`/api/interviews/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: "HR confirmed candidate-selected slot" }) });
+      await onChanged(); setMessage("Đã xác nhận lịch và gửi email phản hồi cho ứng viên.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Không xác nhận được lịch"); }
+    finally { setBusy(false); }
+  };
   const rubric = person?.screening.interview_kit?.rubric || [];
-  return <section className="panel jobs-view interview-ops"><div className="panel-head"><div><h2>Interview operations</h2><p>Reminder, reschedule, scorecard và escalation theo policy</p></div><span className="bounded-badge">Human-gated</span></div>{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const candidate = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{candidate?.candidate.name || "Ứng viên"} · đổi lịch {interview.reschedule_count || 0} lần</p></div>{interview.meeting_url && <a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a>}<i className={`status ${interview.status === "NO_SHOW" ? "rejected" : "review"}`}>{interview.status}</i><button className="secondary compact" disabled={busy} onClick={() => void loadOps(interview.id)}>Operations</button></article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Mở hồ sơ ứng viên để mời phỏng vấn.</div>}
+  return <section className="panel jobs-view interview-ops"><div className="panel-head"><div><h2>Interview operations</h2><p>Ứng viên giữ slot trước; HR xác nhận để tạo lịch và gửi email.</p></div><span className="bounded-badge">Human-gated</span></div>{message && <p className="operations-message interview-message">{message}</p>}{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const candidate = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{candidate?.candidate.name || "Ứng viên"} · đổi lịch {interview.reschedule_count || 0} lần</p></div>{interview.meeting_url && <a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a>}<i className={`status ${interview.status === "NO_SHOW" ? "rejected" : interview.status === "SCHEDULED" ? "interview" : "review"}`}>{interview.status === "PENDING_CONFIRMATION" ? "Chờ HR xác nhận" : interview.status}</i>{interview.status === "PENDING_CONFIRMATION" ? <button className="primary compact" disabled={busy} onClick={() => void confirmInterview(interview.id)}>{busy ? "Đang xác nhận..." : "Xác nhận lịch"}</button> : <button className="secondary compact" disabled={busy} onClick={() => void loadOps(interview.id)}>Operations</button>}</article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Duyệt Top 5 để tự động gửi link chọn lịch.</div>}
     {selectedInterview && <div className="operations-detail"><div className="panel-head"><div><span className="eyebrow">FOLLOW-UP AGENT</span><h3>{person?.candidate.name || "Ứng viên"}</h3></div><button className="danger-link" disabled={busy || selectedInterview.status === "NO_SHOW"} onClick={() => void markNoShow()}>Đánh dấu no-show</button></div>{busy && <InlineProgress label="Đang đồng bộ interview operations"/>}{message && <p className="operations-message">{message}</p>}<div className="operations-grid"><div><h4>Reminder</h4>{ops?.reminders.length ? ops.reminders.map(item => <p key={item.id}><b>{dateLabel(item.due_at)}</b><span>{item.status}</span></p>) : <small>Chưa có reminder.</small>}</div><div><h4>Scorecard</h4>{ops?.scorecards.length ? ops.scorecards.map(item => <p key={item.id}><b>{item.interviewer_email}</b><span>{item.recommendation}</span></p>) : <small>Đang chờ feedback.</small>}</div></div>{ops?.feedback_summary && <article className="feedback-summary"><h4>Feedback summary</h4><p>{ops.feedback_summary.summary}</p><small>Nguồn: {ops.feedback_summary.sources.length} scorecard · Mâu thuẫn: {ops.feedback_summary.conflicts.length}</small></article>}<form className="scorecard-form" onSubmit={submitScorecard}><h4>Nộp scorecard có cấu trúc</h4><input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/><select name="criterion" required defaultValue={rubric[0]?.criterion || "Technical capability"}>{rubric.map(item => <option key={item.criterion}>{item.criterion}</option>)}{!rubric.length && <option>Technical capability</option>}</select><select name="rating" defaultValue="3"><option value="1">1 — Không đạt</option><option value="2">2</option><option value="3">3 — Trung bình</option><option value="4">4</option><option value="5">5 — Xuất sắc</option></select><select name="recommendation" defaultValue="MIXED"><option value="STRONG_YES">Strong yes</option><option value="YES">Yes</option><option value="MIXED">Mixed</option><option value="NO">No</option><option value="STRONG_NO">Strong no</option></select><textarea name="evidence" required placeholder="Evidence quan sát được trong buổi phỏng vấn"/><textarea name="note" placeholder="Ghi chú bổ sung"/><button className="primary compact" disabled={busy}>Lưu scorecard</button></form></div>}
   </section>;
 }

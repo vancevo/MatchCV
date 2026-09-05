@@ -49,13 +49,24 @@ def test_self_scheduling_link_is_hashed_single_use_and_dispatches_outbox():
     assert schedule.status_code == 200
     assert schedule.json()["timezone"] == "Asia/Ho_Chi_Minh"
     slot = schedule.json()["slots"][0]["start_at"]
+    second_application = _application()
+    second_invitation = client.post(f"/api/applications/{second_application['id']}/scheduling-invitations", json={
+        "timezone_name": "Asia/Ho_Chi_Minh", "duration_minutes": 60, "expires_in_hours": 24,
+    }).json()
+    second_token = second_invitation["public_url"].split("schedule=", 1)[1]
     booked = client.post(f"/api/public/scheduling/{token}", json={
         "slot": slot, "timezone_name": "Asia/Ho_Chi_Minh", "idempotency_key": f"candidate-{application['id']}",
     })
     assert booked.status_code == 201
-    assert booked.json()["status"] == "SCHEDULED"
+    assert booked.json()["status"] == "PENDING_CONFIRMATION"
+    assert booked.json()["meeting_url"] == ""
+    second_slots = client.get(f"/api/public/scheduling/{second_token}").json()["slots"]
+    assert slot not in {item["start_at"] for item in second_slots}
+    confirmed = client.post(f"/api/interviews/{booked.json()['id']}/confirm", json={"note": "Approved by HR"})
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "SCHEDULED"
+    assert confirmed.json()["meeting_url"].startswith("https://meet.example/")
     assert booked.json()["provider"] == "local"
-    assert booked.json()["meeting_url"].startswith("https://meet.example/")
     assert client.get(f"/api/public/scheduling/{token}").status_code == 404
 
     outbox = client.get("/api/outbox").json()

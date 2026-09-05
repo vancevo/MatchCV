@@ -113,4 +113,4 @@ def test_low_confidence_routes_to_inbox_and_shortlist_is_only_a_proposal():
     })
     assert resolved.status_code == 200
     applications = client.get(f"/api/applications?job_id={job['id']}").json()
-    assert next(item for item in applications if item["id"] == strong["id"])["status"] == "SHORTLISTED"
+    assert next(item for item in applications if item["id"] == strong["id"])["status"] == "INTERVIEW_PENDING"

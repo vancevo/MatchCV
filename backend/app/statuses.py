@@ -35,6 +35,7 @@ class ApplicationStatus(str, Enum):
 
 
 class InterviewStatus(str, Enum):
+    PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
     SCHEDULED = "SCHEDULED"
     RESCHEDULING = "RESCHEDULING"
     FEEDBACK_PENDING = "FEEDBACK_PENDING"

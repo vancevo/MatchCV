@@ -1,9 +1,25 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.main import seed
 
 
 client = TestClient(app)
+
+
+def test_clear_recruitment_data_requires_phrase_and_preserves_clean_dashboard():
+    rejected = client.post("/api/data/clear", json={"confirmation": "yes"})
+    assert rejected.status_code == 422
+    try:
+        cleared = client.post("/api/data/clear", json={"confirmation": "XOA TOAN BO"})
+        assert cleared.status_code == 200
+        assert cleared.json()["removed"]["jobs"] >= 1
+        dashboard = client.get("/api/dashboard").json()
+        assert dashboard["jobs"] == []
+        assert dashboard["applications"] == []
+        assert dashboard["interviews"] == []
+    finally:
+        seed()
 
 
 def test_health_and_dashboard():
@@ -91,7 +107,8 @@ def test_criteria_and_shortlist_approval():
         "note": "Approve top candidate",
     })
     assert approved.status_code == 200
-    assert approved.json()["items"][0]["status"] == "SHORTLISTED"
+    assert approved.json()["items"][0]["status"] == "INTERVIEW_PENDING"
+    assert len(approved.json()["invitations"]) == 1
 
     report = client.get(f"/api/jobs/{job['id']}/shortlist-report")
     assert report.status_code == 200
