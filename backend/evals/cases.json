@@ -12,7 +12,8 @@
       {"id": "partial", "resume_text": "2 năm lập trình Python và xây dựng REST API."},
       {"id": "weak", "resume_text": "1 năm hỗ trợ nội dung và chăm sóc khách hàng."}
     ],
-    "expected_top_candidate": "strong"
+    "expected_top_candidate": "strong",
+    "expected_manual_review": ["partial", "weak"]
   },
   {
     "id": "frontend-typescript",
@@ -26,6 +27,7 @@
       {"id": "partial", "resume_text": "3 năm React và phát triển giao diện web."},
       {"id": "strong", "resume_text": "5 năm React, TypeScript; triển khai ứng dụng trên AWS."}
     ],
-    "expected_top_candidate": "strong"
+    "expected_top_candidate": "strong",
+    "expected_manual_review": ["partial"]
   }
 ]

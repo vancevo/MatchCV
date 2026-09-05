@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import jwt
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
+from sqlalchemy import select
 
 from .config import get_settings
 
@@ -33,3 +34,58 @@ def current_user_id(authorization: str | None = Header(default=None)) -> str:
     if not user_id:
         raise HTTPException(401, "Access token has no user id")
     return user_id
+
+
+def current_tenant_id(
+    request: Request,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    user_id: str = Depends(current_user_id),
+) -> str:
+    """Resolve the data boundary; the user's personal tenant stays backward compatible."""
+    tenant_id = (x_tenant_id or user_id).strip()
+    if tenant_id == user_id:
+        return tenant_id
+    from .database import session_scope
+    from .models import TenantMembership
+
+    with session_scope() as db:
+        member = db.scalar(select(TenantMembership).where(
+            TenantMembership.tenant_id == tenant_id,
+            TenantMembership.user_id == user_id,
+            TenantMembership.status == "ACTIVE",
+        ))
+        if not member:
+            raise HTTPException(403, "Tenant access denied")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and member.role.upper() == "VIEWER":
+            raise HTTPException(403, "Viewer role is read-only")
+    return tenant_id
+
+
+def require_tenant_role(*allowed_roles: str):
+    allowed = {role.upper() for role in allowed_roles}
+
+    def dependency(
+        x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+        user_id: str = Depends(current_user_id),
+    ) -> str:
+        tenant_id = (x_tenant_id or user_id).strip()
+        if tenant_id == user_id:
+            role = "OWNER"
+        else:
+            from .database import session_scope
+            from .models import TenantMembership
+
+            with session_scope() as db:
+                member = db.scalar(select(TenantMembership).where(
+                    TenantMembership.tenant_id == tenant_id,
+                    TenantMembership.user_id == user_id,
+                    TenantMembership.status == "ACTIVE",
+                ))
+                if not member:
+                    raise HTTPException(403, "Tenant access denied")
+                role = member.role.upper()
+        if role not in allowed:
+            raise HTTPException(403, "Insufficient tenant role")
+        return tenant_id
+
+    return dependency

@@ -54,6 +54,18 @@ class Settings:
     queue_eager: bool
     task_max_attempts: int
     task_timeout_seconds: int
+    integration_provider: str
+    integration_token_secret: str
+    oauth_state_secret: str
+    public_app_url: str
+    google_client_id: str
+    google_client_secret: str
+    google_redirect_uri: str
+    microsoft_client_id: str
+    microsoft_client_secret: str
+    microsoft_redirect_uri: str
+    provider_webhook_secret: str
+    operational_sweep_interval_minutes: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -76,6 +88,17 @@ class Settings:
         if not queue_eager and not redis_url:
             raise RuntimeError("QUEUE_EAGER=false requires REDIS_URL")
 
+        integration_provider = os.getenv("INTEGRATION_PROVIDER", "local").strip().lower()
+        if integration_provider not in {"local", "google", "microsoft"}:
+            raise RuntimeError("INTEGRATION_PROVIDER must be local, google, or microsoft")
+        token_secret = os.getenv("INTEGRATION_TOKEN_SECRET", jwt_secret or "talentflow-local-token-key").strip()
+        oauth_state_secret = os.getenv("OAUTH_STATE_SECRET", jwt_secret or "talentflow-local-oauth-state").strip()
+        if environment in {"staging", "production"} and integration_provider != "local":
+            if token_secret == "talentflow-local-token-key" or oauth_state_secret == "talentflow-local-oauth-state":
+                raise RuntimeError("Real integrations require INTEGRATION_TOKEN_SECRET and OAUTH_STATE_SECRET")
+            if queue_eager:
+                raise RuntimeError("Real integrations in staging/production require QUEUE_EAGER=false for durable outbox retry")
+
         return cls(
             environment=environment,
             database_url=os.getenv("DATABASE_URL", "").strip(),
@@ -95,6 +118,18 @@ class Settings:
             queue_eager=queue_eager,
             task_max_attempts=_positive_int("TASK_MAX_ATTEMPTS", 3, 10),
             task_timeout_seconds=_positive_int("TASK_TIMEOUT_SECONDS", 120, 3600),
+            integration_provider=integration_provider,
+            integration_token_secret=token_secret,
+            oauth_state_secret=oauth_state_secret,
+            public_app_url=os.getenv("PUBLIC_APP_URL", "http://localhost:3000").strip().rstrip("/"),
+            google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
+            google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip(),
+            google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/integrations/google/callback").strip(),
+            microsoft_client_id=os.getenv("MICROSOFT_CLIENT_ID", "").strip(),
+            microsoft_client_secret=os.getenv("MICROSOFT_CLIENT_SECRET", "").strip(),
+            microsoft_redirect_uri=os.getenv("MICROSOFT_REDIRECT_URI", "http://localhost:8000/api/integrations/microsoft/callback").strip(),
+            provider_webhook_secret=os.getenv("PROVIDER_WEBHOOK_SECRET", "").strip(),
+            operational_sweep_interval_minutes=_positive_int("OPERATIONAL_SWEEP_INTERVAL_MINUTES", 15, 1440),
         )
 
 

@@ -1,4 +1,4 @@
-.PHONY: dev frontend backend worker migrate test eval build docker-up
+.PHONY: dev frontend backend worker migrate test eval build docker-up promote-release
 
 QUEUE_URL ?= redis://localhost:6379/0
 
@@ -28,3 +28,6 @@ build:
 
 docker-up:
 	docker compose up --build
+
+promote-release:
+	cd backend && .venv/bin/python -m scripts.promote_release

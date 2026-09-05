@@ -12,3 +12,4 @@ psycopg[binary]==3.2.3
 PyJWT[crypto]==2.10.1
 redis==5.2.1
 rq==2.1.0
+cryptography==44.0.0

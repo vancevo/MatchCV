@@ -2,7 +2,7 @@
 
 TalentFlow là MVP hỗ trợ recruiter tạo vị trí tuyển dụng, tiếp nhận CV, chấm mức độ phù hợp có evidence, duyệt shortlist và đặt lịch phỏng vấn. Hệ thống ưu tiên **decision support**: AI chuẩn bị dữ liệu và đề xuất, recruiter vẫn phê duyệt tiêu chí, shortlist và quyết định với ứng viên.
 
-> Trạng thái hiện tại: Mốc 1–2 đã hoàn thành. Batch CV có durable task, Redis/RQ worker, retry/DLQ, dedupe và progress thật. Calendar/email thật, semantic vector search và bounded shortlist agent chưa được triển khai. Xem [checklist triển khai](./IMPLEMENTATION_CHECKLIST.md) và [kế hoạch mở rộng Agentic AI](./AGENTIC_AI_EXPANSION_PLAN.md).
+> Trạng thái hiện tại: Mốc 1–9 đã hoàn thành phần implementation và test offline; các provider integration và production acceptance vẫn chờ tenant thật. Hệ thống có readiness gate, tenant operations metrics, scheduled SLO alerts, enforced canary promotion, tenant/RBAC, connector gateway có consent/provenance, data lifecycle, quota/kill switch và champion/challenger gate. Sourcing agent không được triển khai. Xem [checklist triển khai](./IMPLEMENTATION_CHECKLIST.md), [runbook production acceptance](./PRODUCTION_ACCEPTANCE_RUNBOOK.md), [kế hoạch mở rộng](./AGENTIC_AI_EXPANSION_PLAN.md) và [legal gate cho sourcing](./SOURCING_LEGAL_GATE.md).
 
 ## Luồng đang hoạt động
 
@@ -13,9 +13,14 @@ Tạo JD
   -> upload tối đa 20 CV PDF/DOCX/TXT
   -> extract text, nhận diện ứng viên và tạo durable task
   -> Redis/RQ worker đối chiếu kỹ năng + kinh nghiệm + evidence
-  -> retry nếu lỗi; tính điểm và sinh interview kit
-  -> recruiter review / duyệt shortlist
-  -> chọn slot demo và tạo lịch phỏng vấn
+  -> embedding + calibration; route anomaly/evidence yếu vào approval inbox
+  -> tự tạo shortlist proposal khi đủ điều kiện
+  -> recruiter review / duyệt proposal (không tự outreach)
+  -> gửi link self-scheduling có hạn dùng
+  -> candidate chọn slot; outbox tạo Calendar event/meeting và gửi email đúng một lần
+  -> RQ scheduler gửi reminder theo policy; candidate có capability link riêng để đổi lịch
+  -> thu scorecard có evidence; tổng hợp feedback có nguồn và phát hiện mâu thuẫn
+  -> bounce/no-show/timeout/out-of-scope được escalation vào approval inbox
 ```
 
 ## Những gì đã triển khai
@@ -31,6 +36,31 @@ Tạo JD
 - Frontend polling trạng thái thật của batch thay cho progress timer mô phỏng.
 - Chỉ lưu text đã extract, metadata và SHA-256 checksum; không lưu file CV gốc.
 - Screening có điểm rule, kinh nghiệm, semantic proxy, kỹ năng ưu tiên và evidence theo yêu cầu.
+- Criteria được version hóa; khi duyệt bản mới, toàn bộ hồ sơ được rescreen bằng durable task có parent-run lineage.
+- Embedding hashing 96 chiều chạy offline; PostgreSQL lưu bằng pgvector và HNSW cosine index, SQLite test lưu JSON.
+- Score được calibration theo eval baseline; confidence, borderline và score/evidence mismatch được route sang manual review.
+- Approval inbox hợp nhất tiêu chí, evidence yếu/anomaly và shortlist proposal.
+- Agent run trace model, prompt version, tool, token/cost và fallback; quyết định recruiter được audit riêng.
+- OAuth per recruiter cho Google/Microsoft; access/refresh token được mã hóa at rest và tự refresh.
+- Free/busy, create/update/cancel event, Gmail/Graph send-mail và webhook ingestion qua provider-neutral adapter.
+- Candidate self-scheduling dùng token chỉ lưu hash, single-use, expiry và timezone IANA.
+- Mọi calendar/email side effect đi qua transactional outbox có idempotency key, retry/backoff và audit.
+- Candidate/interviewer reminder được lên lịch bằng RQ scheduler; reschedule hủy reminder cũ và tạo lịch nhắc mới.
+- Link reschedule dùng token hash riêng, có expiry và giới hạn số lần cấu hình theo recruiter.
+- Scorecard lưu rubric, rating, evidence và recommendation; feedback summary có version và nguồn scorecard.
+- Bounce, no-show, scheduling/feedback timeout, quá giới hạn reschedule và phản hồi ngoài scope đi vào approval inbox.
+- Shared tenant dùng role `OWNER`, `ADMIN`, `RECRUITER`, `VIEWER`; viewer chỉ có quyền đọc và mọi query nghiệp vụ giữ tenant boundary.
+- Push connector gateway cho nguồn inbox/folder/ATS chỉ nhận `resumes.write`, dùng secret hash, bắt buộc consent timestamp, provenance và replay-safe source reference.
+- Candidate data có JSON export, hard-delete có audit hash và retention sweep chỉ áp dụng cho hồ sơ terminal.
+- Quota screening/token/cost theo tenant; email và calendar có kill switch được kiểm tra ngay trước dispatch side effect.
+- Model/prompt policy chia cohort xác định, trace variant và chỉ activate sau eval regression gate.
+- Liveness (`/api/live`) và readiness (`/api/ready`) tách riêng; staging/production fail readiness khi cấu hình bảo mật, database, queue hoặc provider chưa đạt.
+- Operations API theo tenant hiển thị task success, P50/P95 latency, outbox failure/backlog, approval quá SLA và mức dùng quota/chi phí.
+- SLO evaluator tạo rolling alert chống trùng, hỗ trợ acknowledge và tự resolve/reopen khi telemetry phục hồi hoặc tái diễn.
+- Canary release gate so sánh baseline/candidate theo sample size, success rate, P95 latency, cost và outbox failure trước promotion.
+- RQ scheduler tự chạy SLO sweep; on-call notification dùng cùng transactional outbox và chỉ gửi một lần cho mỗi alert episode.
+- Promotion endpoint và CLI CI/CD chặn fail-closed nếu canary/readiness/critical-alert gate chưa đạt.
+- Mail Sandbox theo tenant chỉ cho phép inbox chính hoặc Gmail alias dạng `vinhvp.khmtk36+<number>@gmail.com`; alias được giữ nguyên trong candidate/outbox/provider payload.
 - Xếp hạng Top N, duyệt shortlist và xuất report Markdown kèm interview kit.
 - Sinh bộ câu hỏi phỏng vấn riêng theo CV/JD bằng AI hoặc rules fallback.
 - Human review với các trạng thái xem xét, từ chối, lưu trữ, chờ/đã đặt lịch.
@@ -42,12 +72,16 @@ Tạo JD
 
 Các điểm sau **chưa phải tích hợp production**:
 
-- PostgreSQL hiện chưa bật pgvector; code chưa tạo embedding hay vector index.
-- `semantic_score` hiện là lexical proxy, không phải semantic search bằng embedding.
+- Embedding hiện dùng feature hashing xác định để chạy offline, chưa phải neural embedding đa ngôn ngữ.
+- Calibration hiện dùng bộ eval nhỏ; cần dữ liệu recruiter đã ẩn danh trước khi chọn threshold production.
 - Chưa dùng LangGraph/agent runtime; workflow được điều phối trực tiếp trong FastAPI.
-- Slot lịch được sinh từ dữ liệu mẫu; chưa đọc Google/Outlook Calendar.
-- Meeting URL dùng domain `meet.example`; chưa tạo phòng họp hay gửi email thật.
-- Chưa có sourcing, candidate outreach, reminder, reschedule hoặc tổng hợp feedback tự động.
+- Profile `local` dùng slot theo working hours và `meet.example`; chọn `INTEGRATION_PROVIDER=google|microsoft` cùng OAuth credentials để gọi provider thật.
+- Chưa chạy acceptance test end-to-end với tenant Google/Microsoft thật trong repo; cần hoàn tất trước production rollout.
+- Chưa có adapter pull cụ thể cho Gmail/Drive/ATS; upstream phải đẩy payload đã được consent vào connector gateway và cần acceptance test riêng.
+- Chưa có sourcing agent; runtime cố ý không scrape hoặc tự động tìm/liên hệ ứng viên cho tới khi hoàn tất legal gate theo từng nguồn.
+- Việc hiểu nội dung reply ngoài scope hiện dựa trên event đã được provider/adapter phân loại; chưa có NLP classifier cho email tự do.
+- Readiness, metrics, alert lifecycle và canary gate đã có trong ứng dụng; dashboard hạ tầng bên ngoài vẫn phải cấu hình trên môi trường deploy.
+- Scheduler/notification/CLI đã có trong code; production vẫn cần cấu hình recipient thật, RQ scheduler HA, fault-injection và đặt CLI trước bước chuyển traffic.
 
 ## Kiến trúc hiện tại
 
@@ -61,7 +95,7 @@ Các điểm sau **chưa phải tích hợp production**:
 | Fallback | Python rules | Duy trì luồng offline khi AI lỗi/hết quota |
 | CV parser | pypdf, python-docx | Extract text PDF/DOCX/TXT |
 | Auth | Supabase Auth | Session và phân vùng dữ liệu theo recruiter |
-| Database | SQLite / PostgreSQL | Jobs, applications, interviews, audit logs |
+| Database | SQLite / PostgreSQL + pgvector | Versioned artifacts, embeddings, proposals, approvals và dữ liệu nghiệp vụ |
 | Deploy | Docker Compose, Render | Local stack và cloud services |
 
 Evidence từ OpenRouter chỉ được chấp nhận khi là trích dẫn xuất hiện nguyên văn trong CV. Trước khi gửi CV đến provider, backend che tên đã nhận diện, email và số điện thoại phổ biến. Đây chưa phải cơ chế ẩn danh hóa toàn diện; không dùng dữ liệu thật trước khi hoàn tất đánh giá bảo mật và chính sách xử lý dữ liệu.
@@ -69,6 +103,8 @@ Evidence từ OpenRouter chỉ được chấp nhận khi là trích dẫn xuấ
 ## Chạy local
 
 Yêu cầu: Python 3.11+ và Node.js 22+.
+
+Repo có `.nvmrc`; chạy `nvm use` ở thư mục gốc để dùng đúng Node.js 22.19.0 trước khi cài hoặc build frontend.
 
 ### 1. Backend
 
@@ -111,6 +147,14 @@ QUEUE_EAGER=true
 TASK_MAX_ATTEMPTS=3
 TASK_TIMEOUT_SECONDS=120
 CORS_ORIGINS=http://localhost:3000
+PUBLIC_APP_URL=http://localhost:3000
+INTEGRATION_PROVIDER=local
+INTEGRATION_TOKEN_SECRET=replace-with-a-long-random-secret
+OAUTH_STATE_SECRET=replace-with-another-long-random-secret
+PROVIDER_WEBHOOK_SECRET=replace-with-a-webhook-secret
+OPERATIONAL_SWEEP_INTERVAL_MINUTES=15
+# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
+# MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET / MICROSOFT_REDIRECT_URI
 ```
 
 Frontend đọc `frontend/.env.local`:
@@ -139,8 +183,15 @@ Các biến quan trọng:
 | `TASK_MAX_ATTEMPTS` | Không | Tổng số lần worker thử một task |
 | `TASK_TIMEOUT_SECONDS` | Không | Timeout mỗi RQ job |
 | `CORS_ORIGINS` | Khi deploy | Danh sách origin frontend, phân cách bằng dấu phẩy |
+| `INTEGRATION_PROVIDER` | Không | `local`, `google` hoặc `microsoft`; chọn provider thực thi side effect |
+| `INTEGRATION_TOKEN_SECRET` | Provider thật | Khóa mã hóa access/refresh token at rest |
+| `OAUTH_STATE_SECRET` | Provider thật | Khóa ký OAuth state chống CSRF/replay |
+| `PUBLIC_APP_URL` | Khi gửi lời mời | Origin dùng để tạo link self-scheduling |
+| `PROVIDER_WEBHOOK_SECRET` | Khi deploy webhook | Secret kiểm tra Google channel token, Microsoft clientState hoặc header nội bộ |
+| `GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI` | Khi dùng Google | OAuth web application credentials |
+| `MICROSOFT_CLIENT_ID/SECRET/REDIRECT_URI` | Khi dùng Microsoft | Microsoft identity platform credentials |
 
-Kiểm tra `GET /api/health`: `ai.configured=true` nghĩa là backend đã đọc được OpenRouter key; trường này không khẳng định provider đang sẵn sàng hay còn quota.
+Sử dụng `GET /api/live` cho liveness và `GET /api/ready` cho readiness probe. `GET /api/health` giữ summary tương thích; `ai.configured=true` chỉ nghĩa là backend đã đọc được OpenRouter key, không khẳng định provider còn quota.
 
 ## Chạy bằng Docker
 
@@ -157,6 +208,7 @@ make worker
 ```
 
 Blueprint Render hiện giữ `QUEUE_EAGER=true` để không tự tạo resource có chi phí. Khi deploy async trên Render, cần chủ động tạo Key Value + Background Worker, cấp cùng `DATABASE_URL`, `REDIS_URL`, OpenRouter config và chuyển backend sang `QUEUE_EAGER=false`.
+Vì vậy blueprint miễn phí này là môi trường demo và sẽ không vượt qua production readiness gate của Phase 6 cho tới khi Redis/worker và provider thật được cấu hình.
 
 ## Kiểm thử và build
 
@@ -189,12 +241,48 @@ Không commit `.env`, API key hoặc service-role key vào repository.
 | Method | Endpoint | Mục đích |
 |---|---|---|
 | `GET` | `/api/health` | Health, cấu hình AI và auth |
+| `GET` | `/api/live` | Liveness tối thiểu của API process |
+| `GET` | `/api/ready` | Readiness của database, queue và production config |
+| `GET` | `/api/operations/readiness` | Readiness chi tiết theo tenant, gồm active provider connection |
+| `GET` | `/api/operations/metrics` | Workflow health, latency, outbox, approval SLA và quota theo tenant |
+| `GET/PUT` | `/api/operations/slo-policy` | Đọc/cấu hình ngưỡng SLO và canary theo tenant |
+| `POST` | `/api/operations/evaluate` | Đánh giá telemetry, dedupe hoặc auto-resolve operational alerts |
+| `POST` | `/api/operations/sweep` | Chạy tenant sweep và dispatch notification outbox ngay |
+| `GET` | `/api/operations/alerts` | Danh sách alert theo tenant và trạng thái |
+| `POST` | `/api/operations/alerts/{id}/action` | Acknowledge hoặc resolve alert |
+| `POST/GET` | `/api/operations/release-gates` | Đánh giá và đọc lịch sử canary promotion gate |
+| `POST` | `/api/operations/release-gates/{id}/promote` | Enforce readiness/canary/critical-alert gate và ghi nhận promotion |
+| `GET/PUT` | `/api/mail-sandbox` | Xem hoặc cấu hình inbox chính và whitelist `+number` |
+| `POST` | `/api/mail-sandbox/test` | Gửi email test tới alias được chọn và trả recipient đã lưu |
+
+CI/CD có thể gọi gate fail-closed trước khi chuyển traffic:
+
+```bash
+cd backend
+TALENTFLOW_API_URL=https://api.example.com \
+TALENTFLOW_ACCESS_TOKEN=... \
+TALENTFLOW_TENANT_ID=... \
+TALENTFLOW_RELEASE_VERSION=v1.0.0 \
+.venv/bin/python -m scripts.promote_release
+```
+
+## Mail Sandbox cho tester
+
+Mở mục **Mail Sandbox** trên sidebar, giữ email chính `vinhvp.khmtk36@gmail.com`, chọn giới hạn alias rồi bật whitelist. Ví dụ alias số `7` tạo recipient `vinhvp.khmtk36+7@gmail.com`. Gmail chuyển thư về inbox chính nhưng TalentFlow vẫn lưu nguyên alias trong candidate, outbox và email `To` header.
+
+Khi sandbox bật, email hoặc calendar attendee nằm ngoài email chính và dải `+1` đến `+max_alias` sẽ bị chuyển sang `BLOCKED` trước external side effect. Với `INTEGRATION_PROVIDER=local`, nút gửi test chỉ mô phỏng; muốn nhận email thật cần kết nối Google/Microsoft và OAuth có quyền gửi mail.
 | `GET` | `/api/dashboard` | Metrics, jobs, candidates, interviews |
 | `GET` | `/api/jobs` | Danh sách job có filter/pagination |
 | `POST` | `/api/jobs` | Tạo JD và extract requirements |
 | `POST` | `/api/jobs/{job_id}/approve-criteria` | Duyệt hoặc yêu cầu sửa tiêu chí |
+| `PUT` | `/api/jobs/{job_id}/criteria` | Tạo criteria version mới |
+| `GET` | `/api/jobs/{job_id}/criteria-versions` | Xem version và lineage tiêu chí |
+| `PUT` | `/api/jobs/{job_id}/shortlist-trigger` | Cấu hình ngưỡng tự tạo proposal |
 | `GET` | `/api/jobs/{job_id}/shortlist` | Xếp hạng Top N theo final score |
+| `POST/GET` | `/api/jobs/{job_id}/shortlist-proposals` | Trigger hoặc xem shortlist proposal |
 | `POST` | `/api/jobs/{job_id}/approve-shortlist` | Duyệt shortlist |
+| `GET` | `/api/approvals` | Approval inbox theo trạng thái/type |
+| `POST` | `/api/approvals/{id}/resolve` | Approve/reject criteria, evidence, shortlist hoặc escalation |
 | `GET` | `/api/jobs/{job_id}/shortlist-report` | Tải report Markdown |
 | `DELETE` | `/api/jobs/{job_id}` | Xóa job nếu không còn candidate active |
 | `POST` | `/api/applications` | Tạo application từ resume text |
@@ -205,8 +293,33 @@ Không commit `.env`, API key hoặc service-role key vào repository.
 | `GET` | `/api/agent-runs/{run_id}` | Trạng thái và execution steps của agent run |
 | `GET` | `/api/applications/{id}/interview-kit` | Lấy hoặc sinh interview kit |
 | `POST` | `/api/applications/{id}/review` | Ghi quyết định recruiter |
-| `GET` | `/api/interviewers/{id}/available-slots` | Lấy slot demo còn trống |
-| `POST` | `/api/applications/{id}/interview` | Đặt lịch và kiểm tra conflict |
+| `GET` | `/api/integrations` | Trạng thái kết nối calendar/email theo recruiter |
+| `POST` | `/api/integrations/{provider}/authorize` | Bắt đầu OAuth Google/Microsoft |
+| `DELETE` | `/api/integrations/{provider}` | Revoke connection và xóa token đã lưu |
+| `GET/POST` | `/api/email-templates` | Đọc hoặc tạo version template mới |
+| `GET` | `/api/interviewers/{id}/available-slots` | Free/busy provider + conflict nội bộ |
+| `POST` | `/api/applications/{id}/scheduling-invitations` | Gửi link self-scheduling có expiry |
+| `GET/POST` | `/api/public/scheduling/{token}` | Candidate chọn lịch bằng token single-use hoặc đổi lịch bằng capability token riêng |
+| `POST` | `/api/applications/{id}/interview` | Recruiter đặt lịch idempotent |
+| `PUT/DELETE` | `/api/interviews/{id}` | Reschedule/cancel qua calendar adapter |
+| `GET/PUT` | `/api/interview-policy` | Đọc/cấu hình reminder, reschedule và feedback deadline |
+| `GET` | `/api/interviews/{id}/operations` | Reminder, scorecard và feedback summary của một lịch |
+| `POST` | `/api/interviews/{id}/scorecards` | Nộp structured scorecard và tạo summary có nguồn |
+| `POST` | `/api/interviews/{id}/no-show` | Ghi no-show và tạo escalation |
+| `POST` | `/api/interview-operations/run-due` | Chạy sweep idempotent cho due reminder/timeout |
+| `GET` | `/api/outbox` | Theo dõi side effect và retry state |
+| `POST` | `/api/webhooks/{provider}` | Ingest provider webhook có dedupe |
+| `GET/POST` | `/api/tenants` | Liệt kê hoặc tạo shared tenant |
+| `POST` | `/api/tenants/{id}/members` | Cấp role tenant cho user |
+| `GET/PUT` | `/api/tenant-policy` | Retention, quota và email/calendar kill switch |
+| `GET/POST` | `/api/source-connectors` | Quản lý connector ingress có least-privilege token |
+| `POST` | `/api/source-connectors/{id}/ingest` | Ingest CV có consent/provenance và replay protection |
+| `GET` | `/api/applications/{id}/data-export` | Export candidate data dạng JSON cùng provenance |
+| `DELETE` | `/api/applications/{id}/data` | Xóa dữ liệu ứng viên và giữ audit hash không chứa PII |
+| `POST` | `/api/data-lifecycle/run-retention` | Xóa hồ sơ terminal quá retention window |
+| `GET/PUT` | `/api/model-policy` | Cấu hình champion/challenger |
+| `POST` | `/api/model-policy/evaluate` | Chạy eval gate trước activation |
+| `POST` | `/api/model-policy/activate` | Kích hoạt policy đã pass gate |
 | `GET` | `/api/audit-logs` | Đọc lịch sử hành động |
 
 ## Cấu trúc repository

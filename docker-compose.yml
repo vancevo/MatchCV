@@ -17,6 +17,18 @@ services:
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       AUTO_SEED: ${AUTO_SEED:-true}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:3000}
+      INTEGRATION_PROVIDER: ${INTEGRATION_PROVIDER:-local}
+      INTEGRATION_TOKEN_SECRET: ${INTEGRATION_TOKEN_SECRET:-talentflow-local-token-key}
+      OAUTH_STATE_SECRET: ${OAUTH_STATE_SECRET:-talentflow-local-oauth-state}
+      PROVIDER_WEBHOOK_SECRET: ${PROVIDER_WEBHOOK_SECRET:-}
+      OPERATIONAL_SWEEP_INTERVAL_MINUTES: ${OPERATIONAL_SWEEP_INTERVAL_MINUTES:-15}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/integrations/google/callback}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      MICROSOFT_REDIRECT_URI: ${MICROSOFT_REDIRECT_URI:-http://localhost:8000/api/integrations/microsoft/callback}
       REDIS_URL: redis://redis:6379/0
       QUEUE_EAGER: "false"
     depends_on:
@@ -27,7 +39,7 @@ services:
 
   worker:
     build: ./backend
-    command: rq worker --url redis://redis:6379/0 talentflow-screening
+    command: rq worker --with-scheduler --url redis://redis:6379/0 talentflow-screening
     healthcheck:
       disable: true
     environment:
@@ -40,6 +52,18 @@ services:
       QUEUE_EAGER: "false"
       TASK_MAX_ATTEMPTS: ${TASK_MAX_ATTEMPTS:-3}
       TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-120}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:3000}
+      INTEGRATION_PROVIDER: ${INTEGRATION_PROVIDER:-local}
+      INTEGRATION_TOKEN_SECRET: ${INTEGRATION_TOKEN_SECRET:-talentflow-local-token-key}
+      OAUTH_STATE_SECRET: ${OAUTH_STATE_SECRET:-talentflow-local-oauth-state}
+      PROVIDER_WEBHOOK_SECRET: ${PROVIDER_WEBHOOK_SECRET:-}
+      OPERATIONAL_SWEEP_INTERVAL_MINUTES: ${OPERATIONAL_SWEEP_INTERVAL_MINUTES:-15}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/integrations/google/callback}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      MICROSOFT_REDIRECT_URI: ${MICROSOFT_REDIRECT_URI:-http://localhost:8000/api/integrations/microsoft/callback}
     depends_on:
       backend:
         condition: service_healthy
@@ -47,7 +71,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: recruitment
       POSTGRES_USER: recruitment

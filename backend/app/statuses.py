@@ -36,6 +36,9 @@ class ApplicationStatus(str, Enum):
 
 class InterviewStatus(str, Enum):
     SCHEDULED = "SCHEDULED"
+    RESCHEDULING = "RESCHEDULING"
+    FEEDBACK_PENDING = "FEEDBACK_PENDING"
+    NO_SHOW = "NO_SHOW"
     CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
 

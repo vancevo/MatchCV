@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.agentic import calibrate_screening
 from app.pipeline import extract_requirements, screen_candidate
 
 
@@ -16,6 +17,8 @@ def evaluate() -> dict[str, float | int]:
     evidence_items = 0
     supported_evidence = 0
     ranking_matches = 0
+    routing_items = 0
+    routing_matches = 0
 
     for case in cases:
         requirements = extract_requirements(case["job_description"])
@@ -25,8 +28,14 @@ def evaluate() -> dict[str, float | int]:
 
         ranked: list[tuple[str, float]] = []
         for candidate in case["candidates"]:
-            result = screen_candidate(candidate["resume_text"], requirements)
+            result, _embedding = calibrate_screening(
+                screen_candidate(candidate["resume_text"], requirements), candidate["resume_text"], requirements
+            )
             ranked.append((candidate["id"], result["final_score"]))
+            routing_items += 1
+            expected_manual = candidate["id"] in case.get("expected_manual_review", [])
+            actual_manual = result["routing"]["decision"] == "MANUAL_REVIEW"
+            routing_matches += expected_manual == actual_manual
             for evidence in result["evidence"]:
                 evidence_items += 1
                 if not evidence["matched"] or evidence["evidence"].casefold() in candidate["resume_text"].casefold():
@@ -39,11 +48,13 @@ def evaluate() -> dict[str, float | int]:
         "requirement_accuracy": round(requirement_matches / requirement_fields, 3),
         "evidence_support_rate": round(supported_evidence / evidence_items, 3),
         "top_1_ranking_accuracy": round(ranking_matches / len(cases), 3),
+        "manual_review_routing_accuracy": round(routing_matches / routing_items, 3),
     }
 
 
 if __name__ == "__main__":
     metrics = evaluate()
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    if min(metrics["requirement_accuracy"], metrics["evidence_support_rate"], metrics["top_1_ranking_accuracy"]) < 1:
+    if min(metrics["requirement_accuracy"], metrics["evidence_support_rate"],
+           metrics["top_1_ranking_accuracy"], metrics["manual_review_routing_accuracy"]) < 1:
         raise SystemExit(1)

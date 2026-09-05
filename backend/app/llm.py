@@ -43,13 +43,13 @@ def _json_content(response: httpx.Response) -> dict[str, Any]:
     return json.loads(content)
 
 
-async def _complete(system: str, user: str) -> dict[str, Any] | None:
+async def _complete(system: str, user: str, model_override: str | None = None) -> dict[str, Any] | None:
     settings = get_settings()
     api_key = settings.openrouter_api_key
     if not api_key:
         return None
     payload = {
-        "model": settings.openrouter_model,
+        "model": model_override or settings.openrouter_model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": {"type": "json_object"},
         "temperature": 0,
@@ -155,17 +155,23 @@ def _profile(value: Any, cv_text: str) -> dict[str, Any]:
 
 
 async def screen_candidate_ai(
-    cv_text: str, requirements: dict[str, Any], candidate_name: str = "", candidate_email: str = ""
+    cv_text: str, requirements: dict[str, Any], candidate_name: str = "", candidate_email: str = "",
+    model_override: str | None = None, prompt_profile: str = "baseline",
 ) -> dict[str, Any]:
     baseline = screen_candidate(cv_text, requirements)
     all_requirements = requirements.get("required_skills", []) + requirements.get("preferred_skills", [])
+    profile_instruction = {
+        "baseline": "",
+        "strict_evidence": " Treat ambiguous or paraphrased evidence as unmatched; only accept literal support.",
+    }.get(prompt_profile, "")
     result = await _complete(
         """You extract a candidate profile and evidence for hiring requirements. Return JSON only:
 {"candidate_profile":{"skills":[],"experience_years":0,"education":[],"summary":""},
 "evidence":[{"requirement":"exact requirement supplied","matched":true,"evidence":"exact verbatim CV quote","confidence":0.0}]}.
 Include every supplied requirement exactly once. Evidence must be an exact contiguous quote from the CV.
-If no exact evidence exists, set matched=false and evidence="". Never infer protected traits or invent facts.""",
+If no exact evidence exists, set matched=false and evidence="". Never infer protected traits or invent facts.""" + profile_instruction,
         json.dumps({"requirements": all_requirements, "cv_text": _redact(cv_text, candidate_name, candidate_email)}, ensure_ascii=False),
+        model_override=model_override,
     )
     if not result:
         return {**baseline, "screening_source": "rules", "candidate_profile": None}

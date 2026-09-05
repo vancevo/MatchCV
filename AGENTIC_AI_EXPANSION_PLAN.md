@@ -204,6 +204,8 @@ Mục tiêu: upload trả về nhanh, worker tự xử lý an toàn.
 
 ### Phase 2 — Screening/shortlist agent có approval inbox
 
+**Trạng thái: hoàn thành.** Criteria có version/lineage, rescreen dùng lại durable task, embedding được lưu bằng pgvector trên PostgreSQL, score được calibration bằng eval và mọi shortlist chỉ là proposal chờ duyệt trong approval inbox.
+
 Mục tiêu: hệ thống chủ động tạo proposal, recruiter chỉ xử lý quyết định cần người.
 
 - Tạo criteria version và rescreen khi criteria thay đổi.
@@ -216,6 +218,8 @@ Mục tiêu: hệ thống chủ động tạo proposal, recruiter chỉ xử lý
 **Definition of done:** thay criteria sinh version mới và rerun có lineage; không có outreach trước khi shortlist được duyệt.
 
 ### Phase 3 — Calendar và email thật
+
+**Trạng thái: đã hoàn thành implementation, chờ acceptance test với tenant OAuth thật.** Adapter Google/Microsoft, token encryption/refresh, free-busy, event lifecycle, email versioning, webhook ingestion, candidate scheduling link và transactional outbox đã có test offline. Profile local vẫn dùng provider giả lập có chủ đích.
 
 Mục tiêu: tự động hóa từ shortlist đã duyệt đến lịch phỏng vấn.
 
@@ -230,6 +234,8 @@ Mục tiêu: tự động hóa từ shortlist đã duyệt đến lịch phỏng
 
 ### Phase 4 — Follow-up và interview operations
 
+**Trạng thái: hoàn thành.** Reminder và feedback deadline được lên lịch bền vững; reschedule bị giới hạn bằng policy; bounce/no-show/timeout/out-of-scope và feedback mâu thuẫn được chuyển vào approval inbox.
+
 Mục tiêu: giảm công việc điều phối sau khi đã có lịch.
 
 - Reminder theo mốc thời gian và trạng thái delivery.
@@ -242,6 +248,8 @@ Mục tiêu: giảm công việc điều phối sau khi đã có lịch.
 
 ### Phase 5 — Tối ưu và tích hợp nguồn ứng viên
 
+**Trạng thái: hoàn thành implementation nền tảng.** Shared tenant/RBAC, quota và kill switch, push connector gateway có consent/provenance, export/delete/retention và champion/challenger có regression gate đã có test offline. Adapter upstream cụ thể và model/provider thật vẫn cần acceptance test; sourcing agent bị vô hiệu hóa cho tới khi từng nguồn được phê duyệt pháp lý.
+
 Mục tiêu: mở rộng sau khi core workflow đã đo được chất lượng.
 
 - Connector email/folder/ATS để ingest CV có consent và provenance.
@@ -251,6 +259,52 @@ Mục tiêu: mở rộng sau khi core workflow đã đo được chất lượng
 - Chỉ xem xét sourcing agent sau đánh giá pháp lý và điều khoản của từng nguồn.
 
 **Definition of done:** connector có permission tối thiểu, audit đầy đủ, xóa dữ liệu theo retention và không scrape nguồn trái điều khoản.
+
+### Phase 6 — Production readiness và observability
+
+**Trạng thái: hoàn thành implementation offline, chờ acceptance với tenant provider thật.** Liveness/readiness đã được tách riêng; production gate kiểm tra database, queue, auth, seed, HTTPS, OAuth, webhook và secret placeholder. Tenant operations API tổng hợp screening success/latency, outbox failure/backlog, approval aging và quota. Runbook quy định acceptance matrix và rollback.
+
+Mục tiêu: chỉ nhận traffic và tăng rollout khi hạ tầng, cấu hình bảo mật và workflow side effect đều có bằng chứng vận hành.
+
+- Tách liveness khỏi readiness để process sống không bị hiểu nhầm là hệ thống sẵn sàng.
+- Chặn readiness ở staging/production khi còn SQLite, eager queue, tắt auth/seed demo hoặc URL không HTTPS.
+- Kiểm tra OAuth credentials, token encryption, webhook secret và active tenant connection cho provider thật.
+- Xuất metrics tenant-scoped cho task success, P50/P95 step latency, outbox backlog/failure, approval SLA và AI usage.
+- Viết acceptance matrix cho OAuth, idempotency, webhook replay, retry, restart, tenant isolation và kill switch.
+- Canary rollout và rollback bằng kill switch; không xóa outbox/task lỗi trước điều tra.
+
+**Definition of done:** code/test offline hoàn thành; production acceptance chỉ hoàn thành khi `/api/operations/readiness` không còn blocker và toàn bộ matrix có evidence từ tenant Google/Microsoft thật.
+
+### Phase 7 — SLO alerting và canary release gate
+
+**Trạng thái: hoàn thành implementation offline.** Tenant có policy SLO riêng; evaluator biến telemetry thành alert có dedupe, acknowledge, recovery và auto-resolve. Release gate lưu bằng chứng baseline/canary và chặn promotion khi thiếu mẫu hoặc hồi quy reliability, latency, cost hay side effect.
+
+Mục tiêu: biến dữ liệu quan sát thành quyết định vận hành có trạng thái và audit, thay vì phụ thuộc người trực tự đọc dashboard.
+
+- Cấu hình cửa sổ đo, success-rate floor, P95 ceiling, outbox/approval threshold và budget warning.
+- Một rolling alert cho mỗi tenant/signal; lần đánh giá lặp tăng occurrence thay vì tạo alert storm.
+- Cho phép acknowledge thủ công; evaluator tự resolve khi signal phục hồi và reopen khi tái diễn.
+- Canary gate yêu cầu sample tối thiểu và so sánh cả absolute SLO lẫn regression so với baseline.
+- Mọi thay đổi policy, alert action và release evaluation đều có audit trail.
+- Giữ tenant boundary cho policy, alert và release evidence.
+
+**Definition of done:** migration + API + tests offline hoàn thành; môi trường thật cần gọi evaluator định kỳ, nối alert receiver/on-call và dùng `PROMOTION_ALLOWED` làm điều kiện bắt buộc trong deployment pipeline.
+
+### Phase 8 — Operational automation và enforced promotion
+
+**Trạng thái: hoàn thành implementation offline.** API tự đăng ký sweep định kỳ vào RQ scheduler, mỗi alert episode chỉ tạo một notification outbox có retry/idempotency. Promotion endpoint kiểm tra đồng thời canary result, readiness và critical alerts; CLI CI/CD fail-closed gọi đúng gate này.
+
+Mục tiêu: đóng vòng từ telemetry đến cảnh báo và từ canary evidence đến quyết định rollout thực thi được.
+
+- Lên lịch global SLO sweep khi API khởi động trên profile Redis; interval cấu hình bằng environment.
+- Chỉ evaluate tenant đã có SLO policy, tránh tạo state ngoài ý muốn.
+- Gửi email on-call qua transactional outbox; cùng alert episode không tạo notification trùng.
+- Recovery rồi tái diễn tạo episode/notification mới, giữ lịch sử occurrence trên cùng rolling alert.
+- Promotion chỉ hợp lệ khi gate là `PROMOTION_ALLOWED`, tenant readiness đạt và không còn critical alert active.
+- Lưu người/thời điểm promote; replay promotion trả cùng kết quả.
+- CLI deployment thoát mã khác 0 khi thiếu cấu hình, không có gate hoặc server từ chối promotion.
+
+**Definition of done:** scheduler/notification/promotion enforcement có test offline; production cần cấu hình recipient thật, RQ scheduler HA và đặt CLI gate trước bước chuyển traffic.
 
 ## 8. Thay đổi dữ liệu và API ưu tiên
 
@@ -286,6 +340,15 @@ POST /api/outreach-drafts/{id}/approve
 GET  /api/calendar/connections
 POST /api/scheduling-links
 POST /api/webhooks/{provider}
+GET  /api/live
+GET  /api/ready
+GET  /api/operations/readiness
+GET  /api/operations/metrics
+GET/PUT /api/operations/slo-policy
+POST /api/operations/evaluate
+GET  /api/operations/alerts
+POST /api/operations/alerts/{id}/action
+POST /api/operations/release-gates
 ```
 
 Các endpoint cũ có thể giữ làm compatibility layer trong một phiên bản rồi deprecate.
