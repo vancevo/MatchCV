@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 import secrets
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -56,7 +57,8 @@ from .worker import mark_enqueue_failed
 from .workflow import screening_pipeline
 from .scheduling import (
     add_outbox, authorization_url, available_slots_for_owner, decode_oauth_state,
-    dispatch_outbox, exchange_code, mail_sandbox_alias, render_template, save_connection,
+    dispatch_outbox, exchange_code, local_datetime_label, mail_sandbox_alias, render_template,
+    save_connection,
 )
 from .interview_ops import escalation, get_policy, run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback
 from .governance import (
@@ -84,8 +86,31 @@ async def lifespan(_: FastAPI):
     yield
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 app = FastAPI(title="TalentFlow AI API", version="0.11.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def json_error_envelope(request: Request, call_next):
+    """Turn an unhandled crash into JSON so the browser can actually read the failure.
+
+    Starlette's own handler answers with a bare text/plain 500 carrying no CORS headers, so the
+    browser blocks it and the caller sees only "Failed to fetch" - no status, no message. Added
+    before CORSMiddleware because add_middleware prepends: whatever is registered last ends up
+    outermost, and this response has to travel back out through CORS to be given its headers.
+    """
+    try:
+        return await call_next(request)
+    except Exception as error:  # noqa: BLE001 - deliberately the catch-all boundary
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Hệ thống gặp lỗi không mong muốn, vui lòng thử lại sau.",
+                     "error": {"code": "INTERNAL_ERROR", "message": type(error).__name__}},
+        )
+
+
 app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -2079,12 +2104,13 @@ def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvi
     )
     db.add(invitation); db.flush()
     public_url = f"{get_settings().public_app_url}/?schedule={raw_token}"
+    job = db.get(Job, item.job_id)
     rendered = render_template(
-        db, item.owner_id, "scheduling_invitation", "Mời chọn lịch phỏng vấn",
-        "Chào {candidate_name},\n\nBạn đã vào danh sách phỏng vấn. Vui lòng chọn lịch tại: {public_url}\n"
-        "Liên kết hết hạn lúc {expires_at}. Lịch bạn chọn sẽ được giữ riêng và chờ HR xác nhận.",
+        db, item.owner_id, "scheduling_invitation",
         {"candidate_name": item.candidate_name, "public_url": public_url,
-         "expires_at": invitation.expires_at.isoformat()},
+         "job_title": job.title if job else "vị trí ứng tuyển",
+         "duration_minutes": str(invitation.duration_minutes),
+         "expires_at": local_datetime_label(invitation.expires_at, payload.timezone_name)},
     )
     outbox = add_outbox(
         db, owner_id=item.owner_id, aggregate_type="scheduling_invitation", aggregate_id=invitation.id,

@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -20,7 +21,13 @@ def booked_interview() -> tuple[dict, dict]:
         "candidate_email": f"ops-{suffix}@example.com",
         "resume_text": "5 năm Python FastAPI PostgreSQL REST API Docker Redis và phỏng vấn hệ thống.",
     }).json()
-    slot = client.get("/api/interviewers/recruiter-1/available-slots").json()[0]["start_at"]
+    slots = client.get("/api/interviewers/recruiter-1/available-slots").json()
+    # Reminders sit at 1440 and 60 minutes before the interview, and the 1440 one is dropped when
+    # it would already be in the past. Taking whichever hour happens to be free first makes the
+    # reminder count depend on what time of day the suite runs, so pick a slot a full day out.
+    cutoff = datetime.now(timezone.utc) + timedelta(hours=25)
+    slot = next(item["start_at"] for item in slots
+                if datetime.fromisoformat(item["start_at"].replace("Z", "+00:00")) > cutoff)
     response = client.post(f"/api/applications/{application['id']}/interview", json={
         "slot": slot, "timezone_name": "Asia/Ho_Chi_Minh", "idempotency_key": f"ops-{suffix}",
     })
