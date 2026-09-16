@@ -48,3 +48,34 @@ def candidate_identity(text: str, filename: str | None) -> tuple[str, str]:
 
 def checksum(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+CONTENT_TYPES = {".pdf": "application/pdf", ".txt": "text/plain; charset=utf-8",
+                 ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+
+
+def storage_dir() -> Path:
+    """Where uploads are kept. Ephemeral disks lose these; the extracted text stays in the database."""
+    return Path(get_settings().resume_storage_dir)
+
+
+def stored_resume_path(application_id: str, filename: str | None) -> Path | None:
+    """Uploads are named after the application, so no extra database column is needed."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        return None
+    return storage_dir() / f"{application_id}{suffix}"
+
+
+def store_resume_file(application_id: str, filename: str | None, content: bytes) -> None:
+    path = stored_resume_path(application_id, filename)
+    if not path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def delete_resume_file(application_id: str, filename: str | None) -> None:
+    path = stored_resume_path(application_id, filename)
+    if path and path.exists():
+        path.unlink()
