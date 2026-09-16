@@ -151,7 +151,9 @@ const AUDIT_LABELS: Record<string, string> = {
   INTERVIEW_CANCEL_REQUESTED: "Yêu cầu huỷ lịch phỏng vấn",
   INTERVIEW_CANCELLED_BY_PROVIDER: "Lịch bị huỷ từ hệ thống lịch",
   INTERVIEW_NO_SHOW: "Ứng viên không đến phỏng vấn",
-  INTERVIEW_POLICY_UPDATED: "Cập nhật chính sách phỏng vấn",
+  INTERVIEW_POLICY_UPDATED: "Cập nhật lịch làm việc / chính sách phỏng vấn",
+  BUSY_BLOCK_ADDED: "Thêm khoảng bận",
+  BUSY_BLOCK_REMOVED: "Xoá khoảng bận",
   SCORECARD_SUBMITTED: "Nộp phiếu đánh giá phỏng vấn",
   EMAIL_BOUNCED: "Email gửi không thành công",
   MAIL_SANDBOX_UPDATED: "Cập nhật cấu hình Mail Sandbox",
@@ -196,7 +198,8 @@ const actorLabel = (entry: AuditLog) =>
 const auditGroup = (action: string): "decision" | "screening" | "interview" | "system" => {
   if (["RECRUITER_REVIEWED", "CRITERIA_APPROVED", "CRITERIA_REVISION_REQUESTED", "SHORTLIST_APPROVED", "CRITERIA_VERSION_CREATED", "SHORTLIST_TRIGGER_UPDATED", "JOB_CREATED"].includes(action)) return "decision";
   if (action.startsWith("SCREENING") || action.startsWith("CV_") || action === "RESCREEN_QUEUED" || action === "INTERVIEW_KIT_GENERATED") return "screening";
-  if (action.startsWith("INTERVIEW") || action.startsWith("SCHEDULING") || action.startsWith("CANDIDATE_RESCHEDULE") || action === "SCORECARD_SUBMITTED") return "interview";
+  if (action.startsWith("INTERVIEW") || action.startsWith("SCHEDULING") || action.startsWith("CANDIDATE_RESCHEDULE")
+      || action.startsWith("BUSY_BLOCK") || action === "SCORECARD_SUBMITTED") return "interview";
   return "system";
 };
 const AUDIT_GROUP_LABELS: Record<string, string> = {
@@ -462,7 +465,7 @@ function RecruiterApp() {
     <aside className="sidebar">
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
       <nav><p className="nav-label">WORKSPACE</p>
-        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
+        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch làm việc","clock"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
           <button key={label} className={active === label ? "nav-item active" : "nav-item"} onClick={() => setActive(label)}><Icon name={icon}/>{label}{label === "Ứng viên" && <span className="count">{dashboard.metrics.awaiting_review}</span>}{label === "Phê duyệt" && approvals.length > 0 && <span className="count">{approvals.length}</span>}</button>)}
         <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
       </nav>
@@ -487,6 +490,7 @@ function RecruiterApp() {
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
+        : active === "Lịch làm việc" ? <AvailabilityView/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
         : active === "Xoá dữ liệu" ? <ClearDataView dashboard={dashboard} onCleared={async () => { setSelected(null); setLastBatch(null); await loadDashboard(); }}/>
@@ -1035,6 +1039,346 @@ function AuditLogView({ dashboard }: { dashboard: Dashboard }) {
         {loadingMore ? "Đang tải..." : "Xem thêm"}
       </button>}
   </section>;
+}
+
+type InterviewPolicy = {
+  reminder_minutes: number[]; max_reschedules: number; feedback_due_hours: number;
+  timezone_name: string; working_days: number[]; working_start_hour: number; working_end_hour: number;
+};
+type BusyBlock = { id: string; start_at: string; end_at: string; note: string };
+
+const WEEKDAYS = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+/** Monday-first weekday index, matching the backend's working_days numbering. */
+const weekdayIndex = (date: Date) => (date.getDay() + 6) % 7;
+const dayKey = (date: Date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+const cellKey = (day: string, hour: number) => `${day}:${hour}`;
+const shortDay = (date: Date) => `${String(date.getDate()).padStart(2, "0")}/${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+/** Click once for the start, once for the end — the gesture banking apps use for date ranges. */
+function RangeCalendar({ start, end, disabled, onPick }: {
+  start: string | null; end: string | null; disabled: boolean;
+  onPick: (start: string | null, end: string | null) => void;
+}) {
+  const [month, setMonth] = useState(() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), 1); });
+  const [hover, setHover] = useState<string | null>(null);
+  const today = dayKey(new Date());
+
+  const cells = useMemo(() => {
+    const lead = weekdayIndex(new Date(month.getFullYear(), month.getMonth(), 1));
+    return Array.from({ length: 42 }, (_, index) =>
+      new Date(month.getFullYear(), month.getMonth(), index + 1 - lead));
+  }, [month]);
+
+  const pick = (key: string) => {
+    if (!start || end || key < start) { onPick(key, null); return; }
+    onPick(start, key);
+  };
+
+  // While picking the end, shade what the range would become under the cursor.
+  const shadeTo = end || (start && hover && hover > start ? hover : null);
+
+  return <div className="range-calendar">
+    <div className="range-head">
+      <button type="button" disabled={disabled} aria-label="Tháng trước"
+              onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}>‹</button>
+      <b>Tháng {month.getMonth() + 1}/{month.getFullYear()}</b>
+      <button type="button" disabled={disabled} aria-label="Tháng sau"
+              onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}>›</button>
+    </div>
+    <div className="range-grid">
+      {WEEKDAYS.map(label => <span className="range-weekday" key={label}>{label}</span>)}
+      {cells.map(date => {
+        const key = dayKey(date);
+        const isStart = key === start;
+        const isEnd = key === end;
+        return <button key={key} type="button" disabled={disabled || key < today}
+          className={["range-day",
+            date.getMonth() === month.getMonth() ? "" : "outside",
+            isStart ? "start" : "",
+            isEnd ? "end" : "",
+            start && shadeTo && key > start && key < shadeTo ? "between" : "",
+          ].filter(Boolean).join(" ")}
+          onMouseEnter={() => setHover(key)}
+          onMouseLeave={() => setHover(null)}
+          onClick={() => pick(key)}>{date.getDate()}</button>;
+      })}
+    </div>
+  </div>;
+}
+
+/** Contiguous hours on the same day become one block, so a full day is one row rather than eight. */
+function selectionToBlocks(selection: Set<string>): { start_at: string; end_at: string }[] {
+  const byDay = new Map<string, number[]>();
+  selection.forEach(key => {
+    const [day, hour] = key.split(":");
+    byDay.set(day, [...(byDay.get(day) || []), Number(hour)]);
+  });
+  const blocks: { start_at: string; end_at: string }[] = [];
+  byDay.forEach((hours, day) => {
+    hours.sort((left, right) => left - right);
+    let from = hours[0];
+    let previous = hours[0];
+    hours.slice(1).forEach(hour => {
+      if (hour !== previous + 1) {
+        blocks.push({
+          start_at: new Date(`${day}T${String(from).padStart(2, "0")}:00`).toISOString(),
+          end_at: new Date(`${day}T${String(previous + 1).padStart(2, "0")}:00`).toISOString(),
+        });
+        from = hour;
+      }
+      previous = hour;
+    });
+    blocks.push({
+      start_at: new Date(`${day}T${String(from).padStart(2, "0")}:00`).toISOString(),
+      end_at: new Date(`${day}T${String(previous + 1).padStart(2, "0")}:00`).toISOString(),
+    });
+  });
+  return blocks;
+}
+
+function AvailabilityView() {
+  const [policy, setPolicy] = useState<InterviewPolicy | null>(null);
+  const [blocks, setBlocks] = useState<BusyBlock[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const load = async () => {
+    const [nextPolicy, nextBlocks] = await Promise.all([
+      request<InterviewPolicy>("/api/interview-policy"),
+      request<BusyBlock[]>("/api/busy-blocks"),
+    ]);
+    setPolicy(nextPolicy); setBlocks(nextBlocks);
+  };
+  useEffect(() => {
+    void load().catch(err => setMessage(err instanceof Error ? err.message : "Không tải được lịch"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async (next: InterviewPolicy) => {
+    setPolicy(next); setBusy(true); setMessage("");
+    try {
+      setPolicy(await request<InterviewPolicy>("/api/interview-policy", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next),
+      }));
+      setMessage("Đã lưu. Ứng viên sẽ không còn thấy những khung giờ này.");
+    } catch (err) { setMessage(err instanceof Error ? err.message : "Không lưu được"); await load(); }
+    finally { setBusy(false); }
+  };
+
+  const toggleDay = (day: number) => {
+    if (!policy) return;
+    const days = policy.working_days.includes(day)
+      ? policy.working_days.filter(value => value !== day)
+      : [...policy.working_days, day].sort((left, right) => left - right);
+    if (!days.length) { setMessage("Phải giữ lại ít nhất một ngày làm việc."); return; }
+    void save({ ...policy, working_days: days });
+  };
+
+  if (loading) return <section className="panel"><InlineProgress label="Đang tải lịch làm việc"/></section>;
+  if (!policy) return <section className="panel"><div className="error-banner">{message || "Không tải được lịch"}</div></section>;
+
+  return <section className="panel availability-view">
+    <div className="panel-head">
+      <div><h2>Lịch làm việc & lịch bận</h2><p>Ứng viên chỉ chọn được những khung giờ còn trống ở đây</p></div>
+      <span className="bounded-badge">{blocks.length} khoảng bận đã khai</span>
+    </div>
+    {message && <p className="operations-message">{message}</p>}
+
+    <div className="availability-block">
+      <h3>Khung giờ làm việc</h3>
+      <div className="availability-row">
+        <span className="availability-label">Ngày làm việc</span>
+        <div className="day-toggles">
+          {WEEKDAYS.map((label, day) => <button key={label} type="button" disabled={busy}
+            className={policy.working_days.includes(day) ? "day-toggle on" : "day-toggle"}
+            aria-pressed={policy.working_days.includes(day)}
+            onClick={() => toggleDay(day)}>{label}</button>)}
+        </div>
+      </div>
+      <div className="availability-row">
+        <span className="availability-label">Giờ làm việc</span>
+        <div className="availability-fields">
+          <select disabled={busy} value={policy.working_start_hour}
+                  onChange={event => void save({ ...policy, working_start_hour: Number(event.target.value) })}>
+            {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+          </select>
+          <span>đến</span>
+          <select disabled={busy} value={policy.working_end_hour}
+                  onChange={event => void save({ ...policy, working_end_hour: Number(event.target.value) })}>
+            {Array.from({ length: 24 }, (_, index) => index + 1).map(hour =>
+              <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+          </select>
+          <select disabled={busy} value={policy.timezone_name}
+                  onChange={event => void save({ ...policy, timezone_name: event.target.value })}>
+            {["Asia/Ho_Chi_Minh", "Asia/Bangkok", "Asia/Singapore", "Asia/Tokyo", "UTC"].map(zone =>
+              <option key={zone} value={zone}>{zone}</option>)}
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <PlannerBlock policy={policy} blocks={blocks} busy={busy} onSaved={async note => {
+      setBlocks(await request<BusyBlock[]>("/api/busy-blocks")); setMessage(note);
+    }} setBusy={setBusy} onError={setMessage}/>
+
+  </section>;
+}
+
+function PlannerBlock({ policy, blocks, busy, setBusy, onSaved, onError }: {
+  policy: InterviewPolicy; blocks: BusyBlock[]; busy: boolean;
+  setBusy: (value: boolean) => void;
+  onSaved: (note: string) => Promise<void>;
+  onError: (note: string) => void;
+}) {
+  const [from, setFrom] = useState<string | null>(null);
+  const [to, setTo] = useState<string | null>(null);
+  const [range, setRange] = useState<{ from: string; to: string } | null>(null);
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [painting, setPainting] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    const stop = () => setPainting(null);
+    window.addEventListener("mouseup", stop);
+    return () => window.removeEventListener("mouseup", stop);
+  }, []);
+
+  const hours = Array.from({ length: Math.max(0, policy.working_end_hour - policy.working_start_hour) },
+                           (_, index) => policy.working_start_hour + index);
+
+  const days = useMemo(() => {
+    if (!range) return [];
+    const result: Date[] = [];
+    const cursor = new Date(`${range.from}T00:00`);
+    const last = new Date(`${range.to}T00:00`);
+    while (cursor <= last && result.length < 120) {
+      if (policy.working_days.includes(weekdayIndex(cursor))) result.push(new Date(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return result;
+  }, [range, policy.working_days]);
+
+  const weeks = useMemo(() => {
+    const grouped: Date[][] = [];
+    days.forEach(date => {
+      const last = grouped[grouped.length - 1];
+      // A new group starts whenever the weekday number goes back down, i.e. a new Monday.
+      if (!last || weekdayIndex(date) <= weekdayIndex(last[last.length - 1])) grouped.push([date]);
+      else last.push(date);
+    });
+    return grouped;
+  }, [days]);
+
+  const openRange = () => {
+    if (!from || !to) { onError("Chọn ngày bắt đầu và ngày kết thúc trên lịch."); return; }
+    const marked = new Set<string>();
+    blocks.forEach(block => {
+      const start = new Date(block.start_at);
+      const end = new Date(block.end_at);
+      const cursor = new Date(start);
+      cursor.setMinutes(0, 0, 0);
+      while (cursor < end) {
+        marked.add(cellKey(dayKey(cursor), cursor.getHours()));
+        cursor.setHours(cursor.getHours() + 1);
+      }
+    });
+    setSelection(marked);
+    setRange({ from, to });
+  };
+
+  const paint = (key: string, makeBusy: boolean) => {
+    setSelection(current => {
+      if (current.has(key) === makeBusy) return current;
+      const next = new Set(current);
+      if (makeBusy) next.add(key); else next.delete(key);
+      return next;
+    });
+  };
+
+  const confirm = async () => {
+    if (!range) return;
+    setBusy(true);
+    try {
+      const rangeStart = new Date(`${range.from}T00:00`);
+      const rangeEnd = new Date(`${range.to}T23:59`);
+      const inside = blocks.filter(block => {
+        const start = new Date(block.start_at);
+        return start >= rangeStart && start <= rangeEnd;
+      });
+      for (const block of inside) await request(`/api/busy-blocks/${block.id}`, { method: "DELETE" });
+
+      const kept = new Set(Array.from(selection).filter(key => {
+        const start = new Date(`${key.split(":")[0]}T00:00`);
+        return start >= rangeStart && start <= rangeEnd;
+      }));
+      for (const block of selectionToBlocks(kept)) {
+        await request("/api/busy-blocks", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...block, note: "Lịch bận theo kế hoạch" }),
+        });
+      }
+      await onSaved(`Đã lưu ${kept.size} giờ bận từ ${range.from} đến ${range.to}. Ứng viên sẽ không thấy các giờ này.`);
+      setRange(null);
+    } catch (err) { onError(err instanceof Error ? err.message : "Không lưu được kế hoạch"); }
+    finally { setBusy(false); }
+  };
+
+  return <div className="availability-block">
+    <h3>Lên lịch bận theo khoảng ngày</h3>
+    <p className="availability-hint">
+      Chọn khoảng ngày cần lên kế hoạch, tô những giờ bận trên đúng ngày đó, rồi xác nhận.
+      Xác nhận sẽ <b>thay thế toàn bộ lịch bận trong khoảng ngày đã chọn</b>.
+    </p>
+    {!range && <div className="planner-picker">
+      <RangeCalendar start={from} end={to} disabled={busy}
+                     onPick={(nextFrom, nextTo) => { setFrom(nextFrom); setTo(nextTo); }}/>
+      <div className="planner-picked">
+        <div className="picked-slot"><span>Bắt đầu</span><b>{from ? from.split("-").reverse().join("/") : "— chọn trên lịch —"}</b></div>
+        <div className="picked-slot"><span>Kết thúc</span><b>{to ? to.split("-").reverse().join("/") : "— chọn tiếp —"}</b></div>
+        <button className="primary compact" disabled={busy || !from || !to} onClick={openRange}>Xác nhận khoảng ngày</button>
+        {(from || to) && <button className="secondary compact" disabled={busy}
+                                 onClick={() => { setFrom(null); setTo(null); }}>Chọn lại</button>}
+      </div>
+    </div>}
+
+    {range && <div className="planner-range">
+      <span className="planner-current">Đang lên lịch cho <b>{range.from.split("-").reverse().join("/")}</b> → <b>{range.to.split("-").reverse().join("/")}</b></span>
+      <button className="secondary compact" disabled={busy}
+              onClick={() => { setRange(null); setFrom(null); setTo(null); }}>Chọn khoảng khác</button>
+    </div>}
+
+    {range && (weeks.length ? <>
+      {weeks.map(week => <div className="planner-week" key={dayKey(week[0])}>
+        <h4>Tuần {shortDay(week[0])} – {shortDay(week[week.length - 1])}</h4>
+        <div className="week-grid" style={{ gridTemplateColumns: `54px repeat(${week.length}, minmax(52px, 1fr))` }}>
+          <span className="week-corner"/>
+          {week.map(date => <span className="week-day" key={dayKey(date)}>
+            {WEEKDAYS[weekdayIndex(date)]}<i>{shortDay(date)}</i>
+          </span>)}
+          {hours.map(hour => <div key={hour} style={{ display: "contents" }}>
+            <span className="week-hour">{String(hour).padStart(2, "0")}:00</span>
+            {week.map(date => {
+              const key = cellKey(dayKey(date), hour);
+              const marked = selection.has(key);
+              return <button key={key} type="button" disabled={busy}
+                className={marked ? "week-cell busy" : "week-cell"}
+                aria-pressed={marked}
+                aria-label={`${shortDay(date)} ${String(hour).padStart(2, "0")}:00 — ${marked ? "bận" : "rảnh"}`}
+                onMouseDown={() => { setPainting(!marked); paint(key, !marked); }}
+                onMouseEnter={() => { if (painting !== null) paint(key, painting); }}/>;
+            })}
+          </div>)}
+        </div>
+      </div>)}
+      <div className="planner-actions">
+        <span>{selection.size} giờ đang đánh dấu bận</span>
+        <button className="primary compact" disabled={busy} onClick={() => void confirm()}>
+          {busy ? "Đang lưu..." : "Xác nhận lịch bận"}
+        </button>
+      </div>
+    </> : <p className="availability-hint">Khoảng ngày này không có ngày làm việc nào. Kiểm tra lại mục “Ngày làm việc” phía trên.</p>)}
+  </div>;
 }
 
 function MailSandboxView() {

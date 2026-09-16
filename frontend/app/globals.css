@@ -102,3 +102,51 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .job-stats{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:9px}.job-stats span{display:flex;flex-direction:column;color:#8a8fa0;font-size:8px;text-transform:uppercase;letter-spacing:.5px}.job-stats b{color:#4a3ba8;font:800 17px Manrope,sans-serif;letter-spacing:-.4px}
 .job-status-split{display:flex;flex-wrap:wrap;gap:5px}
 .job-versions{list-style:none;margin:0;padding:0;display:grid;gap:7px}.job-versions li{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 8px;padding-bottom:6px;border-bottom:1px solid #f1f0f7;font-size:9px}.job-versions li:last-child{border-bottom:0;padding-bottom:0}.job-versions b{color:#4a3ba8;font-size:10px}.job-versions span{color:#5d6472;flex:1 1 120px;min-width:0}.job-versions em{color:#9096a5;font-style:italic}.job-versions time{color:#a0a6b4;font-variant-numeric:tabular-nums}
+/* Interview working hours and busy calendar */
+.availability-view{max-width:980px}
+.availability-block{padding:16px 20px;border-top:1px solid #f1f0f7}.availability-block:first-of-type{border-top:0}
+.availability-block h3{margin:0 0 4px;font:800 9px Manrope,sans-serif;letter-spacing:.9px;text-transform:uppercase;color:#5a4fb0}
+.availability-hint{margin:0 0 11px;color:#8d93a3;font-size:9.5px;line-height:1.55}
+.availability-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-top:11px}
+.availability-label{flex:0 0 96px;color:#8a8fa0;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.availability-fields{display:flex;flex-wrap:wrap;align-items:center;gap:7px;color:#7c8291;font-size:10px}
+.availability-fields select{height:30px;padding:0 9px;border:1px solid #e1e2e8;border-radius:8px;background:#fafafd;color:#333a4b;font-size:10px}
+.day-toggles{display:flex;flex-wrap:wrap;gap:5px}
+.day-toggle{width:38px;height:30px;border:1px solid #e2e3e9;border-radius:8px;background:white;color:#7c8291;font-size:9.5px;font-weight:800}
+.day-toggle.on{color:#4a3ba8;background:#ece7fd;border-color:#cdc2f5}.day-toggle:disabled{opacity:.55}
+.week-grid{display:grid;gap:3px;user-select:none}
+.week-corner{min-height:18px}
+.week-day{display:grid;place-items:center;color:#7c8291;font:800 8.5px Manrope,sans-serif;letter-spacing:.5px}
+.week-hour{display:flex;align-items:center;color:#9aa0ae;font-size:8.5px;font-variant-numeric:tabular-nums}
+.week-cell{height:26px;border:1px solid #e8e6f2;border-radius:6px;background:#fbfdfc;transition:background .12s,border-color .12s}
+.week-cell:hover:not(:disabled){border-color:#c9714f;background:#fdf1ec}
+.week-cell.busy{background:#f6ddd4;border-color:#e3b5a5}
+.week-cell:disabled{opacity:.6;cursor:not-allowed}
+@media (max-width:700px){.availability-label{flex-basis:100%}.week-cell{height:30px}}
+.planner-picker{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start;margin-bottom:12px}
+.range-calendar{width:244px;padding:12px;border:1px solid #eceaf4;border-radius:12px;background:#fbfaff}
+.range-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}
+.range-head b{font:800 11px Manrope,sans-serif;color:#3f4658}
+.range-head button{width:24px;height:24px;border:1px solid #e1e2e8;border-radius:7px;background:white;color:#6b6591;font-size:13px;line-height:1}
+.range-head button:hover:not(:disabled){background:#f3efff;border-color:#cdc2f5}
+.range-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.range-weekday{display:grid;place-items:center;height:20px;color:#a0a6b4;font:800 7.5px Manrope,sans-serif;letter-spacing:.4px}
+.range-day{height:28px;border:0;border-radius:7px;background:transparent;color:#3f4658;font-size:10px;font-weight:600}
+.range-day:hover:not(:disabled){background:#ece7fd}
+.range-day.outside{color:#c5c9d4}
+.range-day:disabled{color:#d6d9e1;cursor:not-allowed}
+.range-day.between{background:#ede9fd;border-radius:0}
+.range-day.start,.range-day.end{background:#6c4de6;color:white}
+.range-day.start{border-radius:7px 0 0 7px}.range-day.end{border-radius:0 7px 7px 0}
+.range-day.start.end{border-radius:7px}
+.planner-picked{display:flex;flex-direction:column;gap:9px;min-width:170px}
+.picked-slot{padding:9px 12px;border:1px solid #eceaf4;border-radius:10px;background:#fbfaff}
+.picked-slot span{display:block;color:#9096a5;font-size:8px;font-weight:700;letter-spacing:.6px;text-transform:uppercase}
+.picked-slot b{display:block;margin-top:3px;color:#3f4658;font-size:12px;font-variant-numeric:tabular-nums}
+.planner-range{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px}
+.planner-current{color:#6f7686;font-size:10px}.planner-current b{color:#4a3ba8;font-variant-numeric:tabular-nums}
+.planner-week{margin-bottom:14px}
+.planner-week h4{margin:0 0 7px;color:#6b6591;font:800 8.5px Manrope,sans-serif;letter-spacing:.7px;text-transform:uppercase}
+.week-day i{display:block;margin-top:1px;color:#a0a6b4;font-style:normal;font-size:7.5px;font-weight:600}
+.planner-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding-top:11px;border-top:1px solid #f1f0f7}
+.planner-actions span{color:#7c8291;font-size:9.5px}.planner-actions button{margin-left:auto}
