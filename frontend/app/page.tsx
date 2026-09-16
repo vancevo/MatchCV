@@ -76,6 +76,8 @@ function Icon({ name }: { name: string }) {
     search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,
     upload: <><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 15v5h16v-5"/></>,
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></>,
+    file: <><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></>,
+    ban: <><circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/></>,
     arrow: <path d="m9 18 6-6-6-6"/>, check: <path d="m5 12 4 4L19 6"/>, plus: <path d="M12 5v14M5 12h14"/>,
   };
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -137,6 +139,9 @@ function RecruiterApp() {
   const [active, setActive] = useState("Tổng quan");
   const [selected, setSelected] = useState<Application | null>(null);
   const [explained, setExplained] = useState<Application | null>(null);
+  const [rowResume, setRowResume] = useState<{ resume: Resume; name: string } | null>(null);
+  const [resumeBusy, setResumeBusy] = useState("");
+  const [rejecting, setRejecting] = useState<Application | null>(null);
   const [query, setQuery] = useState("");
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
@@ -306,6 +311,28 @@ function RecruiterApp() {
     });
   };
 
+  // Mở CV và từ chối ngay từ danh sách: trước đây phải mở hồ sơ chi tiết chỉ để làm một việc.
+  const openResumeFor = async (item: Application) => {
+    if (resumeBusy) return;
+    setResumeBusy(item.id);
+    try { setRowResume({ resume: await request<Resume>(`/api/applications/${item.id}/resume`), name: item.candidate.name }); }
+    catch (err) { notify(err instanceof Error ? err.message : "Không mở được CV của ứng viên này"); }
+    finally { setResumeBusy(""); }
+  };
+
+  const rejectFromRow = async (item: Application, reason: string) => {
+    await runAction(`review-REJECT-${item.id}`, "Đang từ chối ứng viên", async () => {
+      await request<Application>(`/api/applications/${item.id}/review`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "REJECT", note: reason.trim() || "Recruiter từ chối ứng viên" }),
+      });
+      setRejecting(null);
+      if (selected?.id === item.id) setSelected(null);
+      await loadDashboard();
+      notify(`Đã từ chối ${item.candidate.name}`);
+    });
+  };
+
   const approveCriteria = async (jobId: string, criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => {
     await runAction(`criteria-${jobId}`, "Đang duyệt tiêu chí", async () => {
       await request(`/api/jobs/${jobId}/criteria`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...criteria, note: "Recruiter reviewed criteria" }) });
@@ -415,9 +442,17 @@ function RecruiterApp() {
                   <span className="match"><i className={`score-ring ${scoreClass(item.screening.final_score)}`} style={{"--score": `${item.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(item.screening.final_score)}</i><span><b>{item.screening.recommendation}</b><small>{item.screening.final_score}% match</small></span></span>
                   <span><i className={`status ${statusTone(item.status)}`}>{statusLabel(item.status)}</i></span>
                 </button>
-                <button className="why-button" disabled={!item.screening.evidence?.length}
-                        title={item.screening.evidence?.length ? "Xem vì sao ứng viên được điểm này" : "Chưa có kết quả chấm điểm"}
-                        onClick={() => setExplained(item)}><Icon name="spark"/>Vì sao?</button>
+                <div className="row-actions">
+                  <button className="why-button" disabled={!item.screening.evidence?.length}
+                          title={item.screening.evidence?.length ? "Xem vì sao ứng viên được điểm này" : "Chưa có kết quả chấm điểm"}
+                          onClick={() => setExplained(item)}><Icon name="spark"/>Vì sao?</button>
+                  <button className="why-button" disabled={resumeBusy === item.id}
+                          title="Mở toàn bộ CV ứng viên đã nộp"
+                          onClick={() => void openResumeFor(item)}><Icon name="file"/>{resumeBusy === item.id ? "Đang mở" : "Xem CV"}</button>
+                  <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
+                          title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
+                          onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
+                </div>
               </div>)}
               {!filtered.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp.</div>}
             </div>
@@ -431,6 +466,10 @@ function RecruiterApp() {
     {explained && <ScoreExplainer application={explained} job={dashboard.jobs.find(item => item.id === explained.job_id)}
                                   onClose={() => setExplained(null)}
                                   onOpenProfile={() => { setSelected(explained); setExplained(null); }}/>}
+    {rowResume && <ResumeViewer resume={rowResume.resume} candidateName={rowResume.name} onClose={() => setRowResume(null)}/>}
+    {rejecting && <RejectCandidateDialog application={rejecting} busy={actionBusy}
+                                         onClose={() => { if (!actionBusy) setRejecting(null); }}
+                                         onConfirm={reason => void rejectFromRow(rejecting, reason)}/>}
     {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
@@ -476,6 +515,29 @@ type Resume = {
   application_id: string; filename: string | null; size: number | null; checksum: string | null;
   text: string; file_available: boolean; file_type: string;
 };
+
+function RejectCandidateDialog({ application, busy, onClose, onConfirm }: {
+  application: Application; busy: boolean; onClose: () => void; onConfirm: (reason: string) => void;
+}) {
+  const [reason, setReason] = useState("");
+  return <div className="modal-layer" onMouseDown={onClose}>
+    <div className="modal reject-modal" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label="Từ chối ứng viên">
+      <button className="close" disabled={busy} onClick={onClose}>×</button>
+      <span className="eyebrow">TỪ CHỐI ỨNG VIÊN</span>
+      <h2>{application.candidate.name}</h2>
+      <p className="reject-sub">{application.candidate.email} · {application.screening.final_score}% phù hợp</p>
+      <label className="reject-field">Lý do từ chối <small>không bắt buộc — sẽ lưu vào nhật ký thao tác</small>
+        <textarea rows={3} value={reason} disabled={busy} autoFocus
+                  placeholder="Ví dụ: thiếu kinh nghiệm so với yêu cầu tối thiểu"
+                  onChange={event => setReason(event.target.value)}/>
+      </label>
+      <div className="reject-actions">
+        <button className="secondary" disabled={busy} onClick={onClose}>Huỷ</button>
+        <button className="danger" disabled={busy} onClick={() => onConfirm(reason)}>{busy ? "Đang từ chối..." : "Xác nhận từ chối"}</button>
+      </div>
+    </div>
+  </div>;
+}
 
 function ResumeViewer({ resume, candidateName, onClose }: {
   resume: Resume; candidateName: string; onClose: () => void;

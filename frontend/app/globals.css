@@ -78,10 +78,18 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .criteria-modal h3{margin:17px 0 8px;font:700 11px Manrope,sans-serif}.criteria-checks{display:flex;flex-wrap:wrap;gap:7px}.criteria-checks label{display:flex;align-items:center;gap:7px;margin:0;padding:8px 10px;border:1px solid #e2dffd;border-radius:9px;background:#faf9ff}.criteria-checks input{width:15px;height:15px;padding:0}.criteria-add{display:grid;grid-template-columns:1fr 110px auto;gap:7px;margin-top:15px}.criteria-add input,.criteria-add select{height:38px}.clear-data-view{max-width:760px}.clear-data-body{padding:24px}.clear-data-body h3{margin:0 0 14px}.clear-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.clear-summary span{padding:14px;border:1px solid #f0d4d4;border-radius:10px;background:#fff8f8;color:#87585d;font-size:10px}.clear-summary b{display:block;color:#9b3f48;font:800 21px Manrope,sans-serif}.clear-data-body>p{color:#747b89;font-size:11px}.clear-data-body>input{width:100%;height:42px;padding:0 12px;border:1px solid #e0c5c8;border-radius:9px}.clear-data-body>.danger{margin-top:12px;padding:0 16px}.interview-message{margin:14px 20px 0}.booking-success small{display:block;color:#747b89;margin-top:8px}@media(max-width:600px){.criteria-add,.clear-summary{grid-template-columns:1fr}}
 /* Quick "why this score" review */
 .table-head{grid-template-columns:1.65fr 1.1fr .75fr 74px}
-.candidate-row{grid-template-columns:1fr 74px;padding:0 20px}
+.candidate-row{grid-template-columns:1fr auto;padding:0 20px}
+.row-actions{display:flex;align-items:center;gap:6px}
 .candidate-open{display:grid;grid-template-columns:1.65fr 1.1fr .75fr;align-items:center;gap:10px;width:100%;padding:14px 0;border:0;background:transparent;text-align:left}
 .why-button{display:inline-flex;align-items:center;justify-content:center;gap:4px;height:28px;padding:0 9px;border:1px solid #ded8f7;border-radius:8px;background:white;color:#5a41c9;font-size:9px;font-weight:800;white-space:nowrap;transition:.15s}
 .why-button .icon{width:12px}.why-button:hover:not(:disabled){background:#f3efff;border-color:#c5b8f2}.why-button:disabled{opacity:.4;cursor:not-allowed}
+.why-button.reject{border-color:#f2d7d7;color:#c05656}.why-button.reject:hover:not(:disabled){background:#fdf2f2;border-color:#e6b9b9}
+.reject-modal{max-width:420px}.reject-sub{color:#969baa;font-size:10px;margin:2px 0 16px}
+.reject-field{display:block;font:800 9px Manrope,sans-serif;letter-spacing:.5px;color:#6b6f7d;text-transform:uppercase}
+.reject-field small{display:block;margin:3px 0 7px;font:500 9px Manrope,sans-serif;letter-spacing:0;color:#a4a8b4;text-transform:none}
+.reject-field textarea{width:100%;padding:10px 12px;border:1px solid #e6e4ef;border-radius:10px;font:500 11px Manrope,sans-serif;color:#2b2b33;resize:vertical}
+.reject-field textarea:focus{outline:0;border-color:#c5b8f2}
+.reject-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 
 .why-modal{width:min(720px,94vw);max-height:92vh;overflow:auto;padding:26px 28px}
 .why-head{display:flex;align-items:center;gap:16px;margin-bottom:16px}
@@ -111,7 +119,7 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .why-col q{color:#6d7482;font-size:9.5px;line-height:1.5;quotes:'“' '”'}
 .why-blank{margin:0;color:#8d93a3;font-size:9.5px;font-style:italic}
 .why-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
-@media (max-width:700px){.why-columns{grid-template-columns:1fr}.why-modal{padding:22px 18px}.candidate-row{grid-template-columns:1fr 60px;padding:0 13px}.candidate-open{grid-template-columns:1.4fr .8fr}.candidate-open>span:nth-child(3){display:none}}
+@media (max-width:700px){.why-columns{grid-template-columns:1fr}.why-modal{padding:22px 18px}.candidate-row{grid-template-columns:1fr;padding:0 13px}.row-actions{justify-content:flex-end;padding-bottom:12px}.candidate-open{grid-template-columns:1.4fr .8fr;padding-bottom:8px}.candidate-open>span:nth-child(3){display:none}}
 /* Requirement-by-requirement comparison */
 .match-table{border:1px solid #e9e7f3;border-radius:11px;overflow:hidden}
 .match-head{display:grid;grid-template-columns:minmax(150px,.85fr) 1.15fr;gap:12px;padding:8px 13px;background:#f3f1fb;color:#6b6591;font:800 8px Manrope,sans-serif;letter-spacing:.8px;text-transform:uppercase}
