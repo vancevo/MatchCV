@@ -10,10 +10,11 @@ from .config import get_settings
 DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 
-def current_user_id(authorization: str | None = Header(default=None)) -> str:
+def current_actor(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Identity of the person behind the request, kept for audit trails."""
     settings = get_settings()
     if not settings.auth_required:
-        return DEV_USER_ID
+        return {"id": DEV_USER_ID, "email": ""}
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Authentication required")
     token = authorization.removeprefix("Bearer ").strip()
@@ -33,7 +34,11 @@ def current_user_id(authorization: str | None = Header(default=None)) -> str:
     user_id = str(payload.get("sub", ""))
     if not user_id:
         raise HTTPException(401, "Access token has no user id")
-    return user_id
+    return {"id": user_id, "email": str(payload.get("email", ""))}
+
+
+def current_user_id(authorization: str | None = Header(default=None)) -> str:
+    return current_actor(authorization)["id"]
 
 
 def current_tenant_id(

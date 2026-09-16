@@ -254,6 +254,8 @@ class AuditLog(Base):
     owner_id: Mapped[str] = mapped_column(String(128), index=True)
     application_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(80))
+    actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    actor_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -378,6 +380,8 @@ class ApprovalRequest(Base):
     resource_id: Mapped[str] = mapped_column(String(36), index=True)
     title: Mapped[str] = mapped_column(String(240))
     summary: Mapped[str] = mapped_column(Text)
+    requested_by_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    requested_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     resolution: Mapped[dict] = mapped_column(JSON, default=dict)
     dedupe_key: Mapped[str] = mapped_column(String(255))

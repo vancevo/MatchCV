@@ -47,9 +47,15 @@ type BatchResult = {
 type Approval = {
   id: string; type: "CRITERIA" | "EVIDENCE" | "SHORTLIST" | "ESCALATION"; status: string; job_id?: string; application_id?: string;
   resource_id: string; title: string; summary: string; payload: Record<string, unknown>; created_at: string;
+  requested_by_id?: string | null; requested_by_email?: string | null;
 };
 type MailSandbox = {
   enabled: boolean; base_email: string; max_alias: number; sample_aliases: string[]; delivery_note: string;
+};
+type AuditLog = {
+  id: string; application_id: string | null; action: string;
+  actor_id: string | null; actor_email: string | null;
+  metadata: Record<string, unknown>; created_at: string;
 };
 type Integration = {
   provider: string; status: string; account_email: string; scopes: string[]; expires_at: string | null;
@@ -70,6 +76,7 @@ function Icon({ name }: { name: string }) {
     search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,
     upload: <><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 15v5h16v-5"/></>,
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></>,
+    clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
     arrow: <path d="m9 18 6-6-6-6"/>, check: <path d="m5 12 4 4L19 6"/>, plus: <path d="M12 5v14M5 12h14"/>,
   };
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -116,6 +123,96 @@ const statusLabel = (status: string) => ({
 } as Record<string, string>)[status] || status;
 const statusTone = (status: string) => status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
 const dateLabel = (value: string) => new Intl.DateTimeFormat("vi-VN", { weekday: "short", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+const fullDateLabel = (value: string) => new Intl.DateTimeFormat("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
+
+const AUDIT_LABELS: Record<string, string> = {
+  JOB_CREATED: "Tạo vị trí tuyển dụng",
+  CV_EXTRACTED: "Trích xuất nội dung CV",
+  CV_DUPLICATE_SKIPPED: "Bỏ qua CV trùng",
+  SCREENING_QUEUED: "Đưa CV vào hàng đợi chấm điểm",
+  SCREENING_COMPLETED: "Chấm điểm CV hoàn tất",
+  SCREENING_RETRY_REQUESTED: "Yêu cầu chấm điểm lại",
+  RESCREEN_QUEUED: "Đưa vào hàng đợi chấm lại",
+  INTERVIEW_KIT_GENERATED: "Sinh bộ câu hỏi phỏng vấn",
+  RECRUITER_REVIEWED: "Recruiter ra quyết định",
+  CRITERIA_VERSION_CREATED: "Tạo phiên bản tiêu chí mới",
+  CRITERIA_APPROVED: "Duyệt tiêu chí tuyển dụng",
+  CRITERIA_REVISION_REQUESTED: "Yêu cầu sửa lại tiêu chí",
+  SHORTLIST_APPROVED: "Duyệt danh sách shortlist",
+  SHORTLIST_REPORT_EXPORTED: "Xuất báo cáo shortlist",
+  SHORTLIST_TRIGGER_UPDATED: "Cập nhật điều kiện tự tạo shortlist",
+  SCHEDULING_INVITATION_CREATED: "Gửi lời mời chọn lịch phỏng vấn",
+  INTERVIEW_SLOT_HELD: "Ứng viên giữ khung giờ phỏng vấn",
+  INTERVIEW_BOOKING_REQUESTED: "Yêu cầu đặt lịch phỏng vấn",
+  INTERVIEW_CONFIRMED_BY_HR: "HR xác nhận lịch phỏng vấn",
+  INTERVIEW_RESCHEDULE_REQUESTED: "Yêu cầu đổi lịch phỏng vấn",
+  CANDIDATE_RESCHEDULE_REQUESTED: "Ứng viên xin đổi lịch",
+  INTERVIEW_CANCEL_REQUESTED: "Yêu cầu huỷ lịch phỏng vấn",
+  INTERVIEW_CANCELLED_BY_PROVIDER: "Lịch bị huỷ từ hệ thống lịch",
+  INTERVIEW_NO_SHOW: "Ứng viên không đến phỏng vấn",
+  INTERVIEW_POLICY_UPDATED: "Cập nhật chính sách phỏng vấn",
+  SCORECARD_SUBMITTED: "Nộp phiếu đánh giá phỏng vấn",
+  EMAIL_BOUNCED: "Email gửi không thành công",
+  MAIL_SANDBOX_UPDATED: "Cập nhật cấu hình Mail Sandbox",
+  MAIL_SANDBOX_TEST_QUEUED: "Gửi email thử nghiệm",
+  MAIL_SANDBOX_RECIPIENT_BLOCKED: "Chặn email ngoài whitelist",
+  MAIL_SANDBOX_REQUIRED: "Chặn gửi vì chưa bật Mail Sandbox",
+  OUTBOX_POLICY_BLOCKED: "Chặn bởi kill switch của tổ chức",
+  CANDIDATE_DATA_EXPORTED: "Xuất dữ liệu ứng viên",
+  CANDIDATE_DATA_DELETED: "Xoá dữ liệu ứng viên",
+  RECRUITMENT_DATA_CLEARED: "Xoá toàn bộ dữ liệu tuyển dụng",
+  RETENTION_SWEEP_COMPLETED: "Dọn dữ liệu quá hạn lưu trữ",
+  INTEGRATION_REVOKED: "Ngắt kết nối dịch vụ ngoài",
+  SOURCE_CONNECTOR_CREATED: "Tạo kênh nhận CV tự động",
+  SOURCE_CONNECTOR_REVOKED: "Thu hồi kênh nhận CV",
+  SOURCE_CV_INGESTED: "Nhận CV từ kênh ngoài",
+  TENANT_POLICY_UPDATED: "Cập nhật chính sách tổ chức",
+  MODEL_POLICY_EVALUATED: "Đánh giá cấu hình model AI",
+  MODEL_POLICY_ACTIVATED: "Kích hoạt cấu hình model AI",
+  OPERATIONAL_SLO_EVALUATED: "Đánh giá cảnh báo vận hành",
+  OPERATIONAL_SLO_POLICY_UPDATED: "Cập nhật ngưỡng cảnh báo",
+  RELEASE_GATE_EVALUATED: "Đánh giá cổng phát hành",
+  RELEASE_PROMOTED: "Phát hành phiên bản mới",
+};
+const EVIDENCE_REASONS: Record<string, string> = {
+  LOW_CONFIDENCE: "Độ tin cậy thấp",
+  BORDERLINE_SCORE: "Điểm nằm sát ngưỡng",
+  SCORE_EVIDENCE_MISMATCH: "Điểm và bằng chứng không khớp",
+};
+const DECISION_LABELS: Record<string, string> = {
+  INTERVIEW: "Mời phỏng vấn", REJECT: "Từ chối", ARCHIVE: "Lưu trữ", MANUAL_REVIEW: "Đánh dấu xem xét",
+  APPROVE: "Phê duyệt",
+};
+const auditLabel = (action: string) => AUDIT_LABELS[action] || action;
+/** Stand-in identity while login is off: the backend cannot tell who acted, so local actions all show this name. */
+const LOCAL_ACTOR_ID = "00000000-0000-0000-0000-000000000001";
+const LOCAL_ACTOR_NAME = "Vinh Nguyễn";
+const actorLabel = (entry: AuditLog) =>
+  entry.actor_email?.trim() ? entry.actor_email.trim()
+  : entry.actor_id === LOCAL_ACTOR_ID ? LOCAL_ACTOR_NAME
+  : entry.actor_id ? entry.actor_id
+  : "";
+const auditGroup = (action: string): "decision" | "screening" | "interview" | "system" => {
+  if (["RECRUITER_REVIEWED", "CRITERIA_APPROVED", "CRITERIA_REVISION_REQUESTED", "SHORTLIST_APPROVED", "CRITERIA_VERSION_CREATED", "SHORTLIST_TRIGGER_UPDATED", "JOB_CREATED"].includes(action)) return "decision";
+  if (action.startsWith("SCREENING") || action.startsWith("CV_") || action === "RESCREEN_QUEUED" || action === "INTERVIEW_KIT_GENERATED") return "screening";
+  if (action.startsWith("INTERVIEW") || action.startsWith("SCHEDULING") || action.startsWith("CANDIDATE_RESCHEDULE") || action === "SCORECARD_SUBMITTED") return "interview";
+  return "system";
+};
+const AUDIT_GROUP_LABELS: Record<string, string> = {
+  decision: "Quyết định", screening: "Xử lý CV", interview: "Phỏng vấn", system: "Hệ thống",
+};
+function auditDetail(entry: AuditLog): string {
+  const meta = entry.metadata || {};
+  const parts: string[] = [];
+  if (typeof meta.decision === "string") parts.push(DECISION_LABELS[meta.decision] || meta.decision);
+  if (typeof meta.score === "number") parts.push(`${meta.score} điểm`);
+  if (typeof meta.version === "number") parts.push(`phiên bản ${meta.version}`);
+  if (Array.isArray(meta.application_ids)) parts.push(`${meta.application_ids.length} ứng viên`);
+  if (typeof meta.count === "number") parts.push(`${meta.count} hồ sơ`);
+  if (typeof meta.recipient === "string") parts.push(meta.recipient);
+  if (typeof meta.note === "string" && meta.note.trim()) parts.push(`“${meta.note.trim()}”`);
+  return parts.join(" · ");
+}
 
 export default function Home() {
   const [scheduleToken, setScheduleToken] = useState<string | null | undefined>(undefined);
@@ -364,12 +461,12 @@ function RecruiterApp() {
     <aside className="sidebar">
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
       <nav><p className="nav-label">WORKSPACE</p>
-        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
+        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
           <button key={label} className={active === label ? "nav-item active" : "nav-item"} onClick={() => setActive(label)}><Icon name={icon}/>{label}{label === "Ứng viên" && <span className="count">{dashboard.metrics.awaiting_review}</span>}{label === "Phê duyệt" && approvals.length > 0 && <span className="count">{approvals.length}</span>}</button>)}
         <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
       </nav>
       <div className="agent-card"><div className="agent-icon"><Icon name="spark"/></div><b>Agent đang hoạt động</b><p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p><div className="agent-progress"><span/></div><small>Dữ liệu đồng bộ từ API</small></div>
-      <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || "Vinh Nguyễn"}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
+      <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || LOCAL_ACTOR_NAME}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
     </aside>
 
     <main>
@@ -387,8 +484,9 @@ function RecruiterApp() {
         </section>}
 
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
-        : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
+        : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
+        : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
         : active === "Xoá dữ liệu" ? <ClearDataView dashboard={dashboard} onCleared={async () => { setSelected(null); setLastBatch(null); await loadDashboard(); }}/>
         : <><div className="dashboard-grid">
@@ -529,12 +627,149 @@ function ClearDataView({ dashboard, onCleared }: { dashboard: Dashboard; onClear
   return <section className="panel clear-data-view"><div className="panel-head"><div><h2>Xoá toàn bộ dữ liệu tuyển dụng</h2><p>Giữ nguyên tài khoản, phân quyền, kết nối và cấu hình hệ thống.</p></div><span className="status rejected">DANGER ZONE</span></div><div className="clear-data-body"><h3>Sẽ xoá vĩnh viễn</h3><div className="clear-summary"><span><b>{dashboard.jobs.length}</b> việc làm</span><span><b>{dashboard.applications.length}</b> CV / ứng viên</span><span><b>{dashboard.interviews?.length || 0}</b> lịch phỏng vấn</span></div><p>Nhập chính xác <code>XOA TOAN BO</code> để xác nhận.</p><input value={confirmation} onChange={event => setConfirmation(event.target.value)} placeholder="XOA TOAN BO"/><button className="danger" disabled={busy || confirmation.trim().toUpperCase() !== "XOA TOAN BO"} onClick={() => void clear()}>{busy ? "Đang xoá..." : "Xoá toàn bộ dữ liệu"}</button>{message && <p className="operations-message">{message}</p>}</div></section>;
 }
 
-function ApprovalInbox({ approvals, actionBusy, pendingAction, onResolve }: {
-  approvals: Approval[]; actionBusy: boolean; pendingAction: PendingAction | null;
+function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve }: {
+  approvals: Approval[]; dashboard: Dashboard; actionBusy: boolean; pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT") => Promise<void>;
 }) {
   const labels: Record<Approval["type"], string> = { CRITERIA: "Tiêu chí", EVIDENCE: "Evidence yếu", SHORTLIST: "Shortlist", ESCALATION: "Ngoại lệ phỏng vấn" };
-  return <section className="panel approval-view"><div className="panel-head"><div><h2>Approval inbox</h2><p>{approvals.length} quyết định cần recruiter xử lý</p></div><span className="bounded-badge">Bounded agent</span></div>{approvals.length ? approvals.map(item => <article className="approval-row" key={item.id}><div className={`approval-type ${item.type.toLowerCase()}`}><Icon name={item.type === "SHORTLIST" ? "users" : item.type === "CRITERIA" ? "briefcase" : "spark"}/></div><div><span className="eyebrow">{labels[item.type]}</span><h3>{item.title}</h3><p>{item.summary}</p>{item.type === "EVIDENCE" && <small>Confidence: {Math.round(Number(item.payload.confidence || 0) * 100)}% · {(item.payload.reasons as string[] || []).join(", ")}</small>}{item.type === "SHORTLIST" && <small>{(item.payload.application_ids as string[] || []).length} ứng viên được đề xuất · Chưa outreach</small>}</div><div className="approval-actions"><button className="secondary compact" disabled={actionBusy} onClick={() => void onResolve(item, "REJECT")}>Trả lại</button><button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(item, "APPROVE")}>{pendingAction?.key === `approval-${item.id}` ? "Đang xử lý..." : item.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}</button></div></article>) : <div className="empty-state">Inbox đã sạch. Agent chỉ chuyển tới đây các quyết định cần người.</div>}</section>;
+  return <section className="panel approval-view">
+    <div className="panel-head">
+      <div><h2>Approval inbox</h2><p>{approvals.length} quyết định cần recruiter xử lý</p></div>
+      <span className="bounded-badge">Bounded agent</span>
+    </div>
+    {approvals.length ? approvals.map(item =>
+      <ApprovalCard key={item.id} approval={item} typeLabel={labels[item.type]} dashboard={dashboard}
+                    actionBusy={actionBusy} pendingAction={pendingAction} onResolve={onResolve}/>)
+      : <div className="empty-state">Inbox đã sạch. Agent chỉ chuyển tới đây các quyết định cần người.</div>}
+  </section>;
+}
+
+function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve }: {
+  approval: Approval; typeLabel: string; dashboard: Dashboard; actionBusy: boolean;
+  pendingAction: PendingAction | null;
+  onResolve: (approval: Approval, decision: "APPROVE" | "REJECT") => Promise<void>;
+}) {
+  const [history, setHistory] = useState<AuditLog[] | null>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+
+  const payload = approval.payload || {};
+  const requester = approval.requested_by_email?.trim()
+    || (approval.requested_by_id === LOCAL_ACTOR_ID ? LOCAL_ACTOR_NAME : approval.requested_by_id) || "";
+  const job = dashboard.jobs.find(item => item.id === approval.job_id);
+  const candidate = dashboard.applications.find(item => item.id === approval.application_id);
+
+  const toggleHistory = async () => {
+    if (history) { setHistory(null); return; }
+    setLoadingHistory(true); setHistoryError("");
+    const query = approval.application_id ? `application_id=${approval.application_id}`
+      : approval.job_id ? `job_id=${approval.job_id}` : "";
+    try { setHistory(await request<AuditLog[]>(`/api/audit-logs?limit=50&${query}`)); }
+    catch (err) { setHistoryError(err instanceof Error ? err.message : "Không tải được lịch sử"); }
+    finally { setLoadingHistory(false); }
+  };
+
+  const criteria = (payload.criteria || {}) as { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number };
+  const ranking = (payload.ranking || []) as { application_id: string; score: number; confidence?: number }[];
+
+  return <article className="approval-row approval-card">
+    <div className={`approval-type ${approval.type.toLowerCase()}`}>
+      <Icon name={approval.type === "SHORTLIST" ? "users" : approval.type === "CRITERIA" ? "briefcase" : "spark"}/>
+    </div>
+    <div className="approval-main">
+      <span className="eyebrow">{typeLabel}</span>
+      <h3>{approval.title}</h3>
+      <p>{approval.summary}</p>
+
+      <div className="approval-meta">
+        <span>Người đề xuất: <b>{requester || "Hệ thống tự đề xuất"}</b></span>
+        {approval.created_at && <span>Thời gian: <b>{fullDateLabel(approval.created_at)}</b></span>}
+        {job && <span>Vị trí: <b>{job.title}</b></span>}
+        {candidate && <span>Ứng viên: <b>{candidate.candidate.name}</b></span>}
+      </div>
+
+      {approval.type === "CRITERIA" && <div className="approval-detail">
+        <div className="approval-field">
+          <span>Kỹ năng bắt buộc</span>
+          <div className="approval-chips">
+            {criteria.required_skills?.length
+              ? criteria.required_skills.map(skill => <i key={skill}>{skill}</i>)
+              : <em className="approval-empty">AI không tách được kỹ năng nào — cần tự bổ sung trước khi duyệt</em>}
+          </div>
+        </div>
+        <div className="approval-field">
+          <span>Kỹ năng ưu tiên</span>
+          <div className="approval-chips">
+            {criteria.preferred_skills?.length
+              ? criteria.preferred_skills.map(skill => <i className="soft" key={skill}>{skill}</i>)
+              : <em className="approval-empty">Không có</em>}
+          </div>
+        </div>
+        <div className="approval-field">
+          <span>Kinh nghiệm tối thiểu</span>
+          <div className="approval-chips"><i>{criteria.minimum_experience || 0} năm</i></div>
+        </div>
+        <div className="approval-field">
+          <span>Phiên bản · Nguồn</span>
+          <div className="approval-chips"><i>v{String(payload.version ?? 1)}</i>
+            {typeof payload.change_note === "string" && payload.change_note && <i className="soft">{payload.change_note}</i>}</div>
+        </div>
+      </div>}
+
+      {approval.type === "SHORTLIST" && <div className="approval-detail">
+        <div className="approval-field wide">
+          <span>{ranking.length} ứng viên được đề xuất — chưa gửi email cho ai</span>
+          <table className="approval-table">
+            <thead><tr><th>#</th><th>Ứng viên</th><th>Điểm</th><th>Độ tin cậy</th></tr></thead>
+            <tbody>
+              {ranking.map((row, index) => {
+                const person = dashboard.applications.find(item => item.id === row.application_id);
+                return <tr key={row.application_id}>
+                  <td>{index + 1}</td>
+                  <td>{person?.candidate.name || row.application_id.slice(0, 8)}</td>
+                  <td className="num">{row.score}</td>
+                  <td className="num">{row.confidence != null ? `${Math.round(row.confidence * 100)}%` : "—"}</td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>}
+
+      {approval.type === "EVIDENCE" && <div className="approval-detail">
+        <div className="approval-field"><span>Điểm chấm</span><div className="approval-chips"><i>{String(payload.score ?? "—")}</i></div></div>
+        <div className="approval-field"><span>Độ tin cậy</span><div className="approval-chips"><i>{Math.round(Number(payload.confidence || 0) * 100)}%</i></div></div>
+        <div className="approval-field"><span>Lý do cần người kiểm tra</span>
+          <div className="approval-chips">{((payload.reasons as string[]) || []).map(reason =>
+            <i className="warn" key={reason}>{EVIDENCE_REASONS[reason] || reason}</i>)}</div>
+        </div>
+      </div>}
+
+      {approval.type === "ESCALATION" && <div className="approval-detail">
+        <div className="approval-field wide"><span>Chi tiết</span>
+          <pre className="approval-raw">{JSON.stringify(payload, null, 2)}</pre></div>
+      </div>}
+
+      <button className="approval-history-toggle" disabled={loadingHistory} onClick={() => void toggleHistory()}>
+        <Icon name="clock"/>{loadingHistory ? "Đang tải..." : history ? "Ẩn lịch sử" : "Xem lịch sử"}
+      </button>
+      {historyError && <p className="approval-empty">{historyError}</p>}
+      {history && <ol className="approval-history">
+        {history.length ? history.map(entry => <li key={entry.id}>
+          <b>{auditLabel(entry.action)}</b>
+          <span>{actorLabel(entry) || "Hệ thống tự động"}</span>
+          <time dateTime={entry.created_at}>{fullDateLabel(entry.created_at)}</time>
+        </li>) : <li className="approval-empty">Chưa có thao tác nào được ghi nhận.</li>}
+      </ol>}
+    </div>
+
+    <div className="approval-actions">
+      <button className="secondary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "REJECT")}>Trả lại</button>
+      <button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "APPROVE")}>
+        {pendingAction?.key === `approval-${approval.id}` ? "Đang xử lý..." : approval.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}
+      </button>
+    </div>
+  </article>;
 }
 
 function InterviewsView({ dashboard, onChanged }: { dashboard: Dashboard; onChanged: () => Promise<void> }) {
@@ -566,6 +801,85 @@ function InterviewsView({ dashboard, onChanged }: { dashboard: Dashboard; onChan
   const rubric = person?.screening.interview_kit?.rubric || [];
   return <section className="panel jobs-view interview-ops"><div className="panel-head"><div><h2>Interview operations</h2><p>Ứng viên giữ slot trước; HR xác nhận để tạo lịch và gửi email.</p></div><span className="bounded-badge">Human-gated</span></div>{message && <p className="operations-message interview-message">{message}</p>}{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const candidate = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{candidate?.candidate.name || "Ứng viên"} · đổi lịch {interview.reschedule_count || 0} lần</p></div>{interview.meeting_url && <a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a>}<i className={`status ${interview.status === "NO_SHOW" ? "rejected" : interview.status === "SCHEDULED" ? "interview" : "review"}`}>{interview.status === "PENDING_CONFIRMATION" ? "Chờ HR xác nhận" : interview.status}</i>{interview.status === "PENDING_CONFIRMATION" ? <button className="primary compact" disabled={busy} onClick={() => void confirmInterview(interview.id)}>{busy ? "Đang xác nhận..." : "Xác nhận lịch"}</button> : <button className="secondary compact" disabled={busy} onClick={() => void loadOps(interview.id)}>Operations</button>}</article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Duyệt Top 5 để tự động gửi link chọn lịch.</div>}
     {selectedInterview && <div className="operations-detail"><div className="panel-head"><div><span className="eyebrow">FOLLOW-UP AGENT</span><h3>{person?.candidate.name || "Ứng viên"}</h3></div><button className="danger-link" disabled={busy || selectedInterview.status === "NO_SHOW"} onClick={() => void markNoShow()}>Đánh dấu no-show</button></div>{busy && <InlineProgress label="Đang đồng bộ interview operations"/>}{message && <p className="operations-message">{message}</p>}<div className="operations-grid"><div><h4>Reminder</h4>{ops?.reminders.length ? ops.reminders.map(item => <p key={item.id}><b>{dateLabel(item.due_at)}</b><span>{item.status}</span></p>) : <small>Chưa có reminder.</small>}</div><div><h4>Scorecard</h4>{ops?.scorecards.length ? ops.scorecards.map(item => <p key={item.id}><b>{item.interviewer_email}</b><span>{item.recommendation}</span></p>) : <small>Đang chờ feedback.</small>}</div></div>{ops?.feedback_summary && <article className="feedback-summary"><h4>Feedback summary</h4><p>{ops.feedback_summary.summary}</p><small>Nguồn: {ops.feedback_summary.sources.length} scorecard · Mâu thuẫn: {ops.feedback_summary.conflicts.length}</small></article>}<form className="scorecard-form" onSubmit={submitScorecard}><h4>Nộp scorecard có cấu trúc</h4><input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/><select name="criterion" required defaultValue={rubric[0]?.criterion || "Technical capability"}>{rubric.map(item => <option key={item.criterion}>{item.criterion}</option>)}{!rubric.length && <option>Technical capability</option>}</select><select name="rating" defaultValue="3"><option value="1">1 — Không đạt</option><option value="2">2</option><option value="3">3 — Trung bình</option><option value="4">4</option><option value="5">5 — Xuất sắc</option></select><select name="recommendation" defaultValue="MIXED"><option value="STRONG_YES">Strong yes</option><option value="YES">Yes</option><option value="MIXED">Mixed</option><option value="NO">No</option><option value="STRONG_NO">Strong no</option></select><textarea name="evidence" required placeholder="Evidence quan sát được trong buổi phỏng vấn"/><textarea name="note" placeholder="Ghi chú bổ sung"/><button className="primary compact" disabled={busy}>Lưu scorecard</button></form></div>}
+  </section>;
+}
+
+function AuditLogView({ dashboard }: { dashboard: Dashboard }) {
+  const PAGE_SIZE = 50;
+  const [logs, setLogs] = useState<AuditLog[]>([]);
+  const [group, setGroup] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = async (offset: number) => {
+    const next = await request<AuditLog[]>(`/api/audit-logs?limit=${PAGE_SIZE}&offset=${offset}`);
+    setHasMore(next.length === PAGE_SIZE);
+    setLogs(current => offset === 0 ? next : [...current, ...next]);
+  };
+  useEffect(() => {
+    void load(0)
+      .catch(err => setError(err instanceof Error ? err.message : "Không tải được lịch sử"))
+      .finally(() => setLoading(false));
+  }, []);
+  const loadMore = async () => {
+    setLoadingMore(true);
+    try { await load(logs.length); }
+    catch (err) { setError(err instanceof Error ? err.message : "Không tải thêm được"); }
+    finally { setLoadingMore(false); }
+  };
+
+  const counts = useMemo(() => {
+    const result: Record<string, number> = { all: logs.length, decision: 0, screening: 0, interview: 0, system: 0 };
+    logs.forEach(item => { result[auditGroup(item.action)] += 1; });
+    return result;
+  }, [logs]);
+  const visible = useMemo(
+    () => group === "all" ? logs : logs.filter(item => auditGroup(item.action) === group),
+    [logs, group],
+  );
+  const candidateName = (applicationId: string | null) =>
+    applicationId ? dashboard.applications.find(item => item.id === applicationId)?.candidate.name : undefined;
+
+  return <section className="panel audit-view">
+    <div className="panel-head">
+      <div><h2>Lịch sử thao tác</h2><p>Toàn bộ hành động đã thực hiện trên hệ thống, mới nhất trước</p></div>
+      <span className="bounded-badge">{logs.length} bản ghi</span>
+    </div>
+    {error && <div className="error-banner"><b>Không tải được lịch sử.</b> {error}</div>}
+    <div className="candidate-tabs audit-tabs">
+      {[["all", "Tất cả"], ["decision", "Quyết định"], ["screening", "Xử lý CV"], ["interview", "Phỏng vấn"], ["system", "Hệ thống"]].map(([key, label]) =>
+        <button key={key} className={group === key ? "active" : ""} onClick={() => setGroup(key)}>{label}<span>{counts[key]}</span></button>)}
+    </div>
+    {loading ? <InlineProgress label="Đang tải lịch sử thao tác"/>
+      : !visible.length ? <div className="empty-state">Chưa có thao tác nào được ghi nhận.</div>
+      : <ol className="audit-list">
+          {visible.map(entry => {
+            const name = candidateName(entry.application_id);
+            const detail = auditDetail(entry);
+            const actor = actorLabel(entry);
+            return <li className="audit-row" key={entry.id}>
+              <i className={`audit-dot ${auditGroup(entry.action)}`} aria-hidden="true"/>
+              <div className="audit-body">
+                <div className="audit-line">
+                  <b>{auditLabel(entry.action)}</b>
+                  <span className={`audit-tag ${auditGroup(entry.action)}`}>{AUDIT_GROUP_LABELS[auditGroup(entry.action)]}</span>
+                  {actor
+                    ? <span className="audit-actor">Người thực hiện: <b>{actor}</b></span>
+                    : <span className="audit-actor system">Hệ thống tự động</span>}
+                </div>
+                {name && <span className="audit-who">Ứng viên: {name}</span>}
+                {detail && <p className="audit-detail">{detail}</p>}
+              </div>
+              <time className="audit-time" dateTime={entry.created_at}>{fullDateLabel(entry.created_at)}</time>
+            </li>;
+          })}
+        </ol>}
+    {hasMore && group === "all" && !loading &&
+      <button className="secondary compact audit-more" disabled={loadingMore} onClick={() => void loadMore()}>
+        {loadingMore ? "Đang tải..." : "Xem thêm"}
+      </button>}
   </section>;
 }
 
