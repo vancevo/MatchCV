@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+from pathlib import Path
 import secrets
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -13,7 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sql_delete, func, or_, select, update as sql_update
 from sqlalchemy.exc import IntegrityError
@@ -41,7 +42,15 @@ from .models import (
     ReleaseGate, UploadBatch,
 )
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
-from .resume import candidate_identity, checksum, extract_resume
+from .resume import (
+    CONTENT_TYPES,
+    candidate_identity,
+    checksum,
+    delete_resume_file,
+    extract_resume,
+    store_resume_file,
+    stored_resume_path,
+)
 from .statuses import (
     ApplicationStatus,
     BatchItemStatus,
@@ -707,6 +716,7 @@ def _policy_dict(policy: TenantPolicy, usage: TenantUsage) -> dict:
 
 
 def _erase_application(db, item: Application, reason: str) -> None:
+    delete_resume_file(item.id, item.resume_filename)
     interview_ids = list(db.scalars(select(Interview.id).where(Interview.application_id == item.id)))
     run_ids = list(db.scalars(select(AgentRun.id).where(AgentRun.application_id == item.id)))
     for ingestion in db.scalars(select(SourceIngestion).where(SourceIngestion.application_id == item.id)):
@@ -1759,6 +1769,32 @@ async def create_application(payload: ApplicationCreate, owner_id: str = Depends
         return application_dict(item)
 
 
+@app.get("/api/applications/{application_id}/resume")
+def read_resume(application_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
+    """Extracted CV text, plus whether the original upload is still on disk."""
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        path = stored_resume_path(item.id, item.resume_filename)
+        suffix = Path(item.resume_filename or "").suffix.lower()
+        return {"application_id": item.id, "filename": item.resume_filename,
+                "size": item.resume_size, "checksum": item.resume_checksum,
+                "text": item.resume_text or "",
+                "file_available": bool(path and path.exists()), "file_type": suffix.lstrip(".")}
+
+
+@app.get("/api/applications/{application_id}/resume-file")
+def read_resume_file(application_id: str, owner_id: str = Depends(current_tenant_id)) -> FileResponse:
+    """Serve the CV exactly as uploaded, so the reviewer sees the candidate's own formatting."""
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        filename = item.resume_filename
+        path = stored_resume_path(item.id, filename)
+    if not path or not path.exists():
+        raise HTTPException(404, "Original file is not stored for this application")
+    return FileResponse(path, media_type=CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                        filename=filename or path.name, content_disposition_type="inline")
+
+
 @app.get("/api/applications/{application_id}/interview-kit")
 async def get_interview_kit(application_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
     with session_scope() as db:
@@ -1826,6 +1862,7 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                     with db.begin_nested():
                         db.add(application)
                         db.flush()
+                    store_resume_file(application_id, filename, content)
                 except IntegrityError:
                     duplicate = db.scalar(select(Application).where(
                         Application.owner_id == owner_id,

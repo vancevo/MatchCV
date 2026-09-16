@@ -55,6 +55,7 @@ class Settings:
     talentflow_max_input_tokens: int
     talentflow_max_new_tokens: int
     max_upload_mb: int
+    resume_storage_dir: str
     redis_url: str
     queue_name: str
     queue_eager: bool
@@ -130,6 +131,7 @@ class Settings:
             talentflow_max_input_tokens=_positive_int("TALENTFLOW_MAX_INPUT_TOKENS", 8192, 32768),
             talentflow_max_new_tokens=_positive_int("TALENTFLOW_MAX_NEW_TOKENS", 2048, 8192),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
+            resume_storage_dir=os.getenv("RESUME_STORAGE_DIR", "uploads").strip() or "uploads",
             redis_url=redis_url,
             queue_name=os.getenv("QUEUE_NAME", "talentflow-screening").strip() or "talentflow-screening",
             queue_eager=queue_eager,
