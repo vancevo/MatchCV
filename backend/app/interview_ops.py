@@ -17,7 +17,7 @@ from .models import (
     OutboxEvent,
     SchedulingInvitation,
 )
-from .scheduling import add_outbox, dispatch_outbox, render_template
+from .scheduling import add_outbox, dispatch_outbox, local_datetime_label, render_template
 
 
 def utcnow() -> datetime:
@@ -84,13 +84,11 @@ def schedule_reminders(db, interview: Interview) -> list[str]:
             db,
             interview.owner_id,
             "interview_reminder",
-            "Nhắc lịch phỏng vấn — {job_title}",
-            "Chào {candidate_name},\n\nLịch phỏng vấn bắt đầu lúc {start_at}.\nTham gia: {meeting_url}",
             {
                 "candidate_name": application.candidate_name,
                 "job_title": job.title,
-                "start_at": aware(interview.start_at).isoformat(),
-                "meeting_url": interview.meeting_url,
+                "start_at": local_datetime_label(aware(interview.start_at), interview.timezone_name),
+                "meeting_url": interview.meeting_url or "(sẽ gửi trước buổi phỏng vấn)",
             },
         )
         event = add_outbox(
@@ -123,11 +121,12 @@ def schedule_scorecard_reminder(db, interview: Interview) -> str:
     job = db.get(Job, application.job_id) if application else None
     due_at = aware(interview.end_at) + timedelta(hours=max(1, policy.feedback_due_hours // 2))
     rendered = render_template(
-        db, interview.owner_id, "scorecard_reminder", "Nhắc nộp scorecard — {candidate_name}",
-        "Scorecard cho {candidate_name} / {job_title} chưa được nộp. Vui lòng bổ sung evidence trước {deadline}.",
+        db, interview.owner_id, "scorecard_reminder",
         {"candidate_name": application.candidate_name if application else "ứng viên",
          "job_title": job.title if job else "vị trí tuyển dụng",
-         "deadline": (aware(interview.end_at) + timedelta(hours=policy.feedback_due_hours)).isoformat()},
+         "deadline": local_datetime_label(
+             aware(interview.end_at) + timedelta(hours=policy.feedback_due_hours),
+             interview.timezone_name)},
     )
     event = add_outbox(
         db, owner_id=interview.owner_id, aggregate_type="interview", aggregate_id=interview.id,
