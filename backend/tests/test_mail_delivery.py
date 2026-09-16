@@ -86,7 +86,9 @@ def test_invitation_email_names_the_job_and_reads_as_local_time():
     assert title in body
     assert "Phỏng vấn trực tuyến" in body
     # An ISO timestamp is not something a candidate should be asked to decode.
-    assert re.search(r"hiệu lực đến \d{2}:\d{2} Th[^,]+, \d{2}/\d{2}/\d{4}", body)
+    # Any weekday, including "Chủ Nhật" - anchoring on "Th" made this pass or fail depending on
+    # which day the expiry happened to land on.
+    assert re.search(r"hiệu lực đến \d{2}:\d{2} \S[^,]*, \d{2}/\d{2}/\d{4}", body)
     assert "T00:00" not in body and "+00:00" not in body
 
 
