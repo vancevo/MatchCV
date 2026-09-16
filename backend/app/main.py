@@ -26,7 +26,7 @@ from .agentic import (
     record_screening_artifact,
     utcnow,
 )
-from .auth import current_tenant_id, current_user_id, require_tenant_role
+from .auth import current_actor, current_tenant_id, current_user_id, require_tenant_role
 from .config import get_settings
 from .database import SessionLocal, session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
@@ -416,8 +416,11 @@ def pipeline(review_status: str = "waiting") -> list[dict]:
     return screening_pipeline(completed_through)
 
 
-def audit(db, owner_id: str, application_id: str | None, action: str, metadata: dict | None = None) -> None:
-    db.add(AuditLog(owner_id=owner_id, application_id=application_id, action=action, metadata_json=metadata or {}))
+def audit(db, owner_id: str, application_id: str | None, action: str, metadata: dict | None = None,
+          actor: dict[str, str] | None = None) -> None:
+    """Pass `actor` for decisions a person made; leave it out so system events stay attributed to no one."""
+    db.add(AuditLog(owner_id=owner_id, application_id=application_id, action=action, metadata_json=metadata or {},
+                    actor_id=(actor or {}).get("id") or None, actor_email=(actor or {}).get("email") or None))
 
 
 def job_dict(job: Job, count: int = 0) -> dict:
@@ -436,6 +439,7 @@ def approval_dict(value: ApprovalRequest) -> dict:
     return {"id": value.id, "type": value.request_type, "status": value.status, "job_id": value.job_id,
             "application_id": value.application_id, "resource_id": value.resource_id, "title": value.title,
             "summary": value.summary, "payload": value.payload, "resolution": value.resolution,
+            "requested_by_id": value.requested_by_id, "requested_by_email": value.requested_by_email,
             "created_at": value.created_at.isoformat() if value.created_at else None}
 
 
@@ -1274,27 +1278,32 @@ def list_applications(
 
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id)) -> dict:
+async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id),
+                     actor: dict[str, str] = Depends(current_actor)) -> dict:
     requirements = await extract_requirements_ai(payload.description)
     requirements = {**requirements, "approval": {"status": "PENDING", "note": ""},
                     "shortlist_trigger": {"enabled": True, "min_completed": 2, "top_n": 5, "min_score": 65}}
     with session_scope() as db:
         job = Job(owner_id=owner_id, **payload.model_dump(), requirements=requirements)
         db.add(job); db.flush()
-        create_criteria_version(db, job, owner_id, requirements, "Extracted from job description")
+        create_criteria_version(db, job, owner_id, requirements, "Extracted from job description", actor=actor)
+        audit(db, owner_id, None, "JOB_CREATED",
+              {"job_id": job.id, "title": job.title, "extraction_source": requirements.get("extraction_source", "")},
+              actor=actor)
         return job_dict(job)
 
 
 @app.put("/api/jobs/{job_id}/criteria")
-def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depends(current_tenant_id),
+                    actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         criteria = payload.model_dump(exclude={"note"})
-        version = create_criteria_version(db, job, owner_id, criteria, payload.note)
+        version = create_criteria_version(db, job, owner_id, criteria, payload.note, actor=actor)
         job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note},
                             "shortlist_trigger": (job.requirements or {}).get("shortlist_trigger", {})}
         audit(db, owner_id, None, "CRITERIA_VERSION_CREATED",
-              {"job_id": job.id, "criteria_version_id": version.id, "version": version.version})
+              {"job_id": job.id, "criteria_version_id": version.id, "version": version.version}, actor=actor)
         return {"job": job_dict(job), "criteria_version": criteria_version_dict(version)}
 
 
@@ -1337,7 +1346,8 @@ def _queue_rescreens(db, job: Job, criteria: CriteriaVersion, owner_id: str) -> 
 
 
 @app.post("/api/jobs/{job_id}/approve-criteria")
-async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str = Depends(current_tenant_id)) -> dict:
+async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str = Depends(current_tenant_id),
+                           actor: dict[str, str] = Depends(current_actor)) -> dict:
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
@@ -1353,7 +1363,8 @@ async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str
             },
         }
         audit(db, owner_id, None, "CRITERIA_APPROVED" if payload.approved else "CRITERIA_REVISION_REQUESTED",
-              {"job_id": job.id, "criteria_version_id": criteria.id, "version": criteria.version, "note": payload.note})
+              {"job_id": job.id, "criteria_version_id": criteria.id, "version": criteria.version, "note": payload.note},
+              actor=actor)
         request = db.scalar(select(ApprovalRequest).where(
             ApprovalRequest.resource_id == criteria.id, ApprovalRequest.status == "PENDING"
         ))
@@ -1457,7 +1468,8 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
 
 
 @app.post("/api/jobs/{job_id}/approve-shortlist")
-def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id)) -> dict:
+def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     selected = set(payload.application_ids)
     invitations: list[dict] = []
     outbox_ids: list[str] = []
@@ -1485,7 +1497,7 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
                 "approved_at": datetime.now(timezone.utc).isoformat(),
             },
         }
-        audit(db, owner_id, None, "SHORTLIST_APPROVED", {"job_id": job.id, "application_ids": payload.application_ids, "note": payload.note})
+        audit(db, owner_id, None, "SHORTLIST_APPROVED", {"job_id": job.id, "application_ids": payload.application_ids, "note": payload.note}, actor=actor)
         proposal = db.scalar(select(ShortlistProposal).where(
             ShortlistProposal.job_id == job.id, ShortlistProposal.status == "PENDING"
         ).order_by(ShortlistProposal.created_at.desc()).limit(1))
@@ -1544,7 +1556,8 @@ def approval_inbox(
 
 @app.post("/api/approvals/{approval_id}/resolve")
 async def resolve_approval(approval_id: str, payload: ApprovalResolution,
-                           owner_id: str = Depends(current_tenant_id)) -> dict:
+                           owner_id: str = Depends(current_tenant_id),
+                           actor: dict[str, str] = Depends(current_actor)) -> dict:
     decision = payload.decision.upper()
     if decision not in {"APPROVE", "REJECT"}:
         raise HTTPException(422, "decision must be APPROVE or REJECT")
@@ -1615,7 +1628,7 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                     invitations.append(invitation)
                     invitation_outbox_ids.append(outbox_id)
         audit(db, owner_id, request.application_id, f"{request.request_type}_{request.status}",
-              {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note})
+              {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note}, actor=actor)
         response = approval_dict(request)
     for task_id in task_ids:
         try:
@@ -1866,7 +1879,8 @@ def get_agent_run(run_id: str, owner_id: str = Depends(current_tenant_id)) -> di
 
 
 @app.post("/api/applications/{application_id}/review")
-def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(current_tenant_id),
+           actor: dict[str, str] = Depends(current_actor)) -> dict:
     statuses = {
         ReviewDecision.INTERVIEW.value: ApplicationStatus.INTERVIEW_PENDING.value,
         ReviewDecision.MANUAL_REVIEW.value: ApplicationStatus.REVIEWED.value,
@@ -1881,7 +1895,7 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         if item.status in {ApplicationStatus.PROCESSING.value, ApplicationStatus.SCREENING_FAILED.value}:
             raise HTTPException(409, "Application screening is not ready for review")
         item.status = statuses[decision]; item.review = payload.model_dump(); item.pipeline = pipeline("completed")
-        audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump())
+        audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump(), actor=actor)
         return application_dict(item)
 
 
@@ -2050,7 +2064,8 @@ def submit_scorecard(interview_id: str, payload: ScorecardCreate,
 
 
 @app.post("/api/interviews/{interview_id}/no-show")
-def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
+def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id),
+                 actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         interview = db.scalar(select(Interview).where(Interview.id == interview_id, Interview.owner_id == owner_id))
         if not interview:
@@ -2058,7 +2073,7 @@ def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id)) 
         interview.status = "NO_SHOW"
         interview.outcome = "NO_SHOW"
         request = escalation(db, interview, "NO_SHOW", "Ứng viên không tham dự; recruiter cần chọn liên hệ lại hoặc đóng quy trình.")
-        audit(db, owner_id, interview.application_id, "INTERVIEW_NO_SHOW", {"interview_id": interview.id})
+        audit(db, owner_id, interview.application_id, "INTERVIEW_NO_SHOW", {"interview_id": interview.id}, actor=actor)
         return {"interview": interview_dict(interview), "approval": approval_dict(request)}
 
 
@@ -2217,7 +2232,8 @@ def book_public_interview(token: str, payload: BookingCreate) -> dict:
 
 @app.post("/api/interviews/{interview_id}/confirm")
 def confirm_interview(interview_id: str, payload: InterviewConfirmation,
-                      owner_id: str = Depends(current_tenant_id)) -> dict:
+                      owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     outbox_id = ""
     with session_scope() as db:
         value = db.scalar(select(Interview).where(
@@ -2238,7 +2254,7 @@ def confirm_interview(interview_id: str, payload: InterviewConfirmation,
         outbox_id = outbox.id
         audit(db, owner_id, application.id, "INTERVIEW_CONFIRMED_BY_HR", {
             "interview_id": value.id, "note": payload.note,
-        })
+        }, actor=actor)
         response = interview_dict(value)
     dispatch_outbox(outbox_id)
     with session_scope() as db:
@@ -2451,6 +2467,7 @@ def logs(
     offset: int = Query(0, ge=0),
     action: str | None = Query(None, max_length=80),
     application_id: str | None = None,
+    job_id: str | None = None,
     owner_id: str = Depends(current_tenant_id),
 ) -> list[dict]:
     with session_scope() as db:
@@ -2459,9 +2476,13 @@ def logs(
             statement = statement.where(AuditLog.action == action)
         if application_id:
             statement = statement.where(AuditLog.application_id == application_id)
+        if job_id:
+            # job_id lives inside the metadata payload rather than its own column.
+            statement = statement.where(AuditLog.metadata_json["job_id"].as_string() == job_id)
         statement = statement.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
         values = db.scalars(statement)
         return [{"id": v.id, "application_id": v.application_id, "action": v.action,
+                 "actor_id": v.actor_id, "actor_email": v.actor_email,
                  "metadata": v.metadata_json,
                  "created_at": v.created_at.replace(tzinfo=v.created_at.tzinfo or timezone.utc).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
                 for v in values]
