@@ -124,6 +124,10 @@ class JobCreate(BaseModel):
     location: str = "Remote"
 
 
+class JobUpdate(BaseModel):
+    description: str = Field(min_length=10, max_length=20000)
+
+
 class ApplicationCreate(BaseModel):
     job_id: str
     candidate_name: str
@@ -577,11 +581,13 @@ def shortlist_report(job: Job, applications: list[Application]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def interview_dict(item: Interview) -> dict:
-    def utc_iso(value: datetime) -> str:
-        normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
-        return normalized.isoformat().replace("+00:00", "Z")
+def utc_iso(value: datetime) -> str:
+    """SQLite returns naive datetimes; without the marker a browser reads them as local time."""
+    normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
+    return normalized.isoformat().replace("+00:00", "Z")
 
+
+def interview_dict(item: Interview) -> dict:
     return {"id": item.id, "application_id": item.application_id, "start_at": utc_iso(item.start_at),
             "end_at": utc_iso(item.end_at), "status": item.status, "meeting_url": item.meeting_url,
             "provider": item.provider, "external_event_id": item.external_event_id,
@@ -1326,7 +1332,7 @@ def list_applications(
 async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id),
                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     requirements = await extract_requirements_ai(payload.description)
-    requirements = {**requirements, "approval": {"status": "PENDING", "note": ""},
+    requirements = {**requirements, "approval": {"status": "PENDING", "note": "", "version": 1},
                     "shortlist_trigger": {"enabled": True, "min_completed": 2, "top_n": 5, "min_score": 65}}
     with session_scope() as db:
         job = Job(owner_id=owner_id, **payload.model_dump(), requirements=requirements)
@@ -1345,7 +1351,7 @@ def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depend
         job = require_job(db, job_id, owner_id)
         criteria = payload.model_dump(exclude={"note"})
         version = create_criteria_version(db, job, owner_id, criteria, payload.note, actor=actor)
-        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note},
+        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note, "version": version.version},
                             "shortlist_trigger": (job.requirements or {}).get("shortlist_trigger", {})}
         audit(db, owner_id, None, "CRITERIA_VERSION_CREATED",
               {"job_id": job.id, "criteria_version_id": version.id, "version": version.version}, actor=actor)
@@ -1404,6 +1410,7 @@ async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str
             "approval": {
                 "status": "APPROVED" if payload.approved else "NEEDS_REVISION",
                 "note": payload.note,
+                "version": criteria.version,
                 "approved_at": datetime.now(timezone.utc).isoformat() if payload.approved else None,
             },
         }
@@ -1633,7 +1640,8 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             criteria.status = "APPROVED" if decision == "APPROVE" else "NEEDS_REVISION"
             criteria.approved_at = utcnow() if decision == "APPROVE" else None
             job.requirements = {**(job.requirements or {}), **criteria.criteria,
-                                "approval": {"status": criteria.status, "note": payload.note}}
+                                "approval": {"status": criteria.status, "note": payload.note,
+                                             "version": criteria.version}}
             if decision == "APPROVE":
                 task_ids = _queue_rescreens(db, job, criteria, owner_id)
         elif request.request_type == "SHORTLIST":
@@ -1690,6 +1698,17 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
     return response
 
 
+@app.put("/api/jobs/{job_id}")
+def update_job(job_id: str, payload: JobUpdate, owner_id: str = Depends(current_tenant_id),
+               actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Edit the posting text. Criteria are versioned separately and are left untouched."""
+    with session_scope() as db:
+        job = require_job(db, job_id, owner_id)
+        job.description = payload.description.strip()
+        audit(db, owner_id, None, "JOB_DESCRIPTION_UPDATED", {"job_id": job.id, "title": job.title}, actor=actor)
+        return job_dict(job)
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
     with session_scope() as db:
@@ -1697,8 +1716,14 @@ def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
         linked = list(db.scalars(select(Application).where(Application.job_id == job_id, Application.owner_id == owner_id)))
         if any(a.status not in {ApplicationStatus.REJECTED.value, ApplicationStatus.ARCHIVED.value} for a in linked):
             raise HTTPException(409, "Only jobs with no candidates or rejected/archived candidates can be deleted")
+        # SQLite runs with foreign keys off, so the ON DELETE CASCADE never fires and the
+        # approval inbox would keep showing cards for a job that no longer exists.
+        approvals = db.execute(sql_delete(ApprovalRequest).where(ApprovalRequest.job_id == job_id)).rowcount
+        db.execute(sql_delete(ShortlistProposal).where(ShortlistProposal.job_id == job_id))
+        db.execute(sql_delete(CriteriaVersion).where(CriteriaVersion.job_id == job_id))
         db.delete(job)
-        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked)}
+        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked),
+                "removed_approvals": approvals}
 
 
 @app.post("/api/applications", status_code=201)
@@ -1732,7 +1757,10 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        criteria = latest_criteria(db, job.id, approved_only=True) or ensure_criteria_version(db, job)
+        criteria = latest_criteria(db, job.id, approved_only=True)
+        if not criteria:
+            # Screening against unapproved criteria would walk straight past the review gate.
+            raise HTTPException(409, f"{job.title}: tiêu chí chưa được duyệt nên chưa nhận CV")
         batch = UploadBatch(owner_id=owner_id, job_id=job_id, total=len(files)); db.add(batch); db.flush()
         for file in files:
             filename = (file.filename or "unnamed")[:255]
@@ -2034,7 +2062,7 @@ def policy_dict(value: InterviewPolicy) -> dict:
 
 def busy_block_dict(value: BusyBlock) -> dict:
     return {"id": value.id, "note": value.note,
-            "start_at": value.start_at.isoformat(), "end_at": value.end_at.isoformat()}
+            "start_at": utc_iso(value.start_at), "end_at": utc_iso(value.end_at)}
 
 
 @app.get("/api/interview-policy")

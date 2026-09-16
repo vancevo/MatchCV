@@ -282,7 +282,7 @@ def availability_policy(db, owner_id: str) -> InterviewPolicy:
     return policy
 
 
-def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 7) -> list[datetime]:
+def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 21) -> list[datetime]:
     policy = availability_policy(db, owner_id)
     try:
         local_zone = ZoneInfo(policy.timezone_name or "Asia/Ho_Chi_Minh")
@@ -304,7 +304,7 @@ def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, day
     slots: list[datetime] = []
     cursor = start
     duration = timedelta(minutes=duration_minutes)
-    while cursor + duration <= end and len(slots) < 20:
+    while cursor + duration <= end and len(slots) < 120:
         local = cursor.astimezone(local_zone)
         if (local.weekday() in working_days
                 and open_hour <= local.hour < close_hour
