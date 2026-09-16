@@ -49,6 +49,7 @@ class Settings:
     openrouter_site_url: str
     openrouter_app_title: str
     max_upload_mb: int
+    resume_storage_dir: str
     redis_url: str
     queue_name: str
     queue_eager: bool
@@ -118,6 +119,7 @@ class Settings:
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
             openrouter_app_title=os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot").strip(),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
+            resume_storage_dir=os.getenv("RESUME_STORAGE_DIR", "uploads").strip() or "uploads",
             redis_url=redis_url,
             queue_name=os.getenv("QUEUE_NAME", "talentflow-screening").strip() or "talentflow-screening",
             queue_eager=queue_eager,
