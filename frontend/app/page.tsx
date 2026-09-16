@@ -23,7 +23,13 @@ type InterviewKit = {
 type Application = {
   id: string; job_id: string; status: string; resume_filename?: string;
   candidate: { name: string; email: string };
-  screening: { final_score: number; raw_score?: number; confidence?: number; recommendation: string; evidence: Evidence[]; experience_years: number; interview_kit?: InterviewKit; routing?: { decision: string; reasons: string[] } };
+  screening: {
+    final_score: number; raw_score?: number; confidence?: number; recommendation: string;
+    evidence: Evidence[]; experience_years: number; interview_kit?: InterviewKit;
+    routing?: { decision: string; reasons: string[] };
+    rule_score?: number; experience_score?: number; semantic_score?: number; preferred_score?: number;
+    screening_source?: string;
+  };
   pipeline: Step[];
 };
 type Job = {
@@ -130,6 +136,7 @@ function RecruiterApp() {
   const [dashboard, setDashboard] = useState<Dashboard>(emptyDashboard);
   const [active, setActive] = useState("Tổng quan");
   const [selected, setSelected] = useState<Application | null>(null);
+  const [explained, setExplained] = useState<Application | null>(null);
   const [query, setQuery] = useState("");
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
@@ -402,7 +409,16 @@ function RecruiterApp() {
               ["archived", "Lưu trữ", dashboard.applications.filter(item => item.status === "ARCHIVED").length],
             ].map(([key, label, count]) => <button key={key} className={candidateTab === key ? "active" : ""} onClick={() => setCandidateTab(String(key))}>{label}<span>{count}</span></button>)}</div>}
             <div className="table-head"><span>ỨNG VIÊN</span><span>ĐỘ PHÙ HỢP</span><span>TRẠNG THÁI</span><span/></div><div className="candidate-list">
-              {filtered.map((item, index) => <button className="candidate-row" key={item.id} onClick={() => setSelected(item)}><span className="person"><i className={`avatar ${["violet","blue","orange"][index%3]}`}>{initials(item.candidate.name)}</i><span><b>{item.candidate.name}</b><small>{item.candidate.email}</small></span></span><span className="match"><i className={`score-ring ${scoreClass(item.screening.final_score)}`} style={{"--score": `${item.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(item.screening.final_score)}</i><span><b>{item.screening.recommendation}</b><small>{item.screening.final_score}% match</small></span></span><span><i className={`status ${statusTone(item.status)}`}>{statusLabel(item.status)}</i></span><span className="row-arrow"><Icon name="arrow"/></span></button>)}
+              {filtered.map((item, index) => <div className="candidate-row" key={item.id}>
+                <button className="candidate-open" onClick={() => setSelected(item)}>
+                  <span className="person"><i className={`avatar ${["violet","blue","orange"][index%3]}`}>{initials(item.candidate.name)}</i><span><b>{item.candidate.name}</b><small>{item.candidate.email}</small></span></span>
+                  <span className="match"><i className={`score-ring ${scoreClass(item.screening.final_score)}`} style={{"--score": `${item.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(item.screening.final_score)}</i><span><b>{item.screening.recommendation}</b><small>{item.screening.final_score}% match</small></span></span>
+                  <span><i className={`status ${statusTone(item.status)}`}>{statusLabel(item.status)}</i></span>
+                </button>
+                <button className="why-button" disabled={!item.screening.evidence?.length}
+                        title={item.screening.evidence?.length ? "Xem vì sao ứng viên được điểm này" : "Chưa có kết quả chấm điểm"}
+                        onClick={() => setExplained(item)}><Icon name="spark"/>Vì sao?</button>
+              </div>)}
               {!filtered.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp.</div>}
             </div>
           </section>
@@ -412,6 +428,9 @@ function RecruiterApp() {
       </div>
     </main>
 
+    {explained && <ScoreExplainer application={explained} job={dashboard.jobs.find(item => item.id === explained.job_id)}
+                                  onClose={() => setExplained(null)}
+                                  onOpenProfile={() => { setSelected(explained); setExplained(null); }}/>}
     {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
@@ -451,6 +470,203 @@ function PublicScheduling({ token }: { token: string }) {
     : !data ? <InlineProgress label="Đang kiểm tra lịch trống"/>
     : <><span className="eyebrow">{data.mode === "reschedule" ? "ĐỔI LỊCH TRONG POLICY" : "CHỌN LỊCH PHỎNG VẤN"}</span><h1>Chào {data.candidate_name}</h1><p>{data.mode === "reschedule" && data.interview ? <>Lịch hiện tại: <b>{dateLabel(data.interview.start_at)}</b>. </> : null}Chọn một khung giờ cho vị trí <b>{data.job_title}</b>. Thời lượng {data.duration_minutes} phút; giờ hiển thị theo thiết bị của bạn.</p><div className="slots public-slots">{data.slots.map(slot => <button key={slot.start_at} disabled={Boolean(busy)} onClick={() => void choose(slot.start_at)}>{busy === slot.start_at ? "Đang giữ lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div>{!data.slots.length && <div className="empty-state">Hiện chưa có lịch phù hợp. Vui lòng liên hệ recruiter.</div>}</>}
   </section></main>;
+}
+
+type Resume = {
+  application_id: string; filename: string | null; size: number | null; checksum: string | null;
+  text: string; file_available: boolean; file_type: string;
+};
+
+function ResumeViewer({ resume, candidateName, onClose }: {
+  resume: Resume; candidateName: string; onClose: () => void;
+}) {
+  const [showText, setShowText] = useState(false);
+  const fileUrl = `${API_URL}/api/applications/${resume.application_id}/resume-file`;
+  const canEmbed = resume.file_available && resume.file_type === "pdf";
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [onClose]);
+
+  const words = resume.text.trim() ? resume.text.trim().split(/\s+/).length : 0;
+  return <div className="modal-layer resume-layer" onMouseDown={onClose}>
+    <div className="resume-window" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label={`CV của ${candidateName}`}>
+      <header>
+        <div>
+          <span className="eyebrow">CV ỨNG VIÊN</span>
+          <h2>{candidateName}</h2>
+          <p>{resume.filename || "Nộp trực tiếp dạng văn bản"}
+            {resume.size ? ` · ${(resume.size / 1024).toFixed(0)} KB` : ""} · {words} từ</p>
+        </div>
+        <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+      </header>
+      {canEmbed && !showText
+        ? <iframe className="resume-frame" src={fileUrl} title={`CV của ${candidateName}`}/>
+        : <div className="resume-sheet"><pre>{resume.text}</pre></div>}
+      <footer>
+        {resume.file_available
+          ? <>
+              <a className="resume-action" href={fileUrl} target="_blank" rel="noreferrer">
+                {resume.file_type === "pdf" ? "Mở file gốc ở tab mới" : `Tải file gốc (.${resume.file_type})`}
+              </a>
+              {canEmbed && <button className="resume-action ghost" onClick={() => setShowText(value => !value)}>
+                {showText ? "Xem lại bản gốc" : "Xem dạng văn bản"}
+              </button>}
+              {!canEmbed && <span className="resume-note">
+                Trình duyệt không mở được .{resume.file_type} — đang hiển thị nội dung đã trích xuất, tải file về để xem đúng định dạng
+              </span>}
+            </>
+          : <span className="resume-note">Hồ sơ này nộp trước khi hệ thống lưu file gốc, chỉ còn nội dung đã trích xuất</span>}
+      </footer>
+    </div>
+  </div>;
+}
+
+const SCORE_REASONS: Record<string, string> = {
+  LOW_CONFIDENCE: "Độ tin cậy thấp — bằng chứng trong CV chưa đủ rõ",
+  BORDERLINE_SCORE: "Điểm nằm sát ngưỡng quyết định",
+  SCORE_EVIDENCE_MISMATCH: "Điểm cao nhưng thiếu bằng chứng cho kỹ năng bắt buộc",
+};
+
+function ScoreExplainer({ application, job, onClose, onOpenProfile }: {
+  application: Application; job?: Job; onClose: () => void; onOpenProfile: () => void;
+}) {
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [onClose]);
+
+  const [resume, setResume] = useState<Resume | null>(null);
+  const [loadingResume, setLoadingResume] = useState(false);
+  const [resumeError, setResumeError] = useState("");
+
+  const screening = application.screening;
+  const evidence = screening.evidence || [];
+  const matched = evidence.filter(item => item.matched);
+  const missing = evidence.filter(item => !item.matched);
+  const reasons = screening.routing?.reasons || [];
+  const requiredSkills = job?.requirements?.required_skills || [];
+  const preferredSkills = job?.requirements?.preferred_skills || [];
+  const requiredCount = requiredSkills.length;
+  const minimumExperience = job?.requirements?.minimum_experience || 0;
+
+  const openResume = async () => {
+    setLoadingResume(true); setResumeError("");
+    try { setResume(await request<Resume>(`/api/applications/${application.id}/resume`)); }
+    catch (err) { setResumeError(err instanceof Error ? err.message : "Không đọc được nội dung CV"); }
+    finally { setLoadingResume(false); }
+  };
+
+  // One row per company requirement so the two sides line up, instead of two separate lists.
+  const checklist = [
+    ...evidence.map(item => ({
+      label: item.requirement,
+      kind: preferredSkills.includes(item.requirement) ? "Ưu tiên" : requiredSkills.includes(item.requirement) ? "Bắt buộc" : "Tiêu chí",
+      met: item.matched,
+      proof: item.matched ? item.evidence : "Không tìm thấy bằng chứng trong CV",
+    })),
+    ...(minimumExperience > 0 ? [{
+      label: `Kinh nghiệm từ ${minimumExperience} năm`,
+      kind: "Bắt buộc",
+      met: screening.experience_years >= minimumExperience,
+      proof: screening.experience_years >= minimumExperience
+        ? `CV thể hiện ${screening.experience_years} năm kinh nghiệm`
+        : `CV chỉ thể hiện ${screening.experience_years} năm`,
+    }] : []),
+  ];
+
+  // The backend blends these four parts with fixed weights; showing the weighted points
+  // makes the final number traceable instead of a black box.
+  const parts = [
+    { label: "Kỹ năng bắt buộc", weight: 40, score: screening.rule_score, tone: "rule" },
+    { label: "Kinh nghiệm", weight: 25, score: screening.experience_score, tone: "experience" },
+    { label: "Tương đồng nội dung", weight: 20, score: screening.semantic_score, tone: "semantic" },
+    { label: "Kỹ năng ưu tiên", weight: 15, score: screening.preferred_score, tone: "preferred" },
+  ].filter(part => typeof part.score === "number") as { label: string; weight: number; score: number; tone: string }[];
+
+  const verdict = missing.length === 0
+    ? `Khớp toàn bộ ${matched.length} tiêu chí được kiểm tra.`
+    : matched.length === 0
+      ? `Không khớp tiêu chí nào trong ${evidence.length} tiêu chí được kiểm tra.`
+      : `Khớp ${matched.length}/${evidence.length} tiêu chí, còn thiếu ${missing.map(item => item.requirement).join(", ")}.`;
+
+  return <div className="modal-layer" onMouseDown={onClose}>
+    <div className="modal why-modal" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label="Giải thích điểm">
+      <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+
+      <div className="why-head">
+        <i className={`score-ring large ${application.screening.final_score >= 80 ? "score-high" : application.screening.final_score >= 65 ? "score-mid" : "score-low"}`}
+           style={{"--score": `${screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(screening.final_score)}</i>
+        <div>
+          <span className="eyebrow">VÌ SAO ĐIỂM NÀY</span>
+          <h2>{application.candidate.name}</h2>
+          <p>{job?.title || "Vị trí tuyển dụng"} · <b>{screening.recommendation}</b>
+            {typeof screening.confidence === "number" && <> · độ tin cậy {Math.round(screening.confidence * 100)}%</>}</p>
+        </div>
+      </div>
+
+      <p className="why-verdict">{verdict}</p>
+
+      {reasons.length > 0 && <div className="why-flags">
+        {reasons.map(reason => <span key={reason}>{SCORE_REASONS[reason] || reason}</span>)}
+      </div>}
+
+      <h3 className="why-section">Đối chiếu từng tiêu chí</h3>
+      <div className="match-table">
+        <div className="match-head">
+          <span>Công ty yêu cầu</span>
+          <span>Ứng viên đáp ứng</span>
+        </div>
+        {checklist.map(row => <div className={row.met ? "match-row met" : "match-row unmet"} key={row.label}>
+          <span className="match-left">
+            <i className="match-mark" aria-hidden="true">{row.met ? "✓" : "✕"}</i>
+            <span><b>{row.label}</b><em>{row.kind}</em></span>
+          </span>
+          <span className="match-right">{row.met
+            ? <q>{row.proof}</q>
+            : <span className="match-none">{row.proof}</span>}</span>
+        </div>)}
+      </div>
+
+      <button className="why-resume-toggle" disabled={loadingResume} onClick={() => void openResume()}>
+        <Icon name="upload"/>{loadingResume ? "Đang mở CV..." : "Mở CV của ứng viên"}
+      </button>
+      {resumeError && <p className="why-note warn">{resumeError}</p>}
+      {resume && <ResumeViewer resume={resume} candidateName={application.candidate.name}
+                               onClose={() => setResume(null)}/>}
+
+      <h3 className="why-section">Điểm này được cộng từ đâu</h3>
+      <div className="why-parts">
+        {parts.map(part => {
+          const contribution = Math.round(part.score * part.weight) / 100;
+          return <div className="why-part" key={part.label}>
+            <div className="why-part-head">
+              <b>{part.label}</b>
+              <span className="why-weight">chiếm {part.weight}%</span>
+              <span className="why-points">+{contribution.toFixed(1)} điểm</span>
+            </div>
+            <div className="why-bar"><i className={part.tone} style={{ width: `${Math.max(1, part.score)}%` }}/></div>
+            <small>Đạt {Math.round(part.score)}/100 ở phần này</small>
+          </div>;
+        })}
+      </div>
+      {typeof screening.raw_score === "number" && Math.abs(screening.raw_score - screening.final_score) >= 0.1 &&
+        <p className="why-note">Điểm thô {screening.raw_score} đã được hiệu chỉnh xuống {screening.final_score} theo bộ dữ liệu đối chiếu.</p>}
+      {screening.screening_source === "rules" &&
+        <p className="why-note">Kết quả do bộ quy tắc so khớp từ khoá tạo ra (chưa bật AI), nên chỉ nhận diện được kỹ năng viết đúng từ khoá.</p>}
+
+      {requiredCount === 0 && <p className="why-note warn">
+        Vị trí này chưa có kỹ năng bắt buộc nào, nên điểm gần như giống nhau cho mọi CV. Hãy bổ sung tiêu chí ở mục “Kiểm tra tiêu chí” rồi chấm lại.
+      </p>}
+
+      <div className="why-actions">
+        <button className="secondary compact" onClick={onClose}>Đóng</button>
+        <button className="primary compact" onClick={onOpenProfile}>Xem hồ sơ đầy đủ<Icon name="arrow"/></button>
+      </div>
+    </div>
+  </div>;
 }
 
 function GlobalActionStatus({ label }: { label: string }) {
