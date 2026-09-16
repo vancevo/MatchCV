@@ -440,7 +440,14 @@ def approval_dict(value: ApprovalRequest) -> dict:
             "application_id": value.application_id, "resource_id": value.resource_id, "title": value.title,
             "summary": value.summary, "payload": value.payload, "resolution": value.resolution,
             "requested_by_id": value.requested_by_id, "requested_by_email": value.requested_by_email,
+            "decided_at": value.decided_at.isoformat() if value.decided_at else None,
             "created_at": value.created_at.isoformat() if value.created_at else None}
+
+
+def decided_by(actor: dict[str, str] | None) -> dict[str, str | None]:
+    """Who closed an approval, stored inside the existing resolution payload."""
+    return {"decided_by_id": (actor or {}).get("id") or None,
+            "decided_by_email": (actor or {}).get("email") or None}
 
 
 def application_dict(item: Application) -> dict:
@@ -1370,7 +1377,7 @@ async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str
         ))
         if request:
             request.status = criteria.status
-            request.resolution = {"note": payload.note}
+            request.resolution = {"note": payload.note, **decided_by(actor)}
             request.decided_at = utcnow()
         if payload.approved:
             task_ids = _queue_rescreens(db, job, criteria, owner_id)
@@ -1510,7 +1517,7 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
             ))
             if request:
                 request.status = "APPROVED"
-                request.resolution = {"note": payload.note, "application_ids": payload.application_ids}
+                request.resolution = {"note": payload.note, "application_ids": payload.application_ids, **decided_by(actor)}
                 request.decided_at = utcnow()
         ranked = sorted([item for item in apps if item.id in selected], key=lambda a: a.screening.get("final_score", 0), reverse=True)
         invitation_payload = SchedulingInvitationCreate()
@@ -1541,13 +1548,16 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
 def approval_inbox(
     status: str = Query("PENDING", max_length=32),
     request_type: str | None = Query(None, max_length=40),
+    job_id: str | None = None,
     limit: int = Query(100, ge=1, le=200),
     owner_id: str = Depends(current_tenant_id),
 ) -> list[dict]:
     with session_scope() as db:
-        statement = select(ApprovalRequest).where(
-            ApprovalRequest.owner_id == owner_id, ApprovalRequest.status == status.upper()
-        )
+        statement = select(ApprovalRequest).where(ApprovalRequest.owner_id == owner_id)
+        if status.upper() != "ALL":
+            statement = statement.where(ApprovalRequest.status == status.upper())
+        if job_id:
+            statement = statement.where(ApprovalRequest.job_id == job_id)
         if request_type:
             statement = statement.where(ApprovalRequest.request_type == request_type.upper())
         values = db.scalars(statement.order_by(ApprovalRequest.created_at.desc()).limit(limit))
@@ -1573,7 +1583,7 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
         if request.status != "PENDING":
             raise HTTPException(409, "Approval request is already resolved")
         request.status = "APPROVED" if decision == "APPROVE" else "REJECTED"
-        request.resolution = {"note": payload.note, "application_ids": payload.application_ids or []}
+        request.resolution = {"note": payload.note, "application_ids": payload.application_ids or [], **decided_by(actor)}
         request.decided_at = utcnow()
         if request.request_type == "CRITERIA":
             criteria = db.scalar(select(CriteriaVersion).where(

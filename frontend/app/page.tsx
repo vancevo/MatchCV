@@ -48,6 +48,7 @@ type Approval = {
   id: string; type: "CRITERIA" | "EVIDENCE" | "SHORTLIST" | "ESCALATION"; status: string; job_id?: string; application_id?: string;
   resource_id: string; title: string; summary: string; payload: Record<string, unknown>; created_at: string;
   requested_by_id?: string | null; requested_by_email?: string | null;
+  decided_at?: string | null; resolution?: Record<string, unknown>;
 };
 type MailSandbox = {
   enabled: boolean; base_email: string; max_alias: number; sample_aliases: string[]; delivery_note: string;
@@ -483,7 +484,7 @@ function RecruiterApp() {
             <article className="metric" key={m.label}><div className={`metric-icon ${m.tone}`}><Icon name={m.icon}/></div><div><p>{m.label}</p><strong>{loading ? "—" : m.value}</strong><span className={`delta ${m.tone}`}>Live</span></div></article>)}
         </section>}
 
-        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
+        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
@@ -567,8 +568,9 @@ function DashboardSkeleton() {
   </section>;
 }
 
-function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
+function JobsView({ jobs, applications, actionBusy, pendingAction, onCreate, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
   jobs: Job[];
+  applications: Application[];
   actionBusy: boolean;
   pendingAction: PendingAction | null;
   onCreate: () => void;
@@ -577,13 +579,165 @@ function JobsView({ jobs, actionBusy, pendingAction, onCreate, onDelete, onRevie
   onApproveShortlist: (jobId: string) => Promise<void>;
   onExportReport: (job: Job) => Promise<void>;
 }) {
-  return <section className="panel jobs-view"><div className="panel-head"><div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div><button disabled={actionBusy} onClick={onCreate}><Icon name="plus"/>Tạo mới</button></div>{jobs.map(job => {
-    const required = job.requirements?.required_skills || [];
-    const preferred = job.requirements?.preferred_skills || [];
-    const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
-    const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
-    return <article className="job-row job-row-detailed" key={job.id}><div className="metric-icon purple"><Icon name="briefcase"/></div><div><h3>{job.title}</h3><p>{job.department} · {job.location}</p><div className="job-requirements">{required.map(item => <span key={item}>{item}</span>)}{preferred.map(item => <span className="soft" key={item}>{item}</span>)}{Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}</div></div><span>{job.applications_count} ứng viên</span><i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i><div className="job-actions"><button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => onReviewCriteria(job)}>{pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Kiểm tra tiêu chí"}</button><button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>{pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}</button><button className="secondary compact" disabled={actionBusy || !job.applications_count} onClick={() => void onExportReport(job)}>{pendingAction?.key === `export-${job.id}` ? "Đang xuất..." : "Xuất report"}</button><button className="danger-link" disabled={actionBusy} onClick={() => void onDelete(job.id)}>{pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}</button></div></article>;
-  })}</section>;
+  return <section className="panel jobs-view">
+    <div className="panel-head">
+      <div><h2>Việc làm đang tuyển</h2><p>{jobs.length} vị trí từ API</p></div>
+      <button disabled={actionBusy} onClick={onCreate}><Icon name="plus"/>Tạo mới</button>
+    </div>
+    {jobs.map(job => <JobRow key={job.id} job={job} applications={applications} actionBusy={actionBusy}
+                             pendingAction={pendingAction} onDelete={onDelete} onReviewCriteria={onReviewCriteria}
+                             onApproveShortlist={onApproveShortlist} onExportReport={onExportReport}/>)}
+  </section>;
+}
+
+function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
+  job: Job;
+  applications: Application[];
+  actionBusy: boolean;
+  pendingAction: PendingAction | null;
+  onDelete: (jobId: string) => Promise<void>;
+  onReviewCriteria: (job: Job) => void;
+  onApproveShortlist: (jobId: string) => Promise<void>;
+  onExportReport: (job: Job) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const required = job.requirements?.required_skills || [];
+  const preferred = job.requirements?.preferred_skills || [];
+  const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
+  const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
+
+  return <article className={open ? "job-row job-row-detailed job-row-open" : "job-row job-row-detailed"}>
+    <div className="metric-icon purple"><Icon name="briefcase"/></div>
+    <div>
+      <h3>{job.title}</h3>
+      <p>{job.department} · {job.location}</p>
+      <div className="job-requirements">
+        {required.map(item => <span key={item}>{item}</span>)}
+        {preferred.map(item => <span className="soft" key={item}>{item}</span>)}
+        {Boolean(job.requirements?.minimum_experience) && <span>{job.requirements?.minimum_experience}+ năm</span>}
+      </div>
+    </div>
+    <span>{job.applications_count} ứng viên</span>
+    <i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i>
+    <div className="job-actions">
+      <button className="secondary compact" onClick={() => setOpen(value => !value)} aria-expanded={open}>
+        {open ? "Ẩn chi tiết" : "Xem chi tiết"}
+      </button>
+      <button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => onReviewCriteria(job)}>
+        {pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Kiểm tra tiêu chí"}
+      </button>
+      <button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>
+        {pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}
+      </button>
+      <button className="secondary compact" disabled={actionBusy || !job.applications_count} onClick={() => void onExportReport(job)}>
+        {pendingAction?.key === `export-${job.id}` ? "Đang xuất..." : "Xuất report"}
+      </button>
+      <button className="danger-link" disabled={actionBusy} onClick={() => void onDelete(job.id)}>
+        {pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}
+      </button>
+    </div>
+    {open && <JobDetail job={job} applications={applications}/>}
+  </article>;
+}
+
+function JobDetail({ job, applications }: { job: Job; applications: Application[] }) {
+  type CriteriaVersion = {
+    id: string; version: number; status: string; change_note: string;
+    criteria: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number };
+    approved_at: string | null; created_at: string;
+  };
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [versions, setVersions] = useState<CriteriaVersion[]>([]);
+  const [history, setHistory] = useState<AuditLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void Promise.all([
+      request<Approval[]>(`/api/approvals?status=ALL&job_id=${job.id}`),
+      request<CriteriaVersion[]>(`/api/jobs/${job.id}/criteria-versions`),
+      request<AuditLog[]>(`/api/audit-logs?limit=50&job_id=${job.id}`),
+    ])
+      .then(([nextApprovals, nextVersions, nextHistory]) => {
+        setApprovals(nextApprovals); setVersions(nextVersions); setHistory(nextHistory);
+      })
+      .catch(err => setError(err instanceof Error ? err.message : "Không tải được chi tiết"))
+      .finally(() => setLoading(false));
+  }, [job.id]);
+
+  const mine = applications.filter(item => item.job_id === job.id);
+  const scores = mine.map(item => item.screening.final_score).filter(value => value > 0);
+  const average = scores.length ? Math.round(scores.reduce((sum, value) => sum + value, 0) / scores.length) : 0;
+  const byStatus = mine.reduce<Record<string, number>>((acc, item) => {
+    acc[item.status] = (acc[item.status] || 0) + 1; return acc;
+  }, {});
+  const criteriaApproval = approvals.find(item => item.type === "CRITERIA");
+  const person = (id?: string | null, email?: string | null) =>
+    email?.trim() || (id === LOCAL_ACTOR_ID ? LOCAL_ACTOR_NAME : id) || "Hệ thống tự đề xuất";
+
+  return <div className="job-detail">
+    {error && <div className="error-banner"><b>Không tải được chi tiết.</b> {error}</div>}
+
+    <div className="job-detail-grid">
+      <section className="job-detail-block">
+        <h4>Mô tả công việc</h4>
+        <p className="job-description">{job.description || "Chưa có mô tả."}</p>
+      </section>
+
+      <section className="job-detail-block">
+        <h4>Truy vết phê duyệt tiêu chí</h4>
+        {loading ? <small>Đang tải...</small> : criteriaApproval ? <dl className="job-trace">
+          <div><dt>Người đề xuất</dt><dd>{person(criteriaApproval.requested_by_id, criteriaApproval.requested_by_email)}</dd></div>
+          <div><dt>Thời gian đề xuất</dt><dd>{fullDateLabel(criteriaApproval.created_at)}</dd></div>
+          <div><dt>Người duyệt</dt><dd>{criteriaApproval.decided_at
+            ? person(criteriaApproval.resolution?.decided_by_id as string, criteriaApproval.resolution?.decided_by_email as string)
+            : <em>Chưa ai duyệt</em>}</dd></div>
+          <div><dt>Thời gian duyệt</dt><dd>{criteriaApproval.decided_at ? fullDateLabel(criteriaApproval.decided_at) : <em>—</em>}</dd></div>
+          {typeof criteriaApproval.resolution?.note === "string" && criteriaApproval.resolution.note &&
+            <div><dt>Ghi chú khi duyệt</dt><dd>“{criteriaApproval.resolution.note as string}”</dd></div>}
+        </dl> : <small>Chưa có yêu cầu phê duyệt nào cho vị trí này.</small>}
+      </section>
+
+      <section className="job-detail-block">
+        <h4>Tình hình ứng viên</h4>
+        <div className="job-stats">
+          <span><b>{mine.length}</b>hồ sơ</span>
+          <span><b>{scores.length ? Math.max(...scores) : 0}</b>điểm cao nhất</span>
+          <span><b>{average}</b>điểm trung bình</span>
+        </div>
+        <div className="job-status-split">
+          {Object.entries(byStatus).length
+            ? Object.entries(byStatus).map(([status, count]) =>
+                <i className={`status ${statusTone(status)}`} key={status}>{statusLabel(status)}: {count}</i>)
+            : <small>Chưa có CV nào được nộp.</small>}
+        </div>
+      </section>
+
+      <section className="job-detail-block">
+        <h4>Các phiên bản tiêu chí</h4>
+        {loading ? <small>Đang tải...</small> : versions.length ? <ol className="job-versions">
+          {versions.map(version => <li key={version.id}>
+            <b>v{version.version}</b>
+            <i className={`status ${version.status === "APPROVED" ? "interview" : "review"}`}>{version.status === "APPROVED" ? "Đã duyệt" : "Chờ duyệt"}</i>
+            <span>{(version.criteria.required_skills || []).join(", ") || "không có kỹ năng nào"}</span>
+            {version.change_note && <em>{version.change_note}</em>}
+            <time dateTime={version.created_at}>{fullDateLabel(version.created_at)}</time>
+          </li>)}
+        </ol> : <small>Chưa có phiên bản nào.</small>}
+      </section>
+    </div>
+
+    <section className="job-detail-block wide">
+      <h4>Lịch sử thao tác của vị trí này</h4>
+      {loading ? <small>Đang tải...</small> : history.length ? <ol className="approval-history">
+        {history.map(entry => <li key={entry.id}>
+          <b>{auditLabel(entry.action)}</b>
+          <span>{actorLabel(entry) || "Hệ thống tự động"}</span>
+          <time dateTime={entry.created_at}>{fullDateLabel(entry.created_at)}</time>
+        </li>)}
+      </ol> : <small>Chưa có thao tác nào được ghi nhận cho vị trí này.</small>}
+    </section>
+  </div>;
 }
 
 function CriteriaModal({ job, busy, onClose, onSubmit }: {
