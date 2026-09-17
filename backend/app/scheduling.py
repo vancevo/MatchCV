@@ -466,8 +466,13 @@ def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, day
     duration = timedelta(minutes=duration_minutes)
     while cursor + duration <= end and len(slots) < 120:
         local = cursor.astimezone(local_zone)
+        local_end = (cursor + duration).astimezone(local_zone)
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        working_start = day_start + timedelta(hours=open_hour)
+        working_end = day_start + timedelta(hours=close_hour)
         if (local.weekday() in working_days
-                and open_hour <= local.hour < close_hour
+                and working_start <= local
+                and local_end <= working_end
                 and not any(cursor < b_end and cursor + duration > b_start for b_start, b_end in busy)):
             slots.append(cursor)
         cursor += timedelta(hours=1)
