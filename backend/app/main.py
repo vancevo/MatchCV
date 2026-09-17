@@ -3,6 +3,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
+import re
+from pathlib import Path
 import secrets
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -12,8 +15,8 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sql_delete, func, or_, select, update as sql_update
 from sqlalchemy.exc import IntegrityError
 
@@ -26,13 +29,13 @@ from .agentic import (
     record_screening_artifact,
     utcnow,
 )
-from .auth import current_tenant_id, current_user_id, require_tenant_role
+from .auth import current_actor, current_tenant_id, current_user_id, require_tenant_role
 from .config import get_settings
 from .database import SessionLocal, session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
 from .master_seed import create_master_user, has_master_seed_config
 from .models import (
-    AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem,
+    AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
     InterviewPolicy, InterviewScorecard, Job, OutboxEvent, ProviderWebhookEvent,
     SchedulingInvitation, ScreeningArtifact, ShortlistProposal, SourceConnector, SourceIngestion, Tenant,
@@ -40,7 +43,15 @@ from .models import (
     ReleaseGate, UploadBatch,
 )
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
-from .resume import candidate_identity, checksum, extract_resume
+from .resume import (
+    CONTENT_TYPES,
+    candidate_identity,
+    checksum,
+    delete_resume_file,
+    extract_resume,
+    store_resume_file,
+    stored_resume_path,
+)
 from .statuses import (
     ApplicationStatus,
     BatchItemStatus,
@@ -56,7 +67,9 @@ from .worker import mark_enqueue_failed
 from .workflow import screening_pipeline
 from .scheduling import (
     add_outbox, authorization_url, available_slots_for_owner, decode_oauth_state,
-    dispatch_outbox, exchange_code, mail_sandbox_alias, render_template, save_connection,
+    allow_sandbox_recipient, dispatch_outbox, exchange_code, local_datetime_label,
+    mail_sandbox_alias, render_template, sandbox_allowlist, sandbox_allowlist_entries,
+    save_connection,
 )
 from .interview_ops import escalation, get_policy, run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback
 from .governance import (
@@ -84,8 +97,31 @@ async def lifespan(_: FastAPI):
     yield
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 app = FastAPI(title="TalentFlow AI API", version="0.11.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def json_error_envelope(request: Request, call_next):
+    """Turn an unhandled crash into JSON so the browser can actually read the failure.
+
+    Starlette's own handler answers with a bare text/plain 500 carrying no CORS headers, so the
+    browser blocks it and the caller sees only "Failed to fetch" - no status, no message. Added
+    before CORSMiddleware because add_middleware prepends: whatever is registered last ends up
+    outermost, and this response has to travel back out through CORS to be given its headers.
+    """
+    try:
+        return await call_next(request)
+    except Exception as error:  # noqa: BLE001 - deliberately the catch-all boundary
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Hệ thống gặp lỗi không mong muốn, vui lòng thử lại sau.",
+                     "error": {"code": "INTERNAL_ERROR", "message": type(error).__name__}},
+        )
+
+
 app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -122,6 +158,10 @@ class JobCreate(BaseModel):
     description: str = Field(min_length=10)
     department: str = "Engineering"
     location: str = "Remote"
+
+
+class JobUpdate(BaseModel):
+    description: str = Field(min_length=10, max_length=20000)
 
 
 class ApplicationCreate(BaseModel):
@@ -228,6 +268,10 @@ class InterviewPolicyUpdate(BaseModel):
     reminder_minutes: list[int] = Field(default_factory=lambda: [1440, 60], min_length=1, max_length=5)
     max_reschedules: int = Field(default=2, ge=0, le=10)
     feedback_due_hours: int = Field(default=24, ge=1, le=168)
+    timezone_name: str = Field(default="Asia/Ho_Chi_Minh", max_length=80)
+    working_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4], max_length=7)
+    working_start_hour: int = Field(default=9, ge=0, le=23)
+    working_end_hour: int = Field(default=17, ge=1, le=24)
 
     @field_validator("reminder_minutes")
     @classmethod
@@ -235,6 +279,40 @@ class InterviewPolicyUpdate(BaseModel):
         if any(minutes < 15 or minutes > 10080 for minutes in value):
             raise ValueError("reminder_minutes must be between 15 and 10080")
         return sorted(set(value), reverse=True)
+
+    @field_validator("working_days")
+    @classmethod
+    def valid_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("working_days must contain weekday numbers 0-6")
+        return sorted(set(value))
+
+    @field_validator("timezone_name")
+    @classmethod
+    def valid_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+    @model_validator(mode="after")
+    def hours_in_order(self) -> "InterviewPolicyUpdate":
+        if self.working_end_hour <= self.working_start_hour:
+            raise ValueError("working_end_hour must be after working_start_hour")
+        return self
+
+
+class BusyBlockCreate(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    note: str = Field(default="", max_length=240)
+
+    @model_validator(mode="after")
+    def valid_range(self) -> "BusyBlockCreate":
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be after start_at")
+        return self
 
 
 class ScorecardAnswer(BaseModel):
@@ -301,6 +379,18 @@ class MailSandboxUpdate(BaseModel):
         if not separator or not local or not domain or "+" in local or " " in normalized:
             raise ValueError("base_email must be a valid address without a plus alias")
         return normalized
+
+
+class MailSandboxRecipient(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def _is_an_address(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", cleaned):
+            raise ValueError("email không hợp lệ")
+        return cleaned
 
 
 class MailSandboxTest(BaseModel):
@@ -416,8 +506,11 @@ def pipeline(review_status: str = "waiting") -> list[dict]:
     return screening_pipeline(completed_through)
 
 
-def audit(db, owner_id: str, application_id: str | None, action: str, metadata: dict | None = None) -> None:
-    db.add(AuditLog(owner_id=owner_id, application_id=application_id, action=action, metadata_json=metadata or {}))
+def audit(db, owner_id: str, application_id: str | None, action: str, metadata: dict | None = None,
+          actor: dict[str, str] | None = None) -> None:
+    """Pass `actor` for decisions a person made; leave it out so system events stay attributed to no one."""
+    db.add(AuditLog(owner_id=owner_id, application_id=application_id, action=action, metadata_json=metadata or {},
+                    actor_id=(actor or {}).get("id") or None, actor_email=(actor or {}).get("email") or None))
 
 
 def job_dict(job: Job, count: int = 0) -> dict:
@@ -436,7 +529,15 @@ def approval_dict(value: ApprovalRequest) -> dict:
     return {"id": value.id, "type": value.request_type, "status": value.status, "job_id": value.job_id,
             "application_id": value.application_id, "resource_id": value.resource_id, "title": value.title,
             "summary": value.summary, "payload": value.payload, "resolution": value.resolution,
+            "requested_by_id": value.requested_by_id, "requested_by_email": value.requested_by_email,
+            "decided_at": value.decided_at.isoformat() if value.decided_at else None,
             "created_at": value.created_at.isoformat() if value.created_at else None}
+
+
+def decided_by(actor: dict[str, str] | None) -> dict[str, str | None]:
+    """Who closed an approval, stored inside the existing resolution payload."""
+    return {"decided_by_id": (actor or {}).get("id") or None,
+            "decided_by_email": (actor or {}).get("email") or None}
 
 
 def application_dict(item: Application) -> dict:
@@ -451,7 +552,12 @@ def application_dict(item: Application) -> dict:
     return {"id": item.id, "job_id": item.job_id, "batch_id": item.batch_id,
             "candidate": {"name": item.candidate_name, "email": item.candidate_email}, "status": item.status,
             "resume_filename": item.resume_filename, "resume_size": item.resume_size,
-            "screening": screening, "pipeline": item.pipeline, "review": item.review}
+            "screening": screening, "pipeline": item.pipeline, "review": item.review,
+            "status_changed_at": utc_iso(item.status_changed_at) if item.status_changed_at else None,
+            "status_changed_by": item.status_changed_by or "",
+            "deleted_at": utc_iso(item.deleted_at) if item.deleted_at else None,
+            "deleted_by": item.deleted_by or "",
+            "created_at": utc_iso(item.created_at) if item.created_at else None}
 
 
 def batch_dict(db, batch: UploadBatch) -> dict:
@@ -528,11 +634,13 @@ def shortlist_report(job: Job, applications: list[Application]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def interview_dict(item: Interview) -> dict:
-    def utc_iso(value: datetime) -> str:
-        normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
-        return normalized.isoformat().replace("+00:00", "Z")
+def utc_iso(value: datetime) -> str:
+    """SQLite returns naive datetimes; without the marker a browser reads them as local time."""
+    normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
+    return normalized.isoformat().replace("+00:00", "Z")
 
+
+def interview_dict(item: Interview) -> dict:
     return {"id": item.id, "application_id": item.application_id, "start_at": utc_iso(item.start_at),
             "end_at": utc_iso(item.end_at), "status": item.status, "meeting_url": item.meeting_url,
             "provider": item.provider, "external_event_id": item.external_event_id,
@@ -627,6 +735,7 @@ def _policy_dict(policy: TenantPolicy, usage: TenantUsage) -> dict:
 
 
 def _erase_application(db, item: Application, reason: str) -> None:
+    delete_resume_file(item.id, item.resume_filename)
     interview_ids = list(db.scalars(select(Interview.id).where(Interview.application_id == item.id)))
     run_ids = list(db.scalars(select(AgentRun.id).where(AgentRun.application_id == item.id)))
     for ingestion in db.scalars(select(SourceIngestion).where(SourceIngestion.application_id == item.id)):
@@ -740,6 +849,8 @@ def _mail_sandbox_dict(policy: TenantPolicy) -> dict:
         "enabled": policy.mail_sandbox_enabled,
         "base_email": policy.mail_sandbox_base_email,
         "max_alias": policy.mail_sandbox_max_alias,
+        "allowed_emails": sandbox_allowlist(policy),
+        "allowed_entries": sandbox_allowlist_entries(policy),
         "sample_aliases": aliases,
         "delivery_note": "Gmail delivers plus aliases to the base inbox while TalentFlow keeps the alias unchanged.",
     }
@@ -764,6 +875,33 @@ def update_mail_sandbox(
         audit(db, owner_id, None, "MAIL_SANDBOX_UPDATED", {
             "enabled": payload.enabled, "base_email": payload.base_email, "max_alias": payload.max_alias,
         })
+        return _mail_sandbox_dict(policy)
+
+
+@app.post("/api/mail-sandbox/allowed-emails")
+def add_mail_sandbox_recipient(
+    payload: MailSandboxRecipient,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        policy = policy_for(db, owner_id)
+        if allow_sandbox_recipient(policy, payload.email):
+            audit(db, owner_id, None, "MAIL_SANDBOX_RECIPIENT_ALLOWED", {"email": payload.email})
+        return _mail_sandbox_dict(policy)
+
+
+@app.delete("/api/mail-sandbox/allowed-emails/{email}")
+def remove_mail_sandbox_recipient(
+    email: str,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        policy = policy_for(db, owner_id)
+        target = email.strip().lower()
+        remaining = [entry for entry in sandbox_allowlist_entries(policy) if entry["email"] != target]
+        if len(remaining) != len(sandbox_allowlist_entries(policy)):
+            policy.mail_sandbox_allowed_emails = remaining
+            audit(db, owner_id, None, "MAIL_SANDBOX_RECIPIENT_REMOVED", {"email": target})
         return _mail_sandbox_dict(policy)
 
 
@@ -1274,27 +1412,32 @@ def list_applications(
 
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id)) -> dict:
+async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id),
+                     actor: dict[str, str] = Depends(current_actor)) -> dict:
     requirements = await extract_requirements_ai(payload.description)
-    requirements = {**requirements, "approval": {"status": "PENDING", "note": ""},
+    requirements = {**requirements, "approval": {"status": "PENDING", "note": "", "version": 1},
                     "shortlist_trigger": {"enabled": True, "min_completed": 2, "top_n": 5, "min_score": 65}}
     with session_scope() as db:
         job = Job(owner_id=owner_id, **payload.model_dump(), requirements=requirements)
         db.add(job); db.flush()
-        create_criteria_version(db, job, owner_id, requirements, "Extracted from job description")
+        create_criteria_version(db, job, owner_id, requirements, "Extracted from job description", actor=actor)
+        audit(db, owner_id, None, "JOB_CREATED",
+              {"job_id": job.id, "title": job.title, "extraction_source": requirements.get("extraction_source", "")},
+              actor=actor)
         return job_dict(job)
 
 
 @app.put("/api/jobs/{job_id}/criteria")
-def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depends(current_tenant_id),
+                    actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         criteria = payload.model_dump(exclude={"note"})
-        version = create_criteria_version(db, job, owner_id, criteria, payload.note)
-        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note},
+        version = create_criteria_version(db, job, owner_id, criteria, payload.note, actor=actor)
+        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note, "version": version.version},
                             "shortlist_trigger": (job.requirements or {}).get("shortlist_trigger", {})}
         audit(db, owner_id, None, "CRITERIA_VERSION_CREATED",
-              {"job_id": job.id, "criteria_version_id": version.id, "version": version.version})
+              {"job_id": job.id, "criteria_version_id": version.id, "version": version.version}, actor=actor)
         return {"job": job_dict(job), "criteria_version": criteria_version_dict(version)}
 
 
@@ -1337,7 +1480,8 @@ def _queue_rescreens(db, job: Job, criteria: CriteriaVersion, owner_id: str) -> 
 
 
 @app.post("/api/jobs/{job_id}/approve-criteria")
-async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str = Depends(current_tenant_id)) -> dict:
+async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str = Depends(current_tenant_id),
+                           actor: dict[str, str] = Depends(current_actor)) -> dict:
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
@@ -1349,17 +1493,19 @@ async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str
             "approval": {
                 "status": "APPROVED" if payload.approved else "NEEDS_REVISION",
                 "note": payload.note,
+                "version": criteria.version,
                 "approved_at": datetime.now(timezone.utc).isoformat() if payload.approved else None,
             },
         }
         audit(db, owner_id, None, "CRITERIA_APPROVED" if payload.approved else "CRITERIA_REVISION_REQUESTED",
-              {"job_id": job.id, "criteria_version_id": criteria.id, "version": criteria.version, "note": payload.note})
+              {"job_id": job.id, "criteria_version_id": criteria.id, "version": criteria.version, "note": payload.note},
+              actor=actor)
         request = db.scalar(select(ApprovalRequest).where(
             ApprovalRequest.resource_id == criteria.id, ApprovalRequest.status == "PENDING"
         ))
         if request:
             request.status = criteria.status
-            request.resolution = {"note": payload.note}
+            request.resolution = {"note": payload.note, **decided_by(actor)}
             request.decided_at = utcnow()
         if payload.approved:
             task_ids = _queue_rescreens(db, job, criteria, owner_id)
@@ -1378,7 +1524,9 @@ def shortlist(job_id: str, limit: int = 5, owner_id: str = Depends(current_tenan
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
         return {
@@ -1439,7 +1587,9 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         approved_ids = (job.requirements or {}).get("shortlist_approval", {}).get("application_ids") or []
         if approved_ids:
@@ -1457,7 +1607,8 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
 
 
 @app.post("/api/jobs/{job_id}/approve-shortlist")
-def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id)) -> dict:
+def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     selected = set(payload.application_ids)
     invitations: list[dict] = []
     outbox_ids: list[str] = []
@@ -1467,7 +1618,9 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
         if not criteria:
             raise HTTPException(409, "Criteria must be approved before shortlist approval")
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         known = {item.id for item in apps}
         missing = selected - known
@@ -1485,7 +1638,7 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
                 "approved_at": datetime.now(timezone.utc).isoformat(),
             },
         }
-        audit(db, owner_id, None, "SHORTLIST_APPROVED", {"job_id": job.id, "application_ids": payload.application_ids, "note": payload.note})
+        audit(db, owner_id, None, "SHORTLIST_APPROVED", {"job_id": job.id, "application_ids": payload.application_ids, "note": payload.note}, actor=actor)
         proposal = db.scalar(select(ShortlistProposal).where(
             ShortlistProposal.job_id == job.id, ShortlistProposal.status == "PENDING"
         ).order_by(ShortlistProposal.created_at.desc()).limit(1))
@@ -1498,7 +1651,7 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
             ))
             if request:
                 request.status = "APPROVED"
-                request.resolution = {"note": payload.note, "application_ids": payload.application_ids}
+                request.resolution = {"note": payload.note, "application_ids": payload.application_ids, **decided_by(actor)}
                 request.decided_at = utcnow()
         ranked = sorted([item for item in apps if item.id in selected], key=lambda a: a.screening.get("final_score", 0), reverse=True)
         invitation_payload = SchedulingInvitationCreate()
@@ -1529,13 +1682,16 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
 def approval_inbox(
     status: str = Query("PENDING", max_length=32),
     request_type: str | None = Query(None, max_length=40),
+    job_id: str | None = None,
     limit: int = Query(100, ge=1, le=200),
     owner_id: str = Depends(current_tenant_id),
 ) -> list[dict]:
     with session_scope() as db:
-        statement = select(ApprovalRequest).where(
-            ApprovalRequest.owner_id == owner_id, ApprovalRequest.status == status.upper()
-        )
+        statement = select(ApprovalRequest).where(ApprovalRequest.owner_id == owner_id)
+        if status.upper() != "ALL":
+            statement = statement.where(ApprovalRequest.status == status.upper())
+        if job_id:
+            statement = statement.where(ApprovalRequest.job_id == job_id)
         if request_type:
             statement = statement.where(ApprovalRequest.request_type == request_type.upper())
         values = db.scalars(statement.order_by(ApprovalRequest.created_at.desc()).limit(limit))
@@ -1544,7 +1700,8 @@ def approval_inbox(
 
 @app.post("/api/approvals/{approval_id}/resolve")
 async def resolve_approval(approval_id: str, payload: ApprovalResolution,
-                           owner_id: str = Depends(current_tenant_id)) -> dict:
+                           owner_id: str = Depends(current_tenant_id),
+                           actor: dict[str, str] = Depends(current_actor)) -> dict:
     decision = payload.decision.upper()
     if decision not in {"APPROVE", "REJECT"}:
         raise HTTPException(422, "decision must be APPROVE or REJECT")
@@ -1560,7 +1717,7 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
         if request.status != "PENDING":
             raise HTTPException(409, "Approval request is already resolved")
         request.status = "APPROVED" if decision == "APPROVE" else "REJECTED"
-        request.resolution = {"note": payload.note, "application_ids": payload.application_ids or []}
+        request.resolution = {"note": payload.note, "application_ids": payload.application_ids or [], **decided_by(actor)}
         request.decided_at = utcnow()
         if request.request_type == "CRITERIA":
             criteria = db.scalar(select(CriteriaVersion).where(
@@ -1572,7 +1729,8 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             criteria.status = "APPROVED" if decision == "APPROVE" else "NEEDS_REVISION"
             criteria.approved_at = utcnow() if decision == "APPROVE" else None
             job.requirements = {**(job.requirements or {}), **criteria.criteria,
-                                "approval": {"status": criteria.status, "note": payload.note}}
+                                "approval": {"status": criteria.status, "note": payload.note,
+                                             "version": criteria.version}}
             if decision == "APPROVE":
                 task_ids = _queue_rescreens(db, job, criteria, owner_id)
         elif request.request_type == "SHORTLIST":
@@ -1615,7 +1773,7 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                     invitations.append(invitation)
                     invitation_outbox_ids.append(outbox_id)
         audit(db, owner_id, request.application_id, f"{request.request_type}_{request.status}",
-              {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note})
+              {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note}, actor=actor)
         response = approval_dict(request)
     for task_id in task_ids:
         try:
@@ -1629,6 +1787,17 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
     return response
 
 
+@app.put("/api/jobs/{job_id}")
+def update_job(job_id: str, payload: JobUpdate, owner_id: str = Depends(current_tenant_id),
+               actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Edit the posting text. Criteria are versioned separately and are left untouched."""
+    with session_scope() as db:
+        job = require_job(db, job_id, owner_id)
+        job.description = payload.description.strip()
+        audit(db, owner_id, None, "JOB_DESCRIPTION_UPDATED", {"job_id": job.id, "title": job.title}, actor=actor)
+        return job_dict(job)
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
     with session_scope() as db:
@@ -1636,8 +1805,14 @@ def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
         linked = list(db.scalars(select(Application).where(Application.job_id == job_id, Application.owner_id == owner_id)))
         if any(a.status not in {ApplicationStatus.REJECTED.value, ApplicationStatus.ARCHIVED.value} for a in linked):
             raise HTTPException(409, "Only jobs with no candidates or rejected/archived candidates can be deleted")
+        # SQLite runs with foreign keys off, so the ON DELETE CASCADE never fires and the
+        # approval inbox would keep showing cards for a job that no longer exists.
+        approvals = db.execute(sql_delete(ApprovalRequest).where(ApprovalRequest.job_id == job_id)).rowcount
+        db.execute(sql_delete(ShortlistProposal).where(ShortlistProposal.job_id == job_id))
+        db.execute(sql_delete(CriteriaVersion).where(CriteriaVersion.job_id == job_id))
         db.delete(job)
-        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked)}
+        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked),
+                "removed_approvals": approvals}
 
 
 @app.post("/api/applications", status_code=201)
@@ -1646,6 +1821,32 @@ async def create_application(payload: ApplicationCreate, owner_id: str = Depends
         item = await build_application(db, owner_id, require_job(db, payload.job_id, owner_id), payload.candidate_name,
                                        payload.candidate_email, payload.resume_text)
         return application_dict(item)
+
+
+@app.get("/api/applications/{application_id}/resume")
+def read_resume(application_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
+    """Extracted CV text, plus whether the original upload is still on disk."""
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        path = stored_resume_path(item.id, item.resume_filename)
+        suffix = Path(item.resume_filename or "").suffix.lower()
+        return {"application_id": item.id, "filename": item.resume_filename,
+                "size": item.resume_size, "checksum": item.resume_checksum,
+                "text": item.resume_text or "",
+                "file_available": bool(path and path.exists()), "file_type": suffix.lstrip(".")}
+
+
+@app.get("/api/applications/{application_id}/resume-file")
+def read_resume_file(application_id: str, owner_id: str = Depends(current_tenant_id)) -> FileResponse:
+    """Serve the CV exactly as uploaded, so the reviewer sees the candidate's own formatting."""
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        filename = item.resume_filename
+        path = stored_resume_path(item.id, filename)
+    if not path or not path.exists():
+        raise HTTPException(404, "Original file is not stored for this application")
+    return FileResponse(path, media_type=CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                        filename=filename or path.name, content_disposition_type="inline")
 
 
 @app.get("/api/applications/{application_id}/interview-kit")
@@ -1671,7 +1872,10 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        criteria = latest_criteria(db, job.id, approved_only=True) or ensure_criteria_version(db, job)
+        criteria = latest_criteria(db, job.id, approved_only=True)
+        if not criteria:
+            # Screening against unapproved criteria would walk straight past the review gate.
+            raise HTTPException(409, f"{job.title}: tiêu chí chưa được duyệt nên chưa nhận CV")
         batch = UploadBatch(owner_id=owner_id, job_id=job_id, total=len(files)); db.add(batch); db.flush()
         for file in files:
             filename = (file.filename or "unnamed")[:255]
@@ -1683,7 +1887,7 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                     Application.job_id == job_id,
                     Application.resume_checksum == digest,
                 ))
-                if duplicate:
+                if duplicate and duplicate.status != ApplicationStatus.DELETED.value:
                     db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=duplicate.id,
                                      filename=filename, checksum=digest, status=BatchItemStatus.DUPLICATE.value,
                                      error="CV trùng checksum trong cùng job"))
@@ -1693,25 +1897,52 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
 
                 name, email = candidate_identity(text, filename)
                 application_id = str(uuid5(NAMESPACE_URL, f"talentflow:{owner_id}:{job_id}:{digest}"))
-                application = Application(
-                    id=application_id,
-                    owner_id=owner_id,
-                    job_id=job.id,
-                    batch_id=batch.id,
-                    candidate_name=name,
-                    candidate_email=email,
-                    status=ApplicationStatus.PROCESSING.value,
-                    resume_filename=filename,
-                    resume_size=len(content),
-                    resume_checksum=digest,
-                    resume_text=text,
-                    screening={},
-                    pipeline=screening_pipeline("Candidate Extracted"),
-                )
+                revived = duplicate is not None
+                run_suffix = f"resubmit:{batch.id}" if revived else "v1"
+                if revived:
+                    # Sending the same CV again after it was cleared out has to land, otherwise the
+                    # upload silently does nothing. The row is revived rather than inserted again
+                    # because its id is derived from the checksum and would collide.
+                    application = duplicate
+                    application.batch_id = batch.id
+                    application.candidate_name = name
+                    application.candidate_email = email
+                    application.status = ApplicationStatus.PROCESSING.value
+                    application.previous_status = ""
+                    application.deleted_at = None
+                    application.deleted_by = ""
+                    application.resume_filename = filename
+                    application.resume_size = len(content)
+                    application.resume_text = text
+                    application.screening = {}
+                    application.review = None
+                    application.pipeline = screening_pipeline("Candidate Extracted")
+                    application.status_changed_at = utcnow()
+                else:
+                    application = Application(
+                        id=application_id,
+                        owner_id=owner_id,
+                        job_id=job.id,
+                        batch_id=batch.id,
+                        candidate_name=name,
+                        candidate_email=email,
+                        status=ApplicationStatus.PROCESSING.value,
+                        resume_filename=filename,
+                        resume_size=len(content),
+                        resume_checksum=digest,
+                        resume_text=text,
+                        screening={},
+                        pipeline=screening_pipeline("Candidate Extracted"),
+                    )
                 try:
                     with db.begin_nested():
-                        db.add(application)
+                        if not revived:
+                            db.add(application)
                         db.flush()
+                    store_resume_file(application_id, filename, content)
+                    if revived:
+                        audit(db, owner_id, application.id, "CV_RESUBMITTED_AFTER_DELETE",
+                              {"filename": filename, "checksum": digest})
                 except IntegrityError:
                     duplicate = db.scalar(select(Application).where(
                         Application.owner_id == owner_id,
@@ -1737,12 +1968,14 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                                model=ai["model"] if ai["configured"] else None,
                                prompt_version="screening-v1+interview-kit-v1",
                                fallback_reason=None if ai["configured"] else "openrouter_not_configured",
-                               idempotency_key=f"screening:{application.id}:v1")
+                               # A resubmission is a genuinely new screening run, so it cannot reuse
+                               # the first submission's key the way a repeated upload should.
+                               idempotency_key=f"screening:{application.id}:{run_suffix}")
                 db.add(run); db.flush()
                 task = AgentTask(owner_id=owner_id, application_id=application.id, batch_id=batch.id,
                                  batch_item_id=batch_item.id, run_id=run.id, status=TaskStatus.QUEUED.value,
                                  max_attempts=get_settings().task_max_attempts,
-                                 idempotency_key=f"screening-task:{application.id}:v1")
+                                 idempotency_key=f"screening-task:{application.id}:{run_suffix}")
                 db.add(task); db.flush()
                 batch_item.task_id = task.id
                 task_ids.append(task.id)
@@ -1866,7 +2099,8 @@ def get_agent_run(run_id: str, owner_id: str = Depends(current_tenant_id)) -> di
 
 
 @app.post("/api/applications/{application_id}/review")
-def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(current_tenant_id),
+           actor: dict[str, str] = Depends(current_actor)) -> dict:
     statuses = {
         ReviewDecision.INTERVIEW.value: ApplicationStatus.INTERVIEW_PENDING.value,
         ReviewDecision.MANUAL_REVIEW.value: ApplicationStatus.REVIEWED.value,
@@ -1881,7 +2115,47 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         if item.status in {ApplicationStatus.PROCESSING.value, ApplicationStatus.SCREENING_FAILED.value}:
             raise HTTPException(409, "Application screening is not ready for review")
         item.status = statuses[decision]; item.review = payload.model_dump(); item.pipeline = pipeline("completed")
-        audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump())
+        item.status_changed_at = utcnow()
+        item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump(), actor=actor)
+        return application_dict(item)
+
+
+@app.post("/api/applications/{application_id}/delete")
+def soft_delete_application(application_id: str, owner_id: str = Depends(current_tenant_id),
+                            actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Move the candidate out of the way without destroying anything.
+
+    Separate from DELETE /data, which erases the record for a privacy request and cannot be
+    undone. A recruiter clearing low scores out of the list wants the opposite of that.
+    """
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        if item.status == ApplicationStatus.DELETED.value:
+            return application_dict(item)
+        item.previous_status = item.status
+        item.status = ApplicationStatus.DELETED.value
+        item.deleted_at = item.status_changed_at = utcnow()
+        item.deleted_by = item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        audit(db, owner_id, item.id, "CANDIDATE_DELETED",
+              {"candidate": item.candidate_name, "from_status": item.previous_status}, actor=actor)
+        return application_dict(item)
+
+
+@app.post("/api/applications/{application_id}/restore")
+def restore_application(application_id: str, owner_id: str = Depends(current_tenant_id),
+                        actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        if item.status != ApplicationStatus.DELETED.value:
+            raise HTTPException(409, "Hồ sơ này không nằm trong mục đã xoá")
+        item.status = item.previous_status or ApplicationStatus.WAITING_REVIEW.value
+        item.previous_status = ""
+        item.deleted_at = None; item.deleted_by = ""
+        item.status_changed_at = utcnow()
+        item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        audit(db, owner_id, item.id, "CANDIDATE_RESTORED",
+              {"candidate": item.candidate_name, "to_status": item.status}, actor=actor)
         return application_dict(item)
 
 
@@ -1965,7 +2239,14 @@ def create_email_template(payload: EmailTemplateCreate, owner_id: str = Depends(
 
 def policy_dict(value: InterviewPolicy) -> dict:
     return {"reminder_minutes": value.reminder_minutes, "max_reschedules": value.max_reschedules,
-            "feedback_due_hours": value.feedback_due_hours}
+            "feedback_due_hours": value.feedback_due_hours, "timezone_name": value.timezone_name,
+            "working_days": value.working_days, "working_start_hour": value.working_start_hour,
+            "working_end_hour": value.working_end_hour}
+
+
+def busy_block_dict(value: BusyBlock) -> dict:
+    return {"id": value.id, "note": value.note,
+            "start_at": utc_iso(value.start_at), "end_at": utc_iso(value.end_at)}
 
 
 @app.get("/api/interview-policy")
@@ -1975,14 +2256,50 @@ def read_interview_policy(owner_id: str = Depends(current_tenant_id)) -> dict:
 
 
 @app.put("/api/interview-policy")
-def update_interview_policy(payload: InterviewPolicyUpdate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def update_interview_policy(payload: InterviewPolicyUpdate, owner_id: str = Depends(current_tenant_id),
+                            actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         value = get_policy(db, owner_id)
         value.reminder_minutes = payload.reminder_minutes
         value.max_reschedules = payload.max_reschedules
         value.feedback_due_hours = payload.feedback_due_hours
-        audit(db, owner_id, None, "INTERVIEW_POLICY_UPDATED", policy_dict(value))
+        value.timezone_name = payload.timezone_name
+        value.working_days = payload.working_days
+        value.working_start_hour = payload.working_start_hour
+        value.working_end_hour = payload.working_end_hour
+        audit(db, owner_id, None, "INTERVIEW_POLICY_UPDATED", policy_dict(value), actor=actor)
         return policy_dict(value)
+
+
+@app.get("/api/busy-blocks")
+def list_busy_blocks(owner_id: str = Depends(current_tenant_id)) -> list[dict]:
+    with session_scope() as db:
+        values = db.scalars(select(BusyBlock).where(BusyBlock.owner_id == owner_id)
+                            .order_by(BusyBlock.start_at))
+        return [busy_block_dict(value) for value in values]
+
+
+@app.post("/api/busy-blocks", status_code=201)
+def create_busy_block(payload: BusyBlockCreate, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        value = BusyBlock(owner_id=owner_id, start_at=payload.start_at, end_at=payload.end_at,
+                          note=payload.note.strip())
+        db.add(value); db.flush()
+        audit(db, owner_id, None, "BUSY_BLOCK_ADDED", busy_block_dict(value), actor=actor)
+        return busy_block_dict(value)
+
+
+@app.delete("/api/busy-blocks/{block_id}")
+def delete_busy_block(block_id: str, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        value = db.scalar(select(BusyBlock).where(BusyBlock.id == block_id, BusyBlock.owner_id == owner_id))
+        if not value:
+            raise HTTPException(404, "Busy block not found")
+        audit(db, owner_id, None, "BUSY_BLOCK_REMOVED", busy_block_dict(value), actor=actor)
+        db.delete(value)
+        return {"status": "deleted", "id": block_id}
 
 
 def scorecard_dict(value: InterviewScorecard) -> dict:
@@ -2050,7 +2367,8 @@ def submit_scorecard(interview_id: str, payload: ScorecardCreate,
 
 
 @app.post("/api/interviews/{interview_id}/no-show")
-def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
+def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id),
+                 actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         interview = db.scalar(select(Interview).where(Interview.id == interview_id, Interview.owner_id == owner_id))
         if not interview:
@@ -2058,7 +2376,7 @@ def mark_no_show(interview_id: str, owner_id: str = Depends(current_tenant_id)) 
         interview.status = "NO_SHOW"
         interview.outcome = "NO_SHOW"
         request = escalation(db, interview, "NO_SHOW", "Ứng viên không tham dự; recruiter cần chọn liên hệ lại hoặc đóng quy trình.")
-        audit(db, owner_id, interview.application_id, "INTERVIEW_NO_SHOW", {"interview_id": interview.id})
+        audit(db, owner_id, interview.application_id, "INTERVIEW_NO_SHOW", {"interview_id": interview.id}, actor=actor)
         return {"interview": interview_dict(interview), "approval": approval_dict(request)}
 
 
@@ -2079,12 +2397,13 @@ def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvi
     )
     db.add(invitation); db.flush()
     public_url = f"{get_settings().public_app_url}/?schedule={raw_token}"
+    job = db.get(Job, item.job_id)
     rendered = render_template(
-        db, item.owner_id, "scheduling_invitation", "Mời chọn lịch phỏng vấn",
-        "Chào {candidate_name},\n\nBạn đã vào danh sách phỏng vấn. Vui lòng chọn lịch tại: {public_url}\n"
-        "Liên kết hết hạn lúc {expires_at}. Lịch bạn chọn sẽ được giữ riêng và chờ HR xác nhận.",
+        db, item.owner_id, "scheduling_invitation",
         {"candidate_name": item.candidate_name, "public_url": public_url,
-         "expires_at": invitation.expires_at.isoformat()},
+         "job_title": job.title if job else "vị trí ứng tuyển",
+         "duration_minutes": str(invitation.duration_minutes),
+         "expires_at": local_datetime_label(invitation.expires_at, payload.timezone_name)},
     )
     outbox = add_outbox(
         db, owner_id=item.owner_id, aggregate_type="scheduling_invitation", aggregate_id=invitation.id,
@@ -2094,6 +2413,12 @@ def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvi
         },
     )
     item.status = ApplicationStatus.INTERVIEW_PENDING.value
+    # Inviting someone is the recruiter saying this address is real, so clear it for delivery.
+    # Otherwise the sandbox blocks the invitation it was just asked to send.
+    if allow_sandbox_recipient(policy_for(db, item.owner_id), item.candidate_email,
+                               source="INTERVIEW", candidate_name=item.candidate_name):
+        audit(db, item.owner_id, item.id, "MAIL_SANDBOX_RECIPIENT_ALLOWED",
+              {"email": item.candidate_email, "source": "INTERVIEW"})
     audit(db, item.owner_id, item.id, "SCHEDULING_INVITATION_CREATED", {"invitation_id": invitation.id})
     return ({"id": invitation.id, "status": invitation.status, "public_url": public_url,
              "expires_at": invitation.expires_at.isoformat(), "delivery_status": outbox.status}, outbox.id)
@@ -2217,7 +2542,8 @@ def book_public_interview(token: str, payload: BookingCreate) -> dict:
 
 @app.post("/api/interviews/{interview_id}/confirm")
 def confirm_interview(interview_id: str, payload: InterviewConfirmation,
-                      owner_id: str = Depends(current_tenant_id)) -> dict:
+                      owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     outbox_id = ""
     with session_scope() as db:
         value = db.scalar(select(Interview).where(
@@ -2238,7 +2564,7 @@ def confirm_interview(interview_id: str, payload: InterviewConfirmation,
         outbox_id = outbox.id
         audit(db, owner_id, application.id, "INTERVIEW_CONFIRMED_BY_HR", {
             "interview_id": value.id, "note": payload.note,
-        })
+        }, actor=actor)
         response = interview_dict(value)
     dispatch_outbox(outbox_id)
     with session_scope() as db:
@@ -2451,6 +2777,7 @@ def logs(
     offset: int = Query(0, ge=0),
     action: str | None = Query(None, max_length=80),
     application_id: str | None = None,
+    job_id: str | None = None,
     owner_id: str = Depends(current_tenant_id),
 ) -> list[dict]:
     with session_scope() as db:
@@ -2459,9 +2786,13 @@ def logs(
             statement = statement.where(AuditLog.action == action)
         if application_id:
             statement = statement.where(AuditLog.application_id == application_id)
+        if job_id:
+            # job_id lives inside the metadata payload rather than its own column.
+            statement = statement.where(AuditLog.metadata_json["job_id"].as_string() == job_id)
         statement = statement.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
         values = db.scalars(statement)
         return [{"id": v.id, "application_id": v.application_id, "action": v.action,
+                 "actor_id": v.actor_id, "actor_email": v.actor_email,
                  "metadata": v.metadata_json,
                  "created_at": v.created_at.replace(tzinfo=v.created_at.tzinfo or timezone.utc).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
                 for v in values]

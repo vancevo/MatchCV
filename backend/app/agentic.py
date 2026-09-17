@@ -116,7 +116,8 @@ def ensure_criteria_version(db, job: Job) -> CriteriaVersion:
     return version
 
 
-def create_criteria_version(db, job: Job, owner_id: str, criteria: dict, note: str = "") -> CriteriaVersion:
+def create_criteria_version(db, job: Job, owner_id: str, criteria: dict, note: str = "",
+                            actor: dict[str, str] | None = None) -> CriteriaVersion:
     parent = latest_criteria(db, job.id)
     version = CriteriaVersion(
         owner_id=owner_id,
@@ -138,13 +139,15 @@ def create_criteria_version(db, job: Job, owner_id: str, criteria: dict, note: s
         summary="Xác nhận yêu cầu trước khi agent dùng phiên bản này để rescreen.",
         payload={"version": version.version, "criteria": version.criteria, "change_note": note},
         dedupe_key=f"criteria:{version.id}",
+        actor=actor,
     )
     return version
 
 
 def add_approval(db, *, owner_id: str, request_type: str, resource_id: str, title: str,
                  summary: str, payload: dict, dedupe_key: str, job_id: str | None = None,
-                 application_id: str | None = None) -> ApprovalRequest:
+                 application_id: str | None = None, actor: dict[str, str] | None = None) -> ApprovalRequest:
+    """Pass `actor` when a person raised this; leave it out so agent-raised requests stay unattributed."""
     existing = db.scalar(select(ApprovalRequest).where(ApprovalRequest.dedupe_key == dedupe_key))
     if existing:
         return existing
@@ -156,6 +159,8 @@ def add_approval(db, *, owner_id: str, request_type: str, resource_id: str, titl
         resource_id=resource_id,
         title=title,
         summary=summary,
+        requested_by_id=(actor or {}).get("id") or None,
+        requested_by_email=(actor or {}).get("email") or None,
         payload=payload,
         dedupe_key=dedupe_key,
     )
