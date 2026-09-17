@@ -72,3 +72,35 @@ def test_a_review_stamps_when_and_by_whom():
                            json={"decision": "REJECT", "note": "không đạt"}).json()
     # Without this the list can only say what happened, never when.
     assert reviewed["status_changed_at"] and reviewed["status_changed_at"].endswith("Z")
+
+
+CV_FILE = ("nop-lai.txt",
+           "LÊ VĂN NỘP LẠI\nnoplai@example.com\n5 năm Python FastAPI PostgreSQL REST API Docker Redis".encode(),
+           "text/plain")
+
+
+def _upload():
+    return client.post("/api/application-batches", data={"job_id": "job-backend-01"},
+                       files=[("files", CV_FILE)])
+
+
+def test_resending_a_cleared_out_cv_lands_instead_of_vanishing():
+    first = _upload()
+    assert first.status_code == 202
+    application_id = first.json()["items"][0]["application"]["id"]
+
+    client.post(f"/api/applications/{application_id}/delete")
+
+    again = _upload().json()
+    # The dedupe used to match the cleared-out row too, so the upload reported a skip and the
+    # recruiter saw nothing appear at all.
+    assert again["skipped"] == 0, "CV nộp lại vẫn bị coi là trùng"
+    assert again["items"][0]["application"]["status"] != "DELETED"
+    assert again["items"][0]["application"]["id"] == application_id
+
+
+def test_an_identical_cv_that_was_not_deleted_is_still_treated_as_a_duplicate():
+    _upload()
+    repeat = _upload().json()
+    # Real duplicates must keep being skipped; only the deleted case changed.
+    assert repeat["skipped"] == 1

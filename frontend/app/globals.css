@@ -322,3 +322,11 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .why-button.restore{border-color:#cfe6d9;color:#227a57}
 .why-button.restore:hover:not(:disabled){background:#f3fbf6;border-color:#a8d9c0}
 @media (max-width:700px){.allow-table th:nth-child(3),.allow-table td:nth-child(3){display:none}}
+
+/* "We have seen this candidate before" marker */
+.seen-before{display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:2px 7px;border-radius:7px;background:#fdf3e8;color:#a9713a;font-style:normal;font-size:8.5px;font-weight:700;cursor:help;white-space:nowrap}
+.seen-before .icon{width:10px}
+.intake-meta{display:grid;gap:4px;margin-top:8px}
+.intake-meta span{display:flex;align-items:center;gap:6px;color:#7c8291;font-size:9.5px}
+.intake-meta b{color:#4a4f5e;font-weight:700}
+.intake-meta .icon{width:12px;flex:none}
