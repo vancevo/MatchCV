@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 
 
 SKILL_ALIASES = {
@@ -15,8 +16,47 @@ SKILL_ALIASES = {
     "python": ("python",),
     "docker": ("docker", "container"),
     "redis": ("redis",),
-    "rest api": ("rest api", "restful", "http api", "web service"),
+    "rest api": ("rest api", "restful", "http api", "web service", "api"),
+    "javascript": ("javascript", "js", "es6"),
+    "typescript": ("typescript", "ts"),
+    "react": ("react", "react.js", "reactjs"),
+    "vue": ("vue", "vue.js", "vuejs"),
+    "angular": ("angular", "angularjs"),
+    "next.js": ("next.js", "nextjs"),
+    "node.js": ("node.js", "nodejs", "node"),
+    "css": ("css", "css3", "scss", "sass", "tailwind"),
+    "html": ("html", "html5"),
+    "git": ("git", "github", "gitlab", "bitbucket"),
+    "kubernetes": ("kubernetes", "k8s", "openshift"),
+    "ci/cd": ("ci/cd", "cicd", "jenkins", "github actions", "gitlab ci"),
+    "mysql": ("mysql", "mariadb"),
+    "mongodb": ("mongodb", "mongo"),
+    "java": ("java", "spring", "spring boot"),
+    "golang": ("golang", "go"),
+    "c#": ("c#", ".net", "dotnet", "asp.net"),
+    "php": ("php", "laravel"),
+    "testing": ("unit test", "jest", "pytest", "junit", "testing"),
+    "responsive design": ("responsive", "responsive design", "mobile-first"),
+    "sql": ("sql",),
+    "aws": ("aws", "amazon web services"),
+    "graphql": ("graphql",),
 }
+
+# The rules path runs whenever the model is not configured, and it can only ever find a skill it
+# has been told about. Nine entries meant a frontend job description listing HTML, CSS, JavaScript,
+# React, REST API and Git produced exactly two criteria, and every candidate then scored the same.
+KNOWN_SKILLS = [
+    "Python", "FastAPI", "Django", "Flask", "Java", "Spring Boot", "Golang", "Node.js", "C#",
+    "PHP", "Laravel", "Ruby on Rails",
+    "JavaScript", "TypeScript", "React", "Vue.js", "Angular", "Next.js", "HTML", "CSS",
+    "Tailwind", "Redux", "responsive design",
+    "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQL", "Elasticsearch",
+    "Docker", "Kubernetes", "AWS", "Azure", "GCP", "CI/CD", "Jenkins", "Terraform", "Linux",
+    "REST API", "GraphQL", "gRPC", "Microservices", "Kafka", "RabbitMQ",
+    "Git", "Agile", "Scrum", "unit test", "Jest", "Pytest", "Selenium",
+    "Machine Learning", "TensorFlow", "PyTorch", "Pandas", "NumPy", "Spark", "Airflow",
+    "Figma", "Power BI", "Excel",
+]
 
 
 @dataclass
@@ -29,17 +69,43 @@ class Evidence:
 
 def extract_requirements(description: str) -> dict:
     text = description.lower()
-    known = ["Python", "FastAPI", "PostgreSQL", "Docker", "Redis", "REST API", "React", "TypeScript", "AWS"]
-    skills = [skill for skill in known if skill.lower() in text]
-    preferred_marker = text.find("ưu tiên")
+    # Ordered the way the job description reads, so the criteria list mirrors the text a
+    # recruiter wrote rather than the order of this module's vocabulary.
+    hits = [(found[0], skill) for skill in KNOWN_SKILLS if (found := find_skill(text, skill))]
+    skills = [skill for _, skill in sorted(hits)]
+    preferred_marker = max(text.find("ưu tiên"), text.find("là một lợi thế"), text.find("nice to have"))
     preferred = [s for s in skills if preferred_marker >= 0 and text.find(s.lower()) > preferred_marker]
     required = [s for s in skills if s not in preferred]
-    years = re.search(r"(?:ít nhất|minimum|min\.?)\s*(\d+)\s*(?:năm|years?)", text)
+    # "Ít nhất 2 năm", "tối thiểu 2 năm", "2+ năm", "2-4 năm" all state the same floor.
+    years = (re.search(r"(?:ít nhất|tối thiểu|minimum|min\.?|từ)\s*(\d+)\s*(?:\+)?\s*(?:năm|years?)", text)
+             or re.search(r"(\d+)\s*\+\s*(?:năm|years?)", text)
+             or re.search(r"(\d+)\s*[-–]\s*\d+\s*(?:năm|years?)", text))
     return {
         "required_skills": required or skills[:3],
         "preferred_skills": preferred,
         "minimum_experience": int(years.group(1)) if years else 0,
     }
+
+
+@lru_cache(maxsize=512)
+def _alias_pattern(alias: str) -> re.Pattern[str]:
+    """Match a whole token, never a fragment of a longer word.
+
+    Plain substring search read "java" out of "javascript" and "gin" out of "debugging", so a
+    frontend job description was credited with Java and Go. Punctuation inside a name such as
+    "node.js", "ci/cd" or "c#" still has to survive, hence lookarounds rather than \b.
+    """
+    return re.compile(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", re.I)
+
+
+def find_skill(text: str, skill: str) -> tuple[int, int] | None:
+    """Where the skill is first mentioned, as (offset, length), or None."""
+    best: tuple[int, int] | None = None
+    for alias in _aliases(skill):
+        found = _alias_pattern(alias).search(text)
+        if found and (best is None or found.start() < best[0]):
+            best = (found.start(), len(found.group(0)))
+    return best
 
 
 def _aliases(skill: str) -> tuple[str, ...]:
@@ -65,11 +131,7 @@ def analyze_evidence(cv_text: str, requirements: list[str]) -> list[dict]:
     lowered = flat.lower()
     evidence: list[Evidence] = []
     for requirement in requirements:
-        found: tuple[int, int] | None = None
-        for alias in _aliases(requirement):
-            at = lowered.find(alias.lower())
-            if at != -1 and (found is None or at < found[0]):
-                found = (at, len(alias))
+        found = find_skill(lowered, requirement)
         evidence.append(Evidence(
             requirement=requirement,
             matched=found is not None,
