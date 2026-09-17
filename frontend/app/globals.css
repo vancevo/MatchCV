@@ -263,3 +263,41 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .resume-frame{flex:1;min-height:420px;width:100%;border:0;background:#f4f4f8}
 .resume-action{display:inline-flex;align-items:center;height:26px;padding:0 11px;border:1px solid #ded8f7;border-radius:8px;background:white;color:#5a41c9;font-size:9px;font-weight:800;text-decoration:none}
 .resume-action:hover{background:#f3efff}.resume-action.ghost{border-style:dashed;color:#7c8291}
+
+/* Approval inbox: filters, bulk selection, plain-language reasons */
+.approval-tabs{margin:0 0 4px}
+.bulk-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:11px 20px;border-top:1px solid #f1f0f7;background:#fbfaff}
+.bulk-check{display:flex;align-items:center;gap:7px;color:#5a4fb0;font-size:10px;font-weight:700;cursor:pointer}
+.bulk-check input,.approval-pick input{width:15px;height:15px;accent-color:#6c4de6;cursor:pointer}
+.bulk-count{margin-left:auto;color:#6f7686;font-size:10px}.bulk-count b{color:#4a3ba8;font-size:12px}
+.approval-pick{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:#f4f2fd;cursor:pointer}
+.approval-picked{background:#faf8ff}
+.approval-why{margin:7px 0 0;padding:10px 12px;border-left:3px solid #c5b8f2;border-radius:0 9px 9px 0;background:#f7f5ff}
+.approval-why b{display:block;margin-bottom:5px;color:#5a4fb0;font:800 8.5px Manrope,sans-serif;letter-spacing:.7px;text-transform:uppercase}
+.approval-why ul{margin:0;padding-left:16px;display:grid;gap:4px}
+.approval-why li{color:#4d5464;font-size:10.5px;line-height:1.55}
+.approval-candidate{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:11px;padding:11px 13px;border:1px solid #ecebf5;border-radius:11px;background:#fbfaff}
+.approval-candidate-meta{flex:1 1 220px;min-width:0}
+.approval-candidate-meta b{display:block;font-size:11px;color:#333a4b}
+.approval-candidate-meta small{display:block;margin:2px 0 7px;color:#8d93a3;font-size:9.5px}
+.approval-hits{display:flex;flex-wrap:wrap;gap:4px}
+.approval-hits i{padding:3px 8px;border-radius:7px;font-style:normal;font-size:9px;font-weight:700}
+.approval-hits i.met{background:#e4f5ec;color:#227a57}
+.approval-hits i.unmet{background:#fdeee8;color:#a9552f}
+.approval-row-actions{flex:0 0 auto}
+@media (max-width:700px){.bulk-bar{padding:11px 13px}.bulk-count{margin-left:0}.approval-candidate{padding:10px}.approval-row-actions{width:100%}}
+
+/* Mail sandbox: addresses cleared for real delivery */
+.allow-list{padding:16px 20px;border-top:1px solid #f1f0f7}
+.allow-list h3{margin:0 0 4px;font:800 9px Manrope,sans-serif;letter-spacing:.9px;text-transform:uppercase;color:#5a4fb0}
+.allow-hint{margin:0 0 11px;color:#8d93a3;font-size:9.5px;line-height:1.55}
+.allow-list ul{list-style:none;margin:0 0 11px;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.allow-list li{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 10px;border:1px solid #d9e8df;border-radius:9px;background:#f3fbf6}
+.allow-list li code{color:#227a57;font-size:10px}
+.allow-list li button{width:18px;height:18px;border:0;border-radius:50%;background:#dcefe4;color:#227a57;font-size:12px;line-height:1;cursor:pointer}
+.allow-list li button:hover:not(:disabled){background:#c9e4d4}
+.allow-list li button:disabled{opacity:.4;cursor:not-allowed}
+.allow-empty{margin:0 0 11px;color:#9aa0ae;font-size:10px;font-style:italic}
+.allow-add{display:flex;flex-wrap:wrap;gap:8px}
+.allow-add input{flex:1 1 220px;height:32px;padding:0 11px;border:1px solid #e1e2e8;border-radius:9px;background:#fafafd;font-size:10.5px;color:#333a4b}
+.allow-add input:focus{outline:0;border-color:#9e8de9;box-shadow:0 0 0 3px #eeeafd}

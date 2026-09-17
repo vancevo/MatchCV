@@ -440,6 +440,8 @@ class TenantPolicy(Base):
     mail_sandbox_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     mail_sandbox_base_email: Mapped[str] = mapped_column(String(320), default="")
     mail_sandbox_max_alias: Mapped[int] = mapped_column(Integer, default=100)
+    # Addresses cleared for real delivery beyond the base mailbox and its plus aliases.
+    mail_sandbox_allowed_emails: Mapped[list] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

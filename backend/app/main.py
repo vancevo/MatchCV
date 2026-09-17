@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import re
 from pathlib import Path
 import secrets
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -66,7 +67,8 @@ from .worker import mark_enqueue_failed
 from .workflow import screening_pipeline
 from .scheduling import (
     add_outbox, authorization_url, available_slots_for_owner, decode_oauth_state,
-    dispatch_outbox, exchange_code, local_datetime_label, mail_sandbox_alias, render_template,
+    allow_sandbox_recipient, dispatch_outbox, exchange_code, local_datetime_label,
+    mail_sandbox_alias, render_template, sandbox_allowlist,
     save_connection,
 )
 from .interview_ops import escalation, get_policy, run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback
@@ -377,6 +379,18 @@ class MailSandboxUpdate(BaseModel):
         if not separator or not local or not domain or "+" in local or " " in normalized:
             raise ValueError("base_email must be a valid address without a plus alias")
         return normalized
+
+
+class MailSandboxRecipient(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def _is_an_address(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", cleaned):
+            raise ValueError("email không hợp lệ")
+        return cleaned
 
 
 class MailSandboxTest(BaseModel):
@@ -830,6 +844,7 @@ def _mail_sandbox_dict(policy: TenantPolicy) -> dict:
         "enabled": policy.mail_sandbox_enabled,
         "base_email": policy.mail_sandbox_base_email,
         "max_alias": policy.mail_sandbox_max_alias,
+        "allowed_emails": sandbox_allowlist(policy),
         "sample_aliases": aliases,
         "delivery_note": "Gmail delivers plus aliases to the base inbox while TalentFlow keeps the alias unchanged.",
     }
@@ -854,6 +869,33 @@ def update_mail_sandbox(
         audit(db, owner_id, None, "MAIL_SANDBOX_UPDATED", {
             "enabled": payload.enabled, "base_email": payload.base_email, "max_alias": payload.max_alias,
         })
+        return _mail_sandbox_dict(policy)
+
+
+@app.post("/api/mail-sandbox/allowed-emails")
+def add_mail_sandbox_recipient(
+    payload: MailSandboxRecipient,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        policy = policy_for(db, owner_id)
+        if allow_sandbox_recipient(policy, payload.email):
+            audit(db, owner_id, None, "MAIL_SANDBOX_RECIPIENT_ALLOWED", {"email": payload.email})
+        return _mail_sandbox_dict(policy)
+
+
+@app.delete("/api/mail-sandbox/allowed-emails/{email}")
+def remove_mail_sandbox_recipient(
+    email: str,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        policy = policy_for(db, owner_id)
+        target = email.strip().lower()
+        remaining = [value for value in sandbox_allowlist(policy) if value != target]
+        if len(remaining) != len(sandbox_allowlist(policy)):
+            policy.mail_sandbox_allowed_emails = remaining
+            audit(db, owner_id, None, "MAIL_SANDBOX_RECIPIENT_REMOVED", {"email": target})
         return _mail_sandbox_dict(policy)
 
 
@@ -2291,6 +2333,11 @@ def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvi
         },
     )
     item.status = ApplicationStatus.INTERVIEW_PENDING.value
+    # Inviting someone is the recruiter saying this address is real, so clear it for delivery.
+    # Otherwise the sandbox blocks the invitation it was just asked to send.
+    if allow_sandbox_recipient(policy_for(db, item.owner_id), item.candidate_email):
+        audit(db, item.owner_id, item.id, "MAIL_SANDBOX_RECIPIENT_ALLOWED",
+              {"email": item.candidate_email})
     audit(db, item.owner_id, item.id, "SCHEDULING_INVITATION_CREATED", {"invitation_id": invitation.id})
     return ({"id": invitation.id, "status": invitation.status, "public_url": public_url,
              "expires_at": invitation.expires_at.isoformat(), "delivery_status": outbox.status}, outbox.id)

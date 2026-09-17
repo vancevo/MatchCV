@@ -58,6 +58,7 @@ type Approval = {
 };
 type MailSandbox = {
   enabled: boolean; base_email: string; max_alias: number; sample_aliases: string[]; delivery_note: string;
+  allowed_emails?: string[];
 };
 type AuditLog = {
   id: string; application_id: string | null; action: string;
@@ -298,7 +299,6 @@ function RecruiterApp() {
     `${item.candidate.name} ${item.candidate.email}`.toLowerCase().includes(query.toLowerCase())), [tabbedApplications, query]);
   const current = selected ? dashboard.applications.find(item => item.id === selected.id) || selected : null;
   const latest = dashboard.applications[0];
-  const scoreClass = (score: number) => score >= 80 ? "score-high" : score >= 65 ? "score-mid" : "score-low";
   const chartScores = dashboard.applications.slice(0, 7).reverse().map(item => item.screening.final_score);
 
   const createJob = async (event: FormEvent<HTMLFormElement>) => {
@@ -464,6 +464,28 @@ function RecruiterApp() {
     });
   };
 
+  const resolveMany = async (items: Approval[], decision: "APPROVE" | "REJECT", note = "") => {
+    await runAction(`approval-bulk-${decision}`,
+      `Đang ${decision === "APPROVE" ? "phê duyệt" : "trả lại"} ${items.length} đề xuất`, async () => {
+        let done = 0; const failed: string[] = [];
+        for (const item of items) {
+          // Sequential on purpose: each resolve writes an audit row and may fan out email, and a
+          // burst of parallel writes against SQLite is how you get "database is locked".
+          try {
+            await request(`/api/approvals/${item.id}/resolve`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ decision, note: note.trim() || (decision === "APPROVE" ? "Recruiter phê duyệt hàng loạt" : "Recruiter trả lại hàng loạt") }),
+            });
+            done += 1;
+          } catch { failed.push(item.title); }
+        }
+        await loadDashboard();
+        notify(failed.length
+          ? `Xong ${done}/${items.length}. Lỗi: ${failed.slice(0, 2).join(", ")}${failed.length > 2 ? "…" : ""}`
+          : `Đã ${decision === "APPROVE" ? "phê duyệt" : "trả lại"} ${done} đề xuất`);
+      });
+  };
+
   const exportReport = async (job: Job) => {
     await runAction(`export-${job.id}`, "Đang xuất report", async () => {
       await download(`/api/jobs/${job.id}/shortlist-report`, `${job.title.toLowerCase().replace(/\s+/g, "-")}-shortlist.md`);
@@ -523,7 +545,10 @@ function RecruiterApp() {
         </section>}
 
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport} onJobChanged={loadDashboard}/>
-        : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
+        : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction}
+                                                  onResolve={resolveApproval} onResolveMany={resolveMany}
+                                                  resumeBusy={resumeBusy} onExplain={setExplained}
+                                                  onViewResume={openResumeFor} onReject={setRejecting}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
         : active === "Lịch làm việc" ? <AvailabilityView dashboard={dashboard}/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
@@ -1196,20 +1221,110 @@ function ClearDataView({ dashboard, onCleared }: { dashboard: Dashboard; onClear
   return <section className="panel clear-data-view"><div className="panel-head"><div><h2>Xoá toàn bộ dữ liệu tuyển dụng</h2><p>Giữ nguyên tài khoản, phân quyền, kết nối và cấu hình hệ thống.</p></div><span className="status rejected">DANGER ZONE</span></div><div className="clear-data-body"><h3>Sẽ xoá vĩnh viễn</h3><div className="clear-summary"><span><b>{dashboard.jobs.length}</b> việc làm</span><span><b>{dashboard.applications.length}</b> CV / ứng viên</span><span><b>{dashboard.interviews?.length || 0}</b> lịch phỏng vấn</span></div><p>Nhập chính xác <code>XOA TOAN BO</code> để xác nhận.</p><input value={confirmation} onChange={event => setConfirmation(event.target.value)} placeholder="XOA TOAN BO"/><button className="danger" disabled={busy || confirmation.trim().toUpperCase() !== "XOA TOAN BO"} onClick={() => void clear()}>{busy ? "Đang xoá..." : "Xoá toàn bộ dữ liệu"}</button>{message && <p className="operations-message">{message}</p>}</div></section>;
 }
 
-function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve }: {
+const scoreClass = (score: number) => score >= 80 ? "score-high" : score >= 65 ? "score-mid" : "score-low";
+
+const APPROVAL_LABELS: Record<Approval["type"], string> = {
+  CRITERIA: "Công việc", EVIDENCE: "Ứng viên", SHORTLIST: "Danh sách rút gọn", ESCALATION: "Ngoại lệ phỏng vấn",
+};
+
+/** The stored codes are English shorthand; a recruiter needs the number that triggered them. */
+function escalationReasons(payload: Record<string, unknown>): string[] {
+  const score = Number(payload.score);
+  const confidence = Math.round(Number(payload.confidence || 0) * 100);
+  const codes = Array.isArray(payload.reasons) ? (payload.reasons as string[]) : [];
+  const explain: Record<string, string> = {
+    LOW_CONFIDENCE: `Máy chưa chắc về kết quả chấm (độ chắc chắn ${confidence}%, dưới ngưỡng 65%)`,
+    BORDERLINE_SCORE: `Điểm ${score} nằm sát ranh giới đạt/không đạt (vùng 60–75)`,
+    SCORE_EVIDENCE_MISMATCH: "Điểm cao nhưng CV thiếu quá nửa kỹ năng bắt buộc — có thể là khớp nhầm",
+  };
+  return codes.map(code => explain[code] || code);
+}
+
+function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve, onResolveMany,
+                         resumeBusy, onExplain, onViewResume, onReject }: {
   approvals: Approval[]; dashboard: Dashboard; actionBusy: boolean; pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
+  onResolveMany: (items: Approval[], decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
+  resumeBusy: string;
+  onExplain: (application: Application) => void;
+  onViewResume: (application: Application) => void;
+  onReject: (application: Application) => void;
 }) {
-  const labels: Record<Approval["type"], string> = { CRITERIA: "Tiêu chí", EVIDENCE: "Evidence yếu", SHORTLIST: "Shortlist", ESCALATION: "Ngoại lệ phỏng vấn" };
+  const [filter, setFilter] = useState<"ALL" | Approval["type"]>("ALL");
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [bulkReject, setBulkReject] = useState(false);
+
+  const pending = approvals.filter(item => item.status === "PENDING");
+  const shown = filter === "ALL" ? approvals : approvals.filter(item => item.type === filter);
+  const selectable = shown.filter(item => item.status === "PENDING");
+  const chosen = selectable.filter(item => picked.has(item.id));
+  const allChosen = selectable.length > 0 && chosen.length === selectable.length;
+
+  const toggle = (id: string) => setPicked(current => {
+    const next = new Set(current);
+    if (!next.delete(id)) next.add(id);
+    return next;
+  });
+  const runBulk = async (decision: "APPROVE" | "REJECT", note = "") => {
+    const items = [...chosen];
+    setBulkReject(false); setPicked(new Set());
+    await onResolveMany(items, decision, note);
+  };
+
+  const tabs: ["ALL" | Approval["type"], string][] = [
+    ["ALL", "Tất cả"], ["CRITERIA", APPROVAL_LABELS.CRITERIA],
+    ["EVIDENCE", APPROVAL_LABELS.EVIDENCE], ["SHORTLIST", APPROVAL_LABELS.SHORTLIST],
+  ];
+
   return <section className="panel approval-view">
     <div className="panel-head">
-      <div><h2>Approval inbox</h2><p>{approvals.length} quyết định cần recruiter xử lý</p></div>
-      <span className="bounded-badge">Bounded agent</span>
+      <div>
+        <h2>Chờ bạn quyết định</h2>
+        <p>{pending.length
+          ? `${pending.length} đề xuất máy không tự quyết được, cần bạn duyệt hoặc trả lại`
+          : "Không còn đề xuất nào chờ bạn"}</p>
+      </div>
+      <span className="bounded-badge">Máy không tự quyết</span>
     </div>
-    {approvals.length ? approvals.map(item =>
-      <ApprovalCard key={item.id} approval={item} typeLabel={labels[item.type]} dashboard={dashboard}
-                    actionBusy={actionBusy} pendingAction={pendingAction} onResolve={onResolve}/>)
-      : <div className="empty-state">Inbox đã sạch. Agent chỉ chuyển tới đây các quyết định cần người.</div>}
+
+    <div className="candidate-tabs approval-tabs">
+      {tabs.map(([key, label]) => {
+        const count = (key === "ALL" ? approvals : approvals.filter(item => item.type === key))
+          .filter(item => item.status === "PENDING").length;
+        return <button key={key} className={filter === key ? "active" : ""}
+                       onClick={() => { setFilter(key); setPicked(new Set()); }}>
+          {label}<span>{count}</span></button>;
+      })}
+    </div>
+
+    {selectable.length > 0 && <div className="bulk-bar">
+      <label className="bulk-check">
+        <input type="checkbox" checked={allChosen} disabled={actionBusy}
+               onChange={() => setPicked(allChosen ? new Set() : new Set(selectable.map(item => item.id)))}/>
+        {allChosen ? "Bỏ chọn tất cả" : `Chọn tất cả ${selectable.length} mục`}
+      </label>
+      {chosen.length > 0 && <>
+        <span className="bulk-count">Đã chọn <b>{chosen.length}</b></span>
+        <button className="secondary compact" disabled={actionBusy} onClick={() => setBulkReject(true)}>
+          Trả lại {chosen.length} mục</button>
+        <button className="primary compact" disabled={actionBusy} onClick={() => void runBulk("APPROVE")}>
+          <Icon name="check"/>Duyệt {chosen.length} mục</button>
+      </>}
+    </div>}
+
+    {pendingAction?.key.startsWith("approval-bulk-") && <InlineProgress label={pendingAction.label}/>}
+
+    {shown.length ? shown.map(item =>
+      <ApprovalCard key={item.id} approval={item} typeLabel={APPROVAL_LABELS[item.type]} dashboard={dashboard}
+                    actionBusy={actionBusy} pendingAction={pendingAction} onResolve={onResolve}
+                    picked={picked.has(item.id)} onPick={() => toggle(item.id)}
+                    resumeBusy={resumeBusy} onExplain={onExplain}
+                    onViewResume={onViewResume} onReject={onReject}/>)
+      : <div className="empty-state">Không có đề xuất nào trong mục này.</div>}
+
+    {bulkReject && <RejectDialog title={`Trả lại ${chosen.length} đề xuất`} busy={actionBusy}
+                                 onCancel={() => setBulkReject(false)}
+                                 onConfirm={note => runBulk("REJECT", note)}/>}
   </section>;
 }
 
@@ -1249,10 +1364,15 @@ function RejectDialog({ title, busy, onCancel, onConfirm }: {
   </div>;
 }
 
-function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve }: {
+function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve,
+                       picked, onPick, resumeBusy, onExplain, onViewResume, onReject }: {
   approval: Approval; typeLabel: string; dashboard: Dashboard; actionBusy: boolean;
   pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
+  picked: boolean; onPick: () => void; resumeBusy: string;
+  onExplain: (application: Application) => void;
+  onViewResume: (application: Application) => void;
+  onReject: (application: Application) => void;
 }) {
   const [history, setHistory] = useState<AuditLog[] | null>(null);
   const [rejecting, setRejecting] = useState(false);
@@ -1278,16 +1398,51 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
   const criteria = (payload.criteria || {}) as { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number };
   const ranking = (payload.ranking || []) as { application_id: string; score: number; confidence?: number }[];
 
-  return <article className="approval-row approval-card">
-    <div className={`approval-type ${approval.type.toLowerCase()}`}>
-      <Icon name={approval.type === "SHORTLIST" ? "users" : approval.type === "CRITERIA" ? "briefcase" : "spark"}/>
-    </div>
+  const reasons = escalationReasons(payload as Record<string, unknown>);
+
+  return <article className={`approval-row approval-card${picked ? " approval-picked" : ""}`}>
+    {approval.status === "PENDING"
+      ? <label className="approval-pick" title="Chọn để xử lý hàng loạt">
+          <input type="checkbox" checked={picked} disabled={actionBusy} onChange={onPick}/>
+        </label>
+      : <div className={`approval-type ${approval.type.toLowerCase()}`}>
+          <Icon name={approval.type === "SHORTLIST" ? "users" : approval.type === "CRITERIA" ? "briefcase" : "spark"}/>
+        </div>}
     <div className="approval-main">
       <span className="eyebrow">{approval.type === "CRITERIA"
         ? (Number(payload.version) || 1) > 1 ? "Cập nhật công việc" : "Công việc mới"
         : typeLabel}</span>
-      <h3>{approval.title}</h3>
-      <p>{approval.summary}</p>
+      <h3>{candidate ? candidate.candidate.name : approval.title}</h3>
+      {reasons.length
+        ? <div className="approval-why">
+            <b>Vì sao cần bạn xem:</b>
+            <ul>{reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+          </div>
+        : <p>{approval.summary}</p>}
+
+      {candidate && <div className="approval-candidate">
+        <i className={`score-ring ${scoreClass(candidate.screening.final_score)}`}
+           style={{"--score": `${candidate.screening.final_score * 3.6}deg`} as React.CSSProperties}>
+          {Math.round(candidate.screening.final_score)}</i>
+        <div className="approval-candidate-meta">
+          <b>{candidate.screening.recommendation}</b>
+          <small>{candidate.candidate.email} · {candidate.screening.experience_years} năm kinh nghiệm</small>
+          <span className="approval-hits">
+            {candidate.screening.evidence.map(item =>
+              <i key={item.requirement} className={item.matched ? "met" : "unmet"}>
+                {item.matched ? "✓" : "✗"} {item.requirement}</i>)}
+          </span>
+        </div>
+        <div className="row-actions approval-row-actions">
+          <button className="why-button" disabled={!candidate.screening.evidence?.length}
+                  onClick={() => onExplain(candidate)}><Icon name="spark"/>Vì sao?</button>
+          <button className="why-button" disabled={resumeBusy === candidate.id}
+                  onClick={() => onViewResume(candidate)}>
+            <Icon name="file"/>{resumeBusy === candidate.id ? "Đang mở" : "Xem CV"}</button>
+          <button className="why-button reject" disabled={actionBusy || candidate.status === "REJECTED"}
+                  onClick={() => onReject(candidate)}><Icon name="ban"/>Từ chối</button>
+        </div>
+      </div>}
 
       <div className="approval-meta">
         <span>Người đề xuất: <b>{requester || "Hệ thống tự đề xuất"}</b></span>
@@ -1792,6 +1947,7 @@ function MailSandboxView() {
   const [baseEmail, setBaseEmail] = useState("vinhvp.khmtk36@gmail.com");
   const [maxAlias, setMaxAlias] = useState(100);
   const [aliasNumber, setAliasNumber] = useState(1);
+  const [newEmail, setNewEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const load = async () => {
@@ -1823,6 +1979,29 @@ function MailSandboxView() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "Không lưu được whitelist"); }
     finally { setBusy(false); }
   };
+  const addEmail = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true); setMessage("");
+    try {
+      setConfig(await request<MailSandbox>("/api/mail-sandbox/allowed-emails", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: newEmail }),
+      }));
+      setNewEmail(""); setMessage(`Đã cho phép gửi tới ${newEmail.trim().toLowerCase()}`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Không thêm được email"); }
+    finally { setBusy(false); }
+  };
+
+  const removeEmail = async (email: string) => {
+    setBusy(true); setMessage("");
+    try {
+      setConfig(await request<MailSandbox>(`/api/mail-sandbox/allowed-emails/${encodeURIComponent(email)}`,
+        { method: "DELETE" }));
+      setMessage(`Đã bỏ ${email} khỏi danh sách cho phép`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Không xoá được email"); }
+    finally { setBusy(false); }
+  };
+
   const sendTest = async () => {
     setBusy(true); setMessage("");
     try {
@@ -1842,7 +2021,26 @@ function MailSandboxView() {
       <div><h3>Gửi email thử</h3><label><span>Hậu tố + number</span><input type="number" min="1" max={maxAlias} value={aliasNumber} onChange={event => setAliasNumber(Number(event.target.value))}/></label><div className="alias-preview"><small>Email sẽ gửi tới</small><b>{preview}</b><span>Gmail nhận tại {baseEmail}; TalentFlow vẫn lưu địa chỉ alias phía trên.</span></div><button className="primary compact" type="button" disabled={busy || !config?.enabled} onClick={() => void sendTest()}>{busy ? "Đang xử lý..." : "Gửi email test"}</button></div></div>
     <div className="gmail-connect"><div><h3>Gmail gửi thật</h3><p>{google ? `Đã kết nối ${google.account_email || "Google"}` : "Kết nối tài khoản Gmail gửi qua OAuth. Mail Sandbox vẫn chặn mọi email ngoài whitelist."}</p></div><button className={google ? "secondary compact" : "primary compact"} type="button" disabled={busy || !config?.enabled} onClick={() => void connectGoogle()}>{google ? "Kết nối lại Gmail" : "Kết nối Gmail"}</button></div>
     {message && <p className="operations-message">{message}</p>}
-    <div className="alias-list"><h3>Alias mẫu trong whitelist</h3><div>{config?.sample_aliases.map(alias => <code key={alias}>{alias}</code>)}</div></div>
+    <div className="alias-list"><h3>Alias mẫu của email gốc</h3><div>{config?.sample_aliases.map(alias => <code key={alias}>{alias}</code>)}</div></div>
+
+    <div className="allow-list">
+      <h3>Email được phép nhận thư thật</h3>
+      <p className="allow-hint">Mỗi lần bạn mời một ứng viên phỏng vấn, email của họ được thêm vào đây,
+        nếu không thư mời sẽ bị chặn. Bạn cũng có thể tự thêm hoặc bỏ bớt.</p>
+      {config?.allowed_emails?.length
+        ? <ul>{config.allowed_emails.map(email => <li key={email}>
+            <code>{email}</code>
+            <button type="button" disabled={busy} title="Bỏ khỏi danh sách"
+                    onClick={() => void removeEmail(email)}>×</button>
+          </li>)}</ul>
+        : <p className="allow-empty">Chưa có email nào ngoài email gốc. Mời một ứng viên phỏng vấn
+          là email của họ xuất hiện ở đây.</p>}
+      <form className="allow-add" onSubmit={addEmail}>
+        <input type="email" required placeholder="them.email@vidu.com" value={newEmail}
+               disabled={busy} onChange={event => setNewEmail(event.target.value)}/>
+        <button className="secondary compact" type="submit" disabled={busy || !newEmail.trim()}>Thêm email</button>
+      </form>
+    </div>
   </section>;
 }
 

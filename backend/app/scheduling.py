@@ -165,17 +165,35 @@ def mail_sandbox_alias(base_email: str, alias_number: int) -> str:
     return f"{local}+{alias_number}@{domain}"
 
 
+def sandbox_allowlist(policy: TenantPolicy | None) -> list[str]:
+    values = list(getattr(policy, "mail_sandbox_allowed_emails", None) or []) if policy else []
+    return [str(value).strip().lower() for value in values if str(value).strip()]
+
+
 def mail_sandbox_recipient_allowed(policy: TenantPolicy | None, recipient: str) -> bool:
     """Validate without rewriting so the plus alias remains in stored records and provider payloads."""
     if not policy or not policy.mail_sandbox_enabled:
         return True
-    base = policy.mail_sandbox_base_email.strip().lower()
     candidate = recipient.strip().lower()
+    # An address cleared by hand, or added when the recruiter invited that candidate. Without this
+    # the sandbox only ever reaches one mailbox family, so inviting anyone else silently blocks.
+    if candidate in sandbox_allowlist(policy):
+        return True
+    base = policy.mail_sandbox_base_email.strip().lower()
     if not base or candidate == base:
         return candidate == base
     local, separator, domain = base.partition("@")
     match = re.fullmatch(rf"{re.escape(local)}\+(\d+)@{re.escape(domain)}", candidate)
     return bool(match and 1 <= int(match.group(1)) <= policy.mail_sandbox_max_alias)
+
+
+def allow_sandbox_recipient(policy: TenantPolicy | None, recipient: str) -> bool:
+    """Add one address to the allowlist. Returns whether the list actually changed."""
+    candidate = (recipient or "").strip().lower()
+    if not policy or "@" not in candidate or mail_sandbox_recipient_allowed(policy, candidate):
+        return False
+    policy.mail_sandbox_allowed_emails = [*sandbox_allowlist(policy), candidate]
+    return True
 
 
 def _aware(value: datetime | None) -> datetime | None:
