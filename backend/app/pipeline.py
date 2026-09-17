@@ -86,18 +86,36 @@ def _aliases(skill: str) -> tuple[str, ...]:
     return SKILL_ALIASES.get(skill.lower(), (skill.lower(),))
 
 
+def _snippet(text: str, at: int, length: int) -> str:
+    """The sentence around the hit, or a window when there is no sentence boundary nearby."""
+    start = max((text.rfind(mark, 0, at) for mark in (". ", "! ", "? ", " • ", " | ")), default=-1)
+    start = start + 2 if start >= 0 and at - start <= 240 else max(0, at - 90)
+    end = min(len(text), at + length + 150)
+    stop = min((pos for mark in (". ", "! ", "? ", " • ", " | ")
+                if (pos := text.find(mark, at + length)) != -1 and pos < end), default=end)
+    # Returned verbatim: the evals gate on evidence being a literal span of the CV, so it stays
+    # quotable rather than decorated with ellipses.
+    return text[start:stop].strip()
+
+
 def analyze_evidence(cv_text: str, requirements: list[str]) -> list[dict]:
-    lines = [line.strip() for line in cv_text.splitlines() if line.strip()]
-    lowered = [line.lower() for line in lines]
+    # Searched as one line: a PDF decides its own line breaks, and a requirement written as two
+    # words ("REST API") could never be found while each word sat on a line of its own.
+    flat = re.sub(r"\s+", " ", cv_text).strip()
+    lowered = flat.lower()
     evidence: list[Evidence] = []
     for requirement in requirements:
-        aliases = _aliases(requirement)
-        hit = next((lines[i] for i, line in enumerate(lowered) if any(a in line for a in aliases)), None)
+        found: tuple[int, int] | None = None
+        for alias in _aliases(requirement):
+            at = lowered.find(alias.lower())
+            if at != -1 and (found is None or at < found[0]):
+                found = (at, len(alias))
         evidence.append(Evidence(
             requirement=requirement,
-            matched=hit is not None,
-            evidence=hit or "Không tìm thấy bằng chứng phù hợp trong CV.",
-            confidence=0.94 if hit else 0.35,
+            matched=found is not None,
+            # A bare "Docker," proves nothing to whoever reads the card; quote enough to judge.
+            evidence=_snippet(flat, *found) if found else "Không tìm thấy bằng chứng phù hợp trong CV.",
+            confidence=0.94 if found else 0.35,
         ))
     return [asdict(item) for item in evidence]
 
