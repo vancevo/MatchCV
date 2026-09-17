@@ -104,6 +104,14 @@ class Application(Base):
     screening: Mapped[dict] = mapped_column(JSON, default=dict)
     pipeline: Mapped[list] = mapped_column(JSON, default=list)
     review: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # When the card last changed hands, and who moved it — a recruiter reading the list needs to
+    # know whether a decision is from this morning or from three weeks ago.
+    status_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status_changed_by: Mapped[str] = mapped_column(String(320), default="")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(320), default="")
+    # Kept so restore puts the candidate back where they were, not into a generic bucket.
+    previous_status: Mapped[str] = mapped_column(String(40), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -215,8 +223,24 @@ class InterviewPolicy(Base):
     reminder_minutes: Mapped[list] = mapped_column(JSON, default=lambda: [1440, 60])
     max_reschedules: Mapped[int] = mapped_column(Integer, default=2)
     feedback_due_hours: Mapped[int] = mapped_column(Integer, default=24)
+    timezone_name: Mapped[str] = mapped_column(String(80), default="Asia/Ho_Chi_Minh")
+    working_days: Mapped[list] = mapped_column(JSON, default=lambda: [0, 1, 2, 3, 4])
+    working_start_hour: Mapped[int] = mapped_column(Integer, default=9)
+    working_end_hour: Mapped[int] = mapped_column(Integer, default=17)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BusyBlock(Base):
+    """A one-off period nobody is available, such as leave or an external meeting."""
+
+    __tablename__ = "busy_blocks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    note: Mapped[str] = mapped_column(String(240), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class InterviewScorecard(Base):
@@ -254,6 +278,8 @@ class AuditLog(Base):
     owner_id: Mapped[str] = mapped_column(String(128), index=True)
     application_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(80))
+    actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    actor_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -378,6 +404,8 @@ class ApprovalRequest(Base):
     resource_id: Mapped[str] = mapped_column(String(36), index=True)
     title: Mapped[str] = mapped_column(String(240))
     summary: Mapped[str] = mapped_column(Text)
+    requested_by_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    requested_by_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     resolution: Mapped[dict] = mapped_column(JSON, default=dict)
     dedupe_key: Mapped[str] = mapped_column(String(255))
@@ -420,6 +448,8 @@ class TenantPolicy(Base):
     mail_sandbox_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     mail_sandbox_base_email: Mapped[str] = mapped_column(String(320), default="")
     mail_sandbox_max_alias: Mapped[int] = mapped_column(Integer, default=100)
+    # Addresses cleared for real delivery beyond the base mailbox and its plus aliases.
+    mail_sandbox_allowed_emails: Mapped[list] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

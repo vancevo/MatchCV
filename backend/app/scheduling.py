@@ -7,9 +7,11 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import jwt
@@ -21,14 +23,126 @@ from .database import session_scope
 from .models import (
     Application,
     AuditLog,
+    BusyBlock,
     IntegrationConnection,
     Interview,
+    InterviewPolicy,
     Job,
     OutboxEvent,
     EmailTemplate,
     SchedulingInvitation,
     TenantPolicy,
 )
+
+
+DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
+VN_WEEKDAYS = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
+
+
+def local_datetime_label(value: datetime, timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    """A candidate reads '14:00 Thứ Tư, 17/09/2026', not '2026-09-17T07:00:00+00:00'."""
+    try:
+        zone = ZoneInfo(timezone_name or DEFAULT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo(DEFAULT_TIMEZONE)
+    local = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(zone)
+    return f"{local:%H:%M} {VN_WEEKDAYS[local.weekday()]}, {local:%d/%m/%Y}"
+
+
+# Bump this whenever the wording below changes. render_template then replaces any tenant row that
+# still carries a superseded built-in body, while leaving copy someone wrote through
+# POST /api/email-templates alone.
+BUILTIN_TEMPLATE_VERSION = 2
+
+BUILTIN_TEMPLATES: dict[str, dict[str, str]] = {
+    "scheduling_invitation": {
+        "subject": "Thư mời phỏng vấn vị trí {job_title}",
+        "body": (
+            "Kính gửi {candidate_name},\n\n"
+            "Cảm ơn bạn đã quan tâm và ứng tuyển vị trí {job_title}.\n\n"
+            "Sau khi xem xét hồ sơ, chúng tôi trân trọng mời bạn tham gia buổi phỏng vấn "
+            "để hai bên có cơ hội trao đổi kỹ hơn về công việc cũng như định hướng của bạn.\n\n"
+            "THÔNG TIN BUỔI PHỎNG VẤN\n"
+            "- Vị trí:    {job_title}\n"
+            "- Hình thức: Phỏng vấn trực tuyến\n"
+            "- Thời lượng: {duration_minutes} phút\n\n"
+            "Bạn vui lòng chọn khung giờ thuận tiện nhất tại đường dẫn sau:\n"
+            "{public_url}\n\n"
+            "Đường dẫn có hiệu lực đến {expires_at}. Khung giờ bạn chọn sẽ được giữ riêng, "
+            "và chúng tôi sẽ gửi email xác nhận kèm đường dẫn phòng họp ngay sau đó.\n\n"
+            "Nếu không có khung giờ nào phù hợp hoặc bạn cần hỗ trợ thêm, "
+            "bạn chỉ cần phản hồi lại email này.\n\n"
+            "Trân trọng,\n"
+            "Bộ phận Tuyển dụng"
+        ),
+    },
+    "interview_confirmation": {
+        "subject": "Xác nhận lịch phỏng vấn vị trí {job_title}",
+        "body": (
+            "Kính gửi {candidate_name},\n\n"
+            "Lịch phỏng vấn của bạn đã được xác nhận. Bạn vui lòng lưu lại thông tin dưới đây:\n\n"
+            "- Vị trí:    {job_title}\n"
+            "- Thời gian: {start_at}\n"
+            "- Hình thức: Phỏng vấn trực tuyến\n"
+            "- Phòng họp: {meeting_url}\n\n"
+            "Bạn nên vào phòng họp trước giờ hẹn khoảng 5 phút và kiểm tra trước đường truyền, "
+            "micro cùng camera để buổi trao đổi diễn ra thuận lợi.\n\n"
+            "Trường hợp cần dời sang khung giờ khác, bạn có thể tự chọn lại tại đây:\n"
+            "{reschedule_url}\n\n"
+            "Chúng tôi rất mong được trò chuyện cùng bạn.\n\n"
+            "Trân trọng,\n"
+            "Bộ phận Tuyển dụng"
+        ),
+    },
+    "interview_reminder": {
+        "subject": "Nhắc lịch phỏng vấn vị trí {job_title}",
+        "body": (
+            "Kính gửi {candidate_name},\n\n"
+            "Chúng tôi xin nhắc bạn về buổi phỏng vấn sắp diễn ra:\n\n"
+            "- Vị trí:    {job_title}\n"
+            "- Thời gian: {start_at}\n"
+            "- Phòng họp: {meeting_url}\n\n"
+            "Bạn vui lòng tham gia đúng giờ. Nếu có việc đột xuất khiến bạn không thể tham dự, "
+            "rất mong bạn phản hồi sớm để chúng tôi kịp sắp xếp lại lịch.\n\n"
+            "Trân trọng,\n"
+            "Bộ phận Tuyển dụng"
+        ),
+    },
+    "scorecard_reminder": {
+        "subject": "Nhắc nộp phiếu đánh giá ứng viên {candidate_name}",
+        "body": (
+            "Xin chào,\n\n"
+            "Buổi phỏng vấn dưới đây đã kết thúc nhưng phiếu đánh giá chưa được nộp:\n\n"
+            "- Ứng viên: {candidate_name}\n"
+            "- Vị trí:   {job_title}\n"
+            "- Hạn nộp:  {deadline}\n\n"
+            "Bạn vui lòng hoàn tất phiếu đánh giá kèm dẫn chứng cụ thể trước hạn, "
+            "để nhóm tuyển dụng có đủ cơ sở đưa ra quyết định.\n\n"
+            "Trân trọng,\n"
+            "TalentFlow"
+        ),
+    },
+}
+
+# Version 1 copy. A row still holding one of these was auto-seeded, never hand-written, so it is
+# safe to supersede; anything else is treated as a deliberate customisation.
+SUPERSEDED_BUILTIN_BODIES: dict[str, set[str]] = {
+    "scheduling_invitation": {
+        "Chào {candidate_name},\n\nBạn đã vào danh sách phỏng vấn. Vui lòng chọn lịch tại: {public_url}\n"
+        "Liên kết hết hạn lúc {expires_at}. Lịch bạn chọn sẽ được giữ riêng và chờ HR xác nhận.",
+    },
+    "interview_confirmation": {
+        "Chào {candidate_name},\n\nLịch phỏng vấn của bạn: {start_at} UTC.\n"
+        "Tham gia: {meeting_url}\nĐổi lịch: {reschedule_url}",
+    },
+    "interview_reminder": {
+        "Chào {candidate_name},\n\nLịch phỏng vấn bắt đầu lúc {start_at}.\nTham gia: {meeting_url}",
+    },
+    "scorecard_reminder": {
+        "Scorecard cho {candidate_name} / {job_title} chưa được nộp. "
+        "Vui lòng bổ sung evidence trước {deadline}.",
+    },
+}
 
 
 GOOGLE_SCOPES = (
@@ -51,17 +165,57 @@ def mail_sandbox_alias(base_email: str, alias_number: int) -> str:
     return f"{local}+{alias_number}@{domain}"
 
 
+def sandbox_allowlist_entries(policy: TenantPolicy | None) -> list[dict]:
+    """Each cleared address with where it came from, so the list can be audited by eye.
+
+    Older rows were plain strings; they are read as manual entries rather than migrated, since
+    the column is JSON and the shape can simply widen.
+    """
+    entries: list[dict] = []
+    for value in (getattr(policy, "mail_sandbox_allowed_emails", None) or []) if policy else []:
+        if isinstance(value, dict):
+            email = str(value.get("email", "")).strip().lower()
+            if email:
+                entries.append({"email": email, "source": value.get("source") or "MANUAL",
+                                "candidate": value.get("candidate") or "", "added_at": value.get("added_at") or ""})
+        elif str(value).strip():
+            entries.append({"email": str(value).strip().lower(), "source": "MANUAL",
+                            "candidate": "", "added_at": ""})
+    return entries
+
+
+def sandbox_allowlist(policy: TenantPolicy | None) -> list[str]:
+    return [entry["email"] for entry in sandbox_allowlist_entries(policy)]
+
+
 def mail_sandbox_recipient_allowed(policy: TenantPolicy | None, recipient: str) -> bool:
     """Validate without rewriting so the plus alias remains in stored records and provider payloads."""
     if not policy or not policy.mail_sandbox_enabled:
         return True
-    base = policy.mail_sandbox_base_email.strip().lower()
     candidate = recipient.strip().lower()
+    # An address cleared by hand, or added when the recruiter invited that candidate. Without this
+    # the sandbox only ever reaches one mailbox family, so inviting anyone else silently blocks.
+    if candidate in sandbox_allowlist(policy):
+        return True
+    base = policy.mail_sandbox_base_email.strip().lower()
     if not base or candidate == base:
         return candidate == base
     local, separator, domain = base.partition("@")
     match = re.fullmatch(rf"{re.escape(local)}\+(\d+)@{re.escape(domain)}", candidate)
     return bool(match and 1 <= int(match.group(1)) <= policy.mail_sandbox_max_alias)
+
+
+def allow_sandbox_recipient(policy: TenantPolicy | None, recipient: str,
+                            source: str = "MANUAL", candidate_name: str = "") -> bool:
+    """Add one address to the allowlist. Returns whether the list actually changed."""
+    email = (recipient or "").strip().lower()
+    if not policy or "@" not in email or mail_sandbox_recipient_allowed(policy, email):
+        return False
+    policy.mail_sandbox_allowed_emails = [*sandbox_allowlist_entries(policy), {
+        "email": email, "source": source, "candidate": candidate_name,
+        "added_at": utcnow().isoformat().replace("+00:00", "Z"),
+    }]
+    return True
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -270,19 +424,56 @@ def provider_busy(db, owner_id: str, start: datetime, end: datetime) -> list[tup
     return [(datetime.fromisoformat(x["start"]["dateTime"]).replace(tzinfo=timezone.utc), datetime.fromisoformat(x["end"]["dateTime"]).replace(tzinfo=timezone.utc)) for x in items]
 
 
-def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 7) -> list[datetime]:
+def availability_policy(db, owner_id: str) -> InterviewPolicy:
+    policy = db.scalar(select(InterviewPolicy).where(InterviewPolicy.owner_id == owner_id))
+    if not policy:
+        policy = InterviewPolicy(owner_id=owner_id)
+        db.add(policy)
+        db.flush()
+    return policy
+
+
+def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 21) -> list[datetime]:
+    policy = availability_policy(db, owner_id)
+    try:
+        local_zone = ZoneInfo(policy.timezone_name or "Asia/Ho_Chi_Minh")
+    except ZoneInfoNotFoundError:
+        local_zone = ZoneInfo("Asia/Ho_Chi_Minh")
+    working_days = {int(value) for value in (policy.working_days or [])}
+    open_hour, close_hour = int(policy.working_start_hour), int(policy.working_end_hour)
+
     start = utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     end = start + timedelta(days=days)
-    busy = provider_busy(db, owner_id, start, end)
+    try:
+        busy = provider_busy(db, owner_id, start, end)
+    except (httpx.HTTPError, RuntimeError, ValueError, KeyError) as error:
+        # The calendar provider being unreachable used to raise straight out of the public
+        # scheduling route: the candidate got an opaque 500 and could not book at all. Falling
+        # back to the interviews we already hold keeps the invitation usable; the audit row is
+        # what tells the recruiter the free/busy read was skipped.
+        busy = []
+        db.add(AuditLog(owner_id=owner_id, application_id=None, action="PROVIDER_FREEBUSY_UNAVAILABLE",
+                        metadata_json={"error": str(error)[:500]}))
     busy.extend(((_aware(i.start_at) or start), (_aware(i.end_at) or end)) for i in db.scalars(
         select(Interview).where(Interview.owner_id == owner_id, Interview.status != "CANCELLED", Interview.start_at < end, Interview.end_at > start)
     ))
+    busy.extend(((_aware(b.start_at) or start), (_aware(b.end_at) or end)) for b in db.scalars(
+        select(BusyBlock).where(BusyBlock.owner_id == owner_id, BusyBlock.start_at < end, BusyBlock.end_at > start)
+    ))
+
     slots: list[datetime] = []
     cursor = start
     duration = timedelta(minutes=duration_minutes)
-    while cursor + duration <= end and len(slots) < 20:
-        local = cursor.astimezone(timezone(timedelta(hours=7)))
-        if local.weekday() < 5 and 9 <= local.hour < 17 and not any(cursor < b_end and cursor + duration > b_start for b_start, b_end in busy):
+    while cursor + duration <= end and len(slots) < 120:
+        local = cursor.astimezone(local_zone)
+        local_end = (cursor + duration).astimezone(local_zone)
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        working_start = day_start + timedelta(hours=open_hour)
+        working_end = day_start + timedelta(hours=close_hour)
+        if (local.weekday() in working_days
+                and working_start <= local
+                and local_end <= working_end
+                and not any(cursor < b_end and cursor + duration > b_start for b_start, b_end in busy)):
             slots.append(cursor)
         cursor += timedelta(hours=1)
     return slots
@@ -300,17 +491,28 @@ def add_outbox(db, *, owner_id: str, aggregate_type: str, aggregate_id: str, ope
     return value
 
 
-def render_template(db, owner_id: str, key: str, default_subject: str, default_body: str,
-                    context: dict[str, str]) -> dict:
+def render_template(db, owner_id: str, key: str, context: dict[str, str]) -> dict:
+    builtin = BUILTIN_TEMPLATES[key]
     template = db.scalar(select(EmailTemplate).where(
         EmailTemplate.owner_id == owner_id, EmailTemplate.key == key, EmailTemplate.active.is_(True),
     ).order_by(EmailTemplate.version.desc()))
+    if (template and template.version < BUILTIN_TEMPLATE_VERSION
+            and (template.body_text or "").strip() in SUPERSEDED_BUILTIN_BODIES.get(key, set())):
+        template.active = False
+        template = None
     if not template:
-        template = EmailTemplate(owner_id=owner_id, key=key, version=1, subject=default_subject,
-                                 body_text=default_body, active=True)
+        template = EmailTemplate(owner_id=owner_id, key=key, version=BUILTIN_TEMPLATE_VERSION,
+                                 subject=builtin["subject"], body_text=builtin["body"], active=True)
         db.add(template); db.flush()
+    # A template written before a new field existed must not crash the send.
+    safe = _TemplateContext(context)
     return {"template_id": template.id, "template_key": key, "template_version": template.version,
-            "subject": template.subject.format_map(context), "body": template.body_text.format_map(context)}
+            "subject": template.subject.format_map(safe), "body": template.body_text.format_map(safe)}
+
+
+class _TemplateContext(dict):
+    def __missing__(self, key: str) -> str:
+        return ""
 
 
 def _create_event(connection: IntegrationConnection | None, token: str, interview: Interview,
@@ -459,10 +661,10 @@ def process_outbox_event(event_id: str) -> None:
                 )
                 db.add(reschedule_invitation)
                 rendered = render_template(
-                    db, event.owner_id, "interview_confirmation", "Xác nhận lịch phỏng vấn — {job_title}",
-                    "Chào {candidate_name},\n\nLịch phỏng vấn của bạn: {start_at} UTC.\nTham gia: {meeting_url}\nĐổi lịch: {reschedule_url}",
+                    db, event.owner_id, "interview_confirmation",
                     {"job_title": job.title, "candidate_name": application.candidate_name,
-                     "start_at": interview.start_at.isoformat(), "meeting_url": meeting_url,
+                     "start_at": local_datetime_label(interview.start_at, interview.timezone_name),
+                     "meeting_url": meeting_url or "(sẽ gửi trước buổi phỏng vấn)",
                      "reschedule_url": f"{get_settings().public_app_url}/?schedule={reschedule_token}"},
                 )
                 child = add_outbox(db, owner_id=event.owner_id, aggregate_type="interview", aggregate_id=interview.id,

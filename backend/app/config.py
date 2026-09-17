@@ -44,6 +44,7 @@ class Settings:
     cors_origins: tuple[str, ...]
     supabase_url: str
     supabase_jwt_secret: str
+    supabase_service_role_key: str
     openrouter_api_key: str
     openrouter_model: str
     openrouter_site_url: str
@@ -55,6 +56,10 @@ class Settings:
     talentflow_max_input_tokens: int
     talentflow_max_new_tokens: int
     max_upload_mb: int
+    resume_storage_dir: str
+    resume_storage_backend: str
+    resume_storage_bucket: str
+    resume_signed_url_ttl_seconds: int
     redis_url: str
     queue_name: str
     queue_eager: bool
@@ -90,6 +95,17 @@ class Settings:
         if auth_required and not (supabase_url or jwt_secret):
             raise RuntimeError("AUTH_REQUIRED=true requires SUPABASE_URL or SUPABASE_JWT_SECRET")
 
+        # Deployment opts into Supabase explicitly; tests and local development remain
+        # self-contained unless their environment asks for remote storage.
+        resume_storage_backend = os.getenv("RESUME_STORAGE_BACKEND", "local").strip().lower()
+        if resume_storage_backend not in {"local", "supabase"}:
+            raise RuntimeError("RESUME_STORAGE_BACKEND must be local or supabase")
+        service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        if resume_storage_backend == "supabase" and not (supabase_url and service_role_key):
+            raise RuntimeError(
+                "Supabase resume storage requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+            )
+
         redis_url = os.getenv("REDIS_URL", "").strip()
         queue_eager = _boolean("QUEUE_EAGER", not bool(redis_url))
         if not queue_eager and not redis_url:
@@ -119,6 +135,7 @@ class Settings:
             cors_origins=origins,
             supabase_url=supabase_url,
             supabase_jwt_secret=jwt_secret,
+            supabase_service_role_key=service_role_key,
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
             openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite").strip(),
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
@@ -130,6 +147,10 @@ class Settings:
             talentflow_max_input_tokens=_positive_int("TALENTFLOW_MAX_INPUT_TOKENS", 8192, 32768),
             talentflow_max_new_tokens=_positive_int("TALENTFLOW_MAX_NEW_TOKENS", 2048, 8192),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
+            resume_storage_dir=os.getenv("RESUME_STORAGE_DIR", "uploads").strip() or "uploads",
+            resume_storage_backend=resume_storage_backend,
+            resume_storage_bucket=os.getenv("RESUME_STORAGE_BUCKET", "resumes").strip() or "resumes",
+            resume_signed_url_ttl_seconds=_positive_int("RESUME_SIGNED_URL_TTL_SECONDS", 300, 3600),
             redis_url=redis_url,
             queue_name=os.getenv("QUEUE_NAME", "talentflow-screening").strip() or "talentflow-screening",
             queue_eager=queue_eager,
