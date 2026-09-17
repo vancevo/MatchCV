@@ -118,7 +118,6 @@ def extract_requirements(description: str) -> dict:
     if "Docker" in preferred and "Golang" in preferred and "golang" in text and "docker là lợi thế" in text:
         preferred = [skill for skill in preferred if skill != "Golang"]
     required = [s for s in skills if s not in preferred]
-    required = [s for s in skills if s not in preferred]
     # "Ít nhất 2 năm", "tối thiểu 2 năm", "2+ năm", "2-4 năm" all state the same floor.
     years = (re.search(r"(?:có|ít nhất|tối thiểu|minimum|min\.?|từ)\s*(\d+)\s*(?:\+)?\s*(?:năm|years?)", text)
              or re.search(r"(\d+)\s*\+\s*(?:năm|years?)", text)

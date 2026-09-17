@@ -55,6 +55,17 @@ def test_find_skill_respects_token_boundaries():
     assert find_skill("kỹ năng debugging tốt", "Golang") is None
 
 
+def test_aliases_do_not_create_duplicate_or_wrong_criteria():
+    assert extract_requirements("Yêu cầu GraphQL API")["required_skills"] == ["GraphQL"]
+    assert extract_requirements("Yêu cầu Tailwind")["required_skills"] == ["Tailwind"]
+
+
+def test_preferred_skill_can_be_written_as_an_alias():
+    result = extract_requirements("Python bắt buộc. Ưu tiên JS")
+    assert result["required_skills"] == ["Python"]
+    assert result["preferred_skills"] == ["JavaScript"]
+
+
 def test_richer_criteria_separate_candidates_that_used_to_tie():
     strong = "React TypeScript JavaScript HTML CSS Redux Tailwind Jest Git responsive design"
     weak = "React JavaScript CSS Git"
