@@ -138,7 +138,17 @@ def screen_candidate(cv_text: str, requirements: dict) -> dict:
     tokens = set(re.findall(r"[a-zA-Z][a-zA-Z+#.]{1,}", cv_text.lower()))
     semantic_hits = sum(any(alias in cv_text.lower() for alias in _aliases(skill)) for skill in required)
     semantic_score = min(100, 35 + semantic_hits * 65 / max(len(required), 1) + min(len(tokens), 80) / 8)
-    final = round(required_score * .40 + experience_score * .25 + semantic_score * .20 + preferred_score * .15, 1)
+
+    # A component with nothing to judge used to award full marks: a job that states no minimum
+    # experience gave every candidate 25 points, and one with no preferred skills another 15. That
+    # is 40% of the score identical for everyone, which is how ten candidates ended up sharing two
+    # values. Drop what was not assessed and renormalise, so the score only reflects what was.
+    parts = [(required_score, .40), (semantic_score, .20)]
+    if minimum > 0:
+        parts.append((experience_score, .25))
+    if preferred:
+        parts.append((preferred_score, .15))
+    final = round(sum(value * weight for value, weight in parts) / sum(w for _, w in parts), 1)
     recommendation = "Strong Match" if final >= 80 else "Potential Match" if final >= 65 else "Needs Review"
     return {
         "rule_score": round(required_score, 1),
