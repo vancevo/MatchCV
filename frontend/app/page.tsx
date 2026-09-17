@@ -22,6 +22,8 @@ type InterviewKit = {
 };
 type Application = {
   id: string; job_id: string; status: string; resume_filename?: string;
+  status_changed_at?: string | null; status_changed_by?: string;
+  deleted_at?: string | null; deleted_by?: string; created_at?: string | null;
   candidate: { name: string; email: string };
   screening: {
     final_score: number; raw_score?: number; confidence?: number; recommendation: string;
@@ -59,6 +61,7 @@ type Approval = {
 type MailSandbox = {
   enabled: boolean; base_email: string; max_alias: number; sample_aliases: string[]; delivery_note: string;
   allowed_emails?: string[];
+  allowed_entries?: { email: string; source: string; candidate: string; added_at: string }[];
 };
 type AuditLog = {
   id: string; application_id: string | null; action: string;
@@ -87,6 +90,8 @@ function Icon({ name }: { name: string }) {
     clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
     file: <><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></>,
     ban: <><circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/></>,
+    trash: <><path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13M9 7V4h6v3"/></>,
+    undo: <><path d="M4 10h10a5 5 0 0 1 0 10h-3"/><path d="m4 10 4-4M4 10l4 4"/></>,
     arrow: <path d="m9 18 6-6-6-6"/>, check: <path d="m5 12 4 4L19 6"/>, plus: <path d="M12 5v14M5 12h14"/>,
   };
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -130,8 +135,16 @@ const statusLabel = (status: string) => ({
   ARCHIVED: "Lưu trữ",
   INTERVIEW_PENDING: "Chờ đặt lịch",
   INTERVIEW_SCHEDULED: "Đã đặt lịch",
+  DELETED: "Đã xoá",
 } as Record<string, string>)[status] || status;
-const statusTone = (status: string) => status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
+const statusTone = (status: string) => status === "DELETED" ? "rejected" : status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
+const agoLabel = (value: string) => {
+  const minutes = Math.round((Date.now() - new Date(value).getTime()) / 60000);
+  if (minutes < 1) return "vừa xong";
+  if (minutes < 60) return `${minutes} phút trước`;
+  if (minutes < 1440) return `${Math.round(minutes / 60)} giờ trước`;
+  return `${Math.round(minutes / 1440)} ngày trước`;
+};
 const dateLabel = (value: string) => new Intl.DateTimeFormat("vi-VN", { weekday: "short", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
 const fullDateLabel = (value: string) => new Intl.DateTimeFormat("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
 
@@ -293,7 +306,9 @@ function RecruiterApp() {
     if (candidateTab === "rejected") return item.status === "REJECTED";
     if (candidateTab === "interview") return item.status.startsWith("INTERVIEW");
     if (candidateTab === "archived") return item.status === "ARCHIVED";
-    return true;
+    if (candidateTab === "deleted") return item.status === "DELETED";
+    // Everything except what the recruiter cleared out; deleted has its own tab.
+    return item.status !== "DELETED";
   }), [dashboard.applications, candidateTab]);
   const filtered = useMemo(() => tabbedApplications.filter(item =>
     `${item.candidate.name} ${item.candidate.email}`.toLowerCase().includes(query.toLowerCase())), [tabbedApplications, query]);
@@ -464,6 +479,23 @@ function RecruiterApp() {
     });
   };
 
+  const softDelete = async (item: Application) => {
+    await runAction(`delete-${item.id}`, `Đang xoá ${item.candidate.name}`, async () => {
+      await request(`/api/applications/${item.id}/delete`, { method: "POST" });
+      if (selected?.id === item.id) setSelected(null);
+      await loadDashboard();
+      notify(`Đã chuyển ${item.candidate.name} vào mục đã xoá`);
+    });
+  };
+
+  const restore = async (item: Application) => {
+    await runAction(`restore-${item.id}`, `Đang khôi phục ${item.candidate.name}`, async () => {
+      await request(`/api/applications/${item.id}/restore`, { method: "POST" });
+      await loadDashboard();
+      notify(`Đã khôi phục ${item.candidate.name}`);
+    });
+  };
+
   const resolveMany = async (items: Approval[], decision: "APPROVE" | "REJECT", note = "") => {
     await runAction(`approval-bulk-${decision}`,
       `Đang ${decision === "APPROVE" ? "phê duyệt" : "trả lại"} ${items.length} đề xuất`, async () => {
@@ -557,19 +589,27 @@ function RecruiterApp() {
         : <><div className="dashboard-grid">
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
             {active === "Ứng viên" && <div className="candidate-tabs">{[
-              ["all", "Tất cả", dashboard.applications.length],
+              ["all", "Tất cả", dashboard.applications.filter(item => item.status !== "DELETED").length],
               ["waiting", "Chờ duyệt", dashboard.applications.filter(item => item.status === "WAITING_REVIEW").length],
               ["reviewed", "Xem xét", dashboard.applications.filter(item => item.status === "REVIEWED").length],
               ["interview", "Phỏng vấn", dashboard.applications.filter(item => item.status.startsWith("INTERVIEW")).length],
               ["rejected", "Từ chối", dashboard.applications.filter(item => item.status === "REJECTED").length],
               ["archived", "Lưu trữ", dashboard.applications.filter(item => item.status === "ARCHIVED").length],
+              ["deleted", "Đã xoá", dashboard.applications.filter(item => item.status === "DELETED").length],
             ].map(([key, label, count]) => <button key={key} className={candidateTab === key ? "active" : ""} onClick={() => setCandidateTab(String(key))}>{label}<span>{count}</span></button>)}</div>}
             <div className="table-head"><span>ỨNG VIÊN</span><span>ĐỘ PHÙ HỢP</span><span>TRẠNG THÁI</span><span/></div><div className="candidate-list">
               {filtered.map((item, index) => <div className="candidate-row" key={item.id}>
                 <button className="candidate-open" onClick={() => setSelected(item)}>
                   <span className="person"><i className={`avatar ${["violet","blue","orange"][index%3]}`}>{initials(item.candidate.name)}</i><span><b>{item.candidate.name}</b><small>{item.candidate.email}</small></span></span>
                   <span className="match"><i className={`score-ring ${scoreClass(item.screening.final_score)}`} style={{"--score": `${item.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(item.screening.final_score)}</i><span><b>{item.screening.recommendation}</b><small>{item.screening.final_score}% match</small></span></span>
-                  <span><i className={`status ${statusTone(item.status)}`}>{statusLabel(item.status)}</i></span>
+                  <span className="status-cell">
+                    <i className={`status ${statusTone(item.status)}`}>{statusLabel(item.status)}</i>
+                    {item.status_changed_at && <small className="status-when"
+                      title={`${fullDateLabel(item.status_changed_at)}${item.status_changed_by ? ` · ${item.status_changed_by}` : ""}`}>
+                      {agoLabel(item.status_changed_at)}
+                      {item.status_changed_by ? ` · ${item.status_changed_by.split("@")[0]}` : ""}
+                    </small>}
+                  </span>
                 </button>
                 <div className="row-actions">
                   <button className="why-button" disabled={!item.screening.evidence?.length}
@@ -578,9 +618,18 @@ function RecruiterApp() {
                   <button className="why-button" disabled={resumeBusy === item.id}
                           title="Mở toàn bộ CV ứng viên đã nộp"
                           onClick={() => void openResumeFor(item)}><Icon name="file"/>{resumeBusy === item.id ? "Đang mở" : "Xem CV"}</button>
-                  <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
-                          title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
-                          onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
+                  {item.status === "DELETED"
+                    ? <button className="why-button restore" disabled={actionBusy}
+                              title="Đưa hồ sơ trở lại danh sách"
+                              onClick={() => void restore(item)}><Icon name="undo"/>Khôi phục</button>
+                    : <>
+                        <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
+                                title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
+                                onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
+                        <button className="why-button delete" disabled={actionBusy}
+                                title="Chuyển vào mục đã xoá, khôi phục lại được"
+                                onClick={() => void softDelete(item)}><Icon name="trash"/>Xoá</button>
+                      </>}
                 </div>
               </div>)}
               {!filtered.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp.</div>}
@@ -2027,14 +2076,21 @@ function MailSandboxView() {
       <h3>Email được phép nhận thư thật</h3>
       <p className="allow-hint">Mỗi lần bạn mời một ứng viên phỏng vấn, email của họ được thêm vào đây,
         nếu không thư mời sẽ bị chặn. Bạn cũng có thể tự thêm hoặc bỏ bớt.</p>
-      {config?.allowed_emails?.length
-        ? <ul>{config.allowed_emails.map(email => <li key={email}>
-            <code>{email}</code>
-            <button type="button" disabled={busy} title="Bỏ khỏi danh sách"
-                    onClick={() => void removeEmail(email)}>×</button>
-          </li>)}</ul>
+      {config?.allowed_entries?.length
+        ? <table className="allow-table">
+            <thead><tr><th>Email</th><th>Nguồn</th><th>Thêm lúc</th><th/></tr></thead>
+            <tbody>{config.allowed_entries.map(entry => <tr key={entry.email}>
+              <td><code>{entry.email}</code></td>
+              <td>{entry.source === "INTERVIEW"
+                ? <span className="allow-src auto">Tự thêm khi mời {entry.candidate || "ứng viên"}</span>
+                : <span className="allow-src manual">Bạn tự thêm</span>}</td>
+              <td className="allow-when">{entry.added_at ? fullDateLabel(entry.added_at) : "—"}</td>
+              <td><button type="button" disabled={busy} title="Bỏ khỏi danh sách"
+                          onClick={() => void removeEmail(entry.email)}>×</button></td>
+            </tr>)}</tbody>
+          </table>
         : <p className="allow-empty">Chưa có email nào ngoài email gốc. Mời một ứng viên phỏng vấn
-          là email của họ xuất hiện ở đây.</p>}
+          là email của họ tự xuất hiện ở đây.</p>}
       <form className="allow-add" onSubmit={addEmail}>
         <input type="email" required placeholder="them.email@vidu.com" value={newEmail}
                disabled={busy} onChange={event => setNewEmail(event.target.value)}/>

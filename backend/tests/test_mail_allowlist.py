@@ -80,3 +80,38 @@ def test_inviting_a_candidate_clears_their_address_for_delivery():
                        json={"timezone_name": "Asia/Ho_Chi_Minh"}).status_code == 201
     # Without this the system queues an invitation it has already forbidden itself to deliver.
     assert "ngoai.danh.sach@congty.vn" in client.get("/api/mail-sandbox").json()["allowed_emails"]
+
+
+def test_an_auto_added_address_records_which_candidate_it_was_for():
+    from app.scheduling import sandbox_allowlist_entries
+
+    class Policy:
+        mail_sandbox_enabled = True
+        mail_sandbox_base_email = "base@gmail.com"
+        mail_sandbox_max_alias = 100
+        mail_sandbox_allowed_emails: list = []
+
+    policy = Policy()
+    allow_sandbox_recipient(policy, "ai.do@congty.vn", source="INTERVIEW", candidate_name="LÊ VĂN A")
+    allow_sandbox_recipient(policy, "tu.them@congty.vn")
+    entries = {entry["email"]: entry for entry in sandbox_allowlist_entries(policy)}
+    # The recruiter has to be able to see the system picked the right address, not just that it picked one.
+    assert entries["ai.do@congty.vn"]["source"] == "INTERVIEW"
+    assert entries["ai.do@congty.vn"]["candidate"] == "LÊ VĂN A"
+    assert entries["ai.do@congty.vn"]["added_at"].endswith("Z")
+    assert entries["tu.them@congty.vn"]["source"] == "MANUAL"
+
+
+def test_plain_string_rows_from_before_are_still_read():
+    from app.scheduling import sandbox_allowlist, sandbox_allowlist_entries
+
+    class Policy:
+        mail_sandbox_enabled = True
+        mail_sandbox_base_email = "base@gmail.com"
+        mail_sandbox_max_alias = 100
+        mail_sandbox_allowed_emails = ["Cu@Example.com", {"email": "moi@example.com", "source": "INTERVIEW"}]
+
+    policy = Policy()
+    assert sandbox_allowlist(policy) == ["cu@example.com", "moi@example.com"]
+    assert sandbox_allowlist_entries(policy)[0]["source"] == "MANUAL"
+    assert mail_sandbox_recipient_allowed(policy, "cu@example.com")

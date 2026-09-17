@@ -165,9 +165,27 @@ def mail_sandbox_alias(base_email: str, alias_number: int) -> str:
     return f"{local}+{alias_number}@{domain}"
 
 
+def sandbox_allowlist_entries(policy: TenantPolicy | None) -> list[dict]:
+    """Each cleared address with where it came from, so the list can be audited by eye.
+
+    Older rows were plain strings; they are read as manual entries rather than migrated, since
+    the column is JSON and the shape can simply widen.
+    """
+    entries: list[dict] = []
+    for value in (getattr(policy, "mail_sandbox_allowed_emails", None) or []) if policy else []:
+        if isinstance(value, dict):
+            email = str(value.get("email", "")).strip().lower()
+            if email:
+                entries.append({"email": email, "source": value.get("source") or "MANUAL",
+                                "candidate": value.get("candidate") or "", "added_at": value.get("added_at") or ""})
+        elif str(value).strip():
+            entries.append({"email": str(value).strip().lower(), "source": "MANUAL",
+                            "candidate": "", "added_at": ""})
+    return entries
+
+
 def sandbox_allowlist(policy: TenantPolicy | None) -> list[str]:
-    values = list(getattr(policy, "mail_sandbox_allowed_emails", None) or []) if policy else []
-    return [str(value).strip().lower() for value in values if str(value).strip()]
+    return [entry["email"] for entry in sandbox_allowlist_entries(policy)]
 
 
 def mail_sandbox_recipient_allowed(policy: TenantPolicy | None, recipient: str) -> bool:
@@ -187,12 +205,16 @@ def mail_sandbox_recipient_allowed(policy: TenantPolicy | None, recipient: str) 
     return bool(match and 1 <= int(match.group(1)) <= policy.mail_sandbox_max_alias)
 
 
-def allow_sandbox_recipient(policy: TenantPolicy | None, recipient: str) -> bool:
+def allow_sandbox_recipient(policy: TenantPolicy | None, recipient: str,
+                            source: str = "MANUAL", candidate_name: str = "") -> bool:
     """Add one address to the allowlist. Returns whether the list actually changed."""
-    candidate = (recipient or "").strip().lower()
-    if not policy or "@" not in candidate or mail_sandbox_recipient_allowed(policy, candidate):
+    email = (recipient or "").strip().lower()
+    if not policy or "@" not in email or mail_sandbox_recipient_allowed(policy, email):
         return False
-    policy.mail_sandbox_allowed_emails = [*sandbox_allowlist(policy), candidate]
+    policy.mail_sandbox_allowed_emails = [*sandbox_allowlist_entries(policy), {
+        "email": email, "source": source, "candidate": candidate_name,
+        "added_at": utcnow().isoformat().replace("+00:00", "Z"),
+    }]
     return True
 
 

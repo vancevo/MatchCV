@@ -68,7 +68,7 @@ from .workflow import screening_pipeline
 from .scheduling import (
     add_outbox, authorization_url, available_slots_for_owner, decode_oauth_state,
     allow_sandbox_recipient, dispatch_outbox, exchange_code, local_datetime_label,
-    mail_sandbox_alias, render_template, sandbox_allowlist,
+    mail_sandbox_alias, render_template, sandbox_allowlist, sandbox_allowlist_entries,
     save_connection,
 )
 from .interview_ops import escalation, get_policy, run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback
@@ -552,7 +552,12 @@ def application_dict(item: Application) -> dict:
     return {"id": item.id, "job_id": item.job_id, "batch_id": item.batch_id,
             "candidate": {"name": item.candidate_name, "email": item.candidate_email}, "status": item.status,
             "resume_filename": item.resume_filename, "resume_size": item.resume_size,
-            "screening": screening, "pipeline": item.pipeline, "review": item.review}
+            "screening": screening, "pipeline": item.pipeline, "review": item.review,
+            "status_changed_at": utc_iso(item.status_changed_at) if item.status_changed_at else None,
+            "status_changed_by": item.status_changed_by or "",
+            "deleted_at": utc_iso(item.deleted_at) if item.deleted_at else None,
+            "deleted_by": item.deleted_by or "",
+            "created_at": utc_iso(item.created_at) if item.created_at else None}
 
 
 def batch_dict(db, batch: UploadBatch) -> dict:
@@ -845,6 +850,7 @@ def _mail_sandbox_dict(policy: TenantPolicy) -> dict:
         "base_email": policy.mail_sandbox_base_email,
         "max_alias": policy.mail_sandbox_max_alias,
         "allowed_emails": sandbox_allowlist(policy),
+        "allowed_entries": sandbox_allowlist_entries(policy),
         "sample_aliases": aliases,
         "delivery_note": "Gmail delivers plus aliases to the base inbox while TalentFlow keeps the alias unchanged.",
     }
@@ -892,8 +898,8 @@ def remove_mail_sandbox_recipient(
     with session_scope() as db:
         policy = policy_for(db, owner_id)
         target = email.strip().lower()
-        remaining = [value for value in sandbox_allowlist(policy) if value != target]
-        if len(remaining) != len(sandbox_allowlist(policy)):
+        remaining = [entry for entry in sandbox_allowlist_entries(policy) if entry["email"] != target]
+        if len(remaining) != len(sandbox_allowlist_entries(policy)):
             policy.mail_sandbox_allowed_emails = remaining
             audit(db, owner_id, None, "MAIL_SANDBOX_RECIPIENT_REMOVED", {"email": target})
         return _mail_sandbox_dict(policy)
@@ -1518,7 +1524,9 @@ def shortlist(job_id: str, limit: int = 5, owner_id: str = Depends(current_tenan
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
         return {
@@ -1579,7 +1587,9 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         approved_ids = (job.requirements or {}).get("shortlist_approval", {}).get("application_ids") or []
         if approved_ids:
@@ -1608,7 +1618,9 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
         if not criteria:
             raise HTTPException(409, "Criteria must be approved before shortlist approval")
         apps = [item for item in db.scalars(select(Application).where(
-            Application.job_id == job.id, Application.owner_id == owner_id
+            Application.job_id == job.id, Application.owner_id == owner_id,
+            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
+            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         known = {item.id for item in apps}
         missing = selected - known
@@ -2075,7 +2087,47 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         if item.status in {ApplicationStatus.PROCESSING.value, ApplicationStatus.SCREENING_FAILED.value}:
             raise HTTPException(409, "Application screening is not ready for review")
         item.status = statuses[decision]; item.review = payload.model_dump(); item.pipeline = pipeline("completed")
+        item.status_changed_at = utcnow()
+        item.status_changed_by = actor.get("email") or actor.get("name") or ""
         audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump(), actor=actor)
+        return application_dict(item)
+
+
+@app.post("/api/applications/{application_id}/delete")
+def soft_delete_application(application_id: str, owner_id: str = Depends(current_tenant_id),
+                            actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Move the candidate out of the way without destroying anything.
+
+    Separate from DELETE /data, which erases the record for a privacy request and cannot be
+    undone. A recruiter clearing low scores out of the list wants the opposite of that.
+    """
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        if item.status == ApplicationStatus.DELETED.value:
+            return application_dict(item)
+        item.previous_status = item.status
+        item.status = ApplicationStatus.DELETED.value
+        item.deleted_at = item.status_changed_at = utcnow()
+        item.deleted_by = item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        audit(db, owner_id, item.id, "CANDIDATE_DELETED",
+              {"candidate": item.candidate_name, "from_status": item.previous_status}, actor=actor)
+        return application_dict(item)
+
+
+@app.post("/api/applications/{application_id}/restore")
+def restore_application(application_id: str, owner_id: str = Depends(current_tenant_id),
+                        actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        item = require_application(db, application_id, owner_id)
+        if item.status != ApplicationStatus.DELETED.value:
+            raise HTTPException(409, "Hồ sơ này không nằm trong mục đã xoá")
+        item.status = item.previous_status or ApplicationStatus.WAITING_REVIEW.value
+        item.previous_status = ""
+        item.deleted_at = None; item.deleted_by = ""
+        item.status_changed_at = utcnow()
+        item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        audit(db, owner_id, item.id, "CANDIDATE_RESTORED",
+              {"candidate": item.candidate_name, "to_status": item.status}, actor=actor)
         return application_dict(item)
 
 
@@ -2335,9 +2387,10 @@ def _create_scheduling_invitation(db, item: Application, payload: SchedulingInvi
     item.status = ApplicationStatus.INTERVIEW_PENDING.value
     # Inviting someone is the recruiter saying this address is real, so clear it for delivery.
     # Otherwise the sandbox blocks the invitation it was just asked to send.
-    if allow_sandbox_recipient(policy_for(db, item.owner_id), item.candidate_email):
+    if allow_sandbox_recipient(policy_for(db, item.owner_id), item.candidate_email,
+                               source="INTERVIEW", candidate_name=item.candidate_name):
         audit(db, item.owner_id, item.id, "MAIL_SANDBOX_RECIPIENT_ALLOWED",
-              {"email": item.candidate_email})
+              {"email": item.candidate_email, "source": "INTERVIEW"})
     audit(db, item.owner_id, item.id, "SCHEDULING_INVITATION_CREATED", {"invitation_id": invitation.id})
     return ({"id": invitation.id, "status": invitation.status, "public_url": public_url,
              "expires_at": invitation.expires_at.isoformat(), "delivery_status": outbox.status}, outbox.id)
