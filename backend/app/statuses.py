@@ -32,7 +32,6 @@ class ApplicationStatus(str, Enum):
     ARCHIVED = "ARCHIVED"
     INTERVIEW_PENDING = "INTERVIEW_PENDING"
     INTERVIEW_SCHEDULED = "INTERVIEW_SCHEDULED"
-    DELETED = "DELETED"
 
 
 class InterviewStatus(str, Enum):

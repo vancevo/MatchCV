@@ -302,7 +302,7 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .allow-add input{flex:1 1 220px;height:32px;padding:0 11px;border:1px solid #e1e2e8;border-radius:9px;background:#fafafd;font-size:10.5px;color:#333a4b}
 .allow-add input:focus{outline:0;border-color:#9e8de9;box-shadow:0 0 0 3px #eeeafd}
 
-/* Allowlist table, candidate delete/restore, per-row timestamps */
+/* Allowlist table, permanent candidate deletion, per-row timestamps */
 .allow-table{width:100%;border-collapse:collapse;margin-bottom:11px;font-size:10px}
 .allow-table th{text-align:left;padding:6px 8px;color:#8a8fa0;font:700 8px Manrope,sans-serif;letter-spacing:.6px;text-transform:uppercase;border-bottom:1px solid #eceaf4}
 .allow-table td{padding:7px 8px;border-bottom:1px solid #f5f4fa;vertical-align:middle}
@@ -319,8 +319,6 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 .status-when{color:#a0a6b4;font-size:8.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .why-button.delete{border-color:#e9e7f3;color:#8a8fa0}
 .why-button.delete:hover:not(:disabled){background:#f6f6f9;border-color:#d8d6e4;color:#6f7686}
-.why-button.restore{border-color:#cfe6d9;color:#227a57}
-.why-button.restore:hover:not(:disabled){background:#f3fbf6;border-color:#a8d9c0}
 @media (max-width:700px){.allow-table th:nth-child(3),.allow-table td:nth-child(3){display:none}}
 
 /* "We have seen this candidate before" marker */

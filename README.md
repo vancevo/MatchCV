@@ -34,7 +34,7 @@ Tạo JD
 - Retry có backoff, timeout, RQ failed registry và nút retry từng CV lỗi.
 - Dedupe bằng SHA-256 trong phạm vi recruiter + job; CV trùng liên kết về application đã có.
 - Frontend polling trạng thái thật của batch thay cho progress timer mô phỏng.
-- Chỉ lưu text đã extract, metadata và SHA-256 checksum; không lưu file CV gốc.
+- Lưu text đã extract, metadata và SHA-256 checksum; production lưu CV gốc trong bucket Supabase Storage private và chỉ mở bằng signed URL ngắn hạn.
 - Screening có điểm rule, kinh nghiệm, semantic proxy, kỹ năng ưu tiên và evidence theo yêu cầu.
 - Criteria được version hóa; khi duyệt bản mới, toàn bộ hồ sơ được rescreen bằng durable task có parent-run lineage.
 - Embedding hashing 96 chiều chạy offline; PostgreSQL lưu bằng pgvector và HNSW cosine index, SQLite test lưu JSON.
@@ -176,6 +176,10 @@ Các biến quan trọng:
 | `AUTH_REQUIRED` | Không | `true` để bắt buộc Bearer token |
 | `SUPABASE_URL` | Khi bật auth | Endpoint Supabase, đồng thời dùng để đọc JWKS |
 | `SUPABASE_JWT_SECRET` | Tuỳ cấu hình | Xác minh JWT HS256; bỏ trống để dùng JWKS |
+| `SUPABASE_SERVICE_ROLE_KEY` | Khi dùng Storage | Chỉ đặt ở backend; dùng tạo bucket private và quản lý CV gốc |
+| `RESUME_STORAGE_BACKEND` | Không | `local` khi phát triển, `supabase` trên Render |
+| `RESUME_STORAGE_BUCKET` | Không | Bucket private chứa CV, mặc định `resumes` |
+| `RESUME_SIGNED_URL_TTL_SECONDS` | Không | Thời gian sống signed URL, mặc định 300 giây |
 | `AUTO_SEED` | Không | Seed job/CV demo khi backend khởi động |
 | `REDIS_URL` | Khi chạy async | Redis URL dùng chung cho API và worker |
 | `QUEUE_EAGER` | Không | `true` chạy inline cho development/test; `false` bắt buộc Redis |
