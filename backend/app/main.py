@@ -1887,7 +1887,7 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                     Application.job_id == job_id,
                     Application.resume_checksum == digest,
                 ))
-                if duplicate:
+                if duplicate and duplicate.status != ApplicationStatus.DELETED.value:
                     db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=duplicate.id,
                                      filename=filename, checksum=digest, status=BatchItemStatus.DUPLICATE.value,
                                      error="CV trùng checksum trong cùng job"))
@@ -1897,26 +1897,52 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
 
                 name, email = candidate_identity(text, filename)
                 application_id = str(uuid5(NAMESPACE_URL, f"talentflow:{owner_id}:{job_id}:{digest}"))
-                application = Application(
-                    id=application_id,
-                    owner_id=owner_id,
-                    job_id=job.id,
-                    batch_id=batch.id,
-                    candidate_name=name,
-                    candidate_email=email,
-                    status=ApplicationStatus.PROCESSING.value,
-                    resume_filename=filename,
-                    resume_size=len(content),
-                    resume_checksum=digest,
-                    resume_text=text,
-                    screening={},
-                    pipeline=screening_pipeline("Candidate Extracted"),
-                )
+                revived = duplicate is not None
+                run_suffix = f"resubmit:{batch.id}" if revived else "v1"
+                if revived:
+                    # Sending the same CV again after it was cleared out has to land, otherwise the
+                    # upload silently does nothing. The row is revived rather than inserted again
+                    # because its id is derived from the checksum and would collide.
+                    application = duplicate
+                    application.batch_id = batch.id
+                    application.candidate_name = name
+                    application.candidate_email = email
+                    application.status = ApplicationStatus.PROCESSING.value
+                    application.previous_status = ""
+                    application.deleted_at = None
+                    application.deleted_by = ""
+                    application.resume_filename = filename
+                    application.resume_size = len(content)
+                    application.resume_text = text
+                    application.screening = {}
+                    application.review = None
+                    application.pipeline = screening_pipeline("Candidate Extracted")
+                    application.status_changed_at = utcnow()
+                else:
+                    application = Application(
+                        id=application_id,
+                        owner_id=owner_id,
+                        job_id=job.id,
+                        batch_id=batch.id,
+                        candidate_name=name,
+                        candidate_email=email,
+                        status=ApplicationStatus.PROCESSING.value,
+                        resume_filename=filename,
+                        resume_size=len(content),
+                        resume_checksum=digest,
+                        resume_text=text,
+                        screening={},
+                        pipeline=screening_pipeline("Candidate Extracted"),
+                    )
                 try:
                     with db.begin_nested():
-                        db.add(application)
+                        if not revived:
+                            db.add(application)
                         db.flush()
                     store_resume_file(application_id, filename, content)
+                    if revived:
+                        audit(db, owner_id, application.id, "CV_RESUBMITTED_AFTER_DELETE",
+                              {"filename": filename, "checksum": digest})
                 except IntegrityError:
                     duplicate = db.scalar(select(Application).where(
                         Application.owner_id == owner_id,
@@ -1942,12 +1968,14 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                                model=ai["model"] if ai["configured"] else None,
                                prompt_version="screening-v1+interview-kit-v1",
                                fallback_reason=None if ai["configured"] else "openrouter_not_configured",
-                               idempotency_key=f"screening:{application.id}:v1")
+                               # A resubmission is a genuinely new screening run, so it cannot reuse
+                               # the first submission's key the way a repeated upload should.
+                               idempotency_key=f"screening:{application.id}:{run_suffix}")
                 db.add(run); db.flush()
                 task = AgentTask(owner_id=owner_id, application_id=application.id, batch_id=batch.id,
                                  batch_item_id=batch_item.id, run_id=run.id, status=TaskStatus.QUEUED.value,
                                  max_attempts=get_settings().task_max_attempts,
-                                 idempotency_key=f"screening-task:{application.id}:v1")
+                                 idempotency_key=f"screening-task:{application.id}:{run_suffix}")
                 db.add(task); db.flush()
                 batch_item.task_id = task.id
                 task_ids.append(task.id)
