@@ -48,7 +48,9 @@ from .resume import (
     candidate_identity,
     checksum,
     delete_resume_file,
+    ensure_resume_bucket,
     extract_resume,
+    resume_file_url,
     store_resume_file,
     stored_resume_path,
 )
@@ -84,6 +86,7 @@ from .operations import (
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    ensure_resume_bucket()
     if settings.auto_seed:
         seed()
     if settings.master_seed_on_start and has_master_seed_config():
@@ -555,8 +558,6 @@ def application_dict(item: Application) -> dict:
             "screening": screening, "pipeline": item.pipeline, "review": item.review,
             "status_changed_at": utc_iso(item.status_changed_at) if item.status_changed_at else None,
             "status_changed_by": item.status_changed_by or "",
-            "deleted_at": utc_iso(item.deleted_at) if item.deleted_at else None,
-            "deleted_by": item.deleted_by or "",
             "created_at": utc_iso(item.created_at) if item.created_at else None}
 
 
@@ -735,7 +736,9 @@ def _policy_dict(policy: TenantPolicy, usage: TenantUsage) -> dict:
 
 
 def _erase_application(db, item: Application, reason: str) -> None:
-    delete_resume_file(item.id, item.resume_filename)
+    # Remove the private object before deleting database metadata. A storage error aborts the
+    # transaction, so the UI never reports success while a personal-data object is left behind.
+    delete_resume_file(item.owner_id, item.id, item.resume_filename)
     interview_ids = list(db.scalars(select(Interview.id).where(Interview.application_id == item.id)))
     run_ids = list(db.scalars(select(AgentRun.id).where(AgentRun.application_id == item.id)))
     for ingestion in db.scalars(select(SourceIngestion).where(SourceIngestion.application_id == item.id)):
@@ -1359,6 +1362,9 @@ def clear_recruitment_data(
             "applications": db.scalar(select(func.count()).select_from(Application).where(Application.owner_id == owner_id)) or 0,
             "interviews": db.scalar(select(func.count()).select_from(Interview).where(Interview.owner_id == owner_id)) or 0,
         }
+        applications = list(db.scalars(select(Application).where(Application.owner_id == owner_id)))
+        for item in applications:
+            delete_resume_file(item.owner_id, item.id, item.resume_filename)
         # Delete in dependency order so the operation behaves consistently in SQLite and PostgreSQL.
         for model in (
             FeedbackSummary, InterviewScorecard, OutboxEvent, SchedulingInvitation, Interview,
@@ -1525,8 +1531,6 @@ def shortlist(job_id: str, limit: int = 5, owner_id: str = Depends(current_tenan
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
             Application.job_id == job.id, Application.owner_id == owner_id,
-            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
-            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
         return {
@@ -1588,8 +1592,6 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
         job = require_job(db, job_id, owner_id)
         apps = [item for item in db.scalars(select(Application).where(
             Application.job_id == job.id, Application.owner_id == owner_id,
-            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
-            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         approved_ids = (job.requirements or {}).get("shortlist_approval", {}).get("application_ids") or []
         if approved_ids:
@@ -1619,8 +1621,6 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
             raise HTTPException(409, "Criteria must be approved before shortlist approval")
         apps = [item for item in db.scalars(select(Application).where(
             Application.job_id == job.id, Application.owner_id == owner_id,
-            # A candidate the recruiter cleared out must not be ranked back into a shortlist.
-            Application.status != ApplicationStatus.DELETED.value,
         )) if "final_score" in (item.screening or {})]
         known = {item.id for item in apps}
         missing = selected - known
@@ -1805,6 +1805,8 @@ def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
         linked = list(db.scalars(select(Application).where(Application.job_id == job_id, Application.owner_id == owner_id)))
         if any(a.status not in {ApplicationStatus.REJECTED.value, ApplicationStatus.ARCHIVED.value} for a in linked):
             raise HTTPException(409, "Only jobs with no candidates or rejected/archived candidates can be deleted")
+        for application in linked:
+            _erase_application(db, application, "job_permanent_delete")
         # SQLite runs with foreign keys off, so the ON DELETE CASCADE never fires and the
         # approval inbox would keep showing cards for a job that no longer exists.
         approvals = db.execute(sql_delete(ApprovalRequest).where(ApprovalRequest.job_id == job_id)).rowcount
@@ -1825,22 +1827,28 @@ async def create_application(payload: ApplicationCreate, owner_id: str = Depends
 
 @app.get("/api/applications/{application_id}/resume")
 def read_resume(application_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
-    """Extracted CV text, plus whether the original upload is still on disk."""
+    """Extracted CV text plus a short-lived URL for the private original upload."""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
-        path = stored_resume_path(item.id, item.resume_filename)
+        file_url = resume_file_url(owner_id, item.id, item.resume_filename)
         suffix = Path(item.resume_filename or "").suffix.lower()
         return {"application_id": item.id, "filename": item.resume_filename,
                 "size": item.resume_size, "checksum": item.resume_checksum,
                 "text": item.resume_text or "",
-                "file_available": bool(path and path.exists()), "file_type": suffix.lstrip(".")}
+                "file_available": bool(file_url), "file_url": file_url,
+                "file_type": suffix.lstrip(".")}
 
 
 @app.get("/api/applications/{application_id}/resume-file")
-def read_resume_file(application_id: str, owner_id: str = Depends(current_tenant_id)) -> FileResponse:
-    """Serve the CV exactly as uploaded, so the reviewer sees the candidate's own formatting."""
+def read_resume_file(application_id: str, owner_id: str = Depends(current_tenant_id)) -> Response:
+    """Compatibility route for local development; production returns a private signed URL above."""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
+        if settings.resume_storage_backend != "local":
+            url = resume_file_url(owner_id, item.id, item.resume_filename)
+            if not url:
+                raise HTTPException(404, "Original file is not stored for this application")
+            return RedirectResponse(url)
         filename = item.resume_filename
         path = stored_resume_path(item.id, filename)
     if not path or not path.exists():
@@ -1887,7 +1895,7 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                     Application.job_id == job_id,
                     Application.resume_checksum == digest,
                 ))
-                if duplicate and duplicate.status != ApplicationStatus.DELETED.value:
+                if duplicate:
                     db.add(BatchItem(owner_id=owner_id, batch_id=batch.id, application_id=duplicate.id,
                                      filename=filename, checksum=digest, status=BatchItemStatus.DUPLICATE.value,
                                      error="CV trùng checksum trong cùng job"))
@@ -1897,52 +1905,32 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
 
                 name, email = candidate_identity(text, filename)
                 application_id = str(uuid5(NAMESPACE_URL, f"talentflow:{owner_id}:{job_id}:{digest}"))
-                revived = duplicate is not None
-                run_suffix = f"resubmit:{batch.id}" if revived else "v1"
-                if revived:
-                    # Sending the same CV again after it was cleared out has to land, otherwise the
-                    # upload silently does nothing. The row is revived rather than inserted again
-                    # because its id is derived from the checksum and would collide.
-                    application = duplicate
-                    application.batch_id = batch.id
-                    application.candidate_name = name
-                    application.candidate_email = email
-                    application.status = ApplicationStatus.PROCESSING.value
-                    application.previous_status = ""
-                    application.deleted_at = None
-                    application.deleted_by = ""
-                    application.resume_filename = filename
-                    application.resume_size = len(content)
-                    application.resume_text = text
-                    application.screening = {}
-                    application.review = None
-                    application.pipeline = screening_pipeline("Candidate Extracted")
-                    application.status_changed_at = utcnow()
-                else:
-                    application = Application(
-                        id=application_id,
-                        owner_id=owner_id,
-                        job_id=job.id,
-                        batch_id=batch.id,
-                        candidate_name=name,
-                        candidate_email=email,
-                        status=ApplicationStatus.PROCESSING.value,
-                        resume_filename=filename,
-                        resume_size=len(content),
-                        resume_checksum=digest,
-                        resume_text=text,
-                        screening={},
-                        pipeline=screening_pipeline("Candidate Extracted"),
-                    )
+                run_suffix = "v1"
+                application = Application(
+                    id=application_id,
+                    owner_id=owner_id,
+                    job_id=job.id,
+                    batch_id=batch.id,
+                    candidate_name=name,
+                    candidate_email=email,
+                    status=ApplicationStatus.PROCESSING.value,
+                    resume_filename=filename,
+                    resume_size=len(content),
+                    resume_checksum=digest,
+                    resume_text=text,
+                    screening={},
+                    pipeline=screening_pipeline("Candidate Extracted"),
+                )
                 try:
                     with db.begin_nested():
-                        if not revived:
-                            db.add(application)
+                        db.add(application)
                         db.flush()
-                    store_resume_file(application_id, filename, content)
-                    if revived:
-                        audit(db, owner_id, application.id, "CV_RESUBMITTED_AFTER_DELETE",
-                              {"filename": filename, "checksum": digest})
+                    try:
+                        store_resume_file(owner_id, application_id, filename, content)
+                    except Exception:
+                        db.delete(application)
+                        db.flush()
+                        raise
                 except IntegrityError:
                     duplicate = db.scalar(select(Application).where(
                         Application.owner_id == owner_id,
@@ -1980,7 +1968,8 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                 batch_item.task_id = task.id
                 task_ids.append(task.id)
                 audit(db, owner_id, application.id, "CV_EXTRACTED",
-                      {"filename": filename, "size": len(content), "checksum": digest, "stored_original": False})
+                      {"filename": filename, "size": len(content), "checksum": digest, "stored_original": True,
+                       "storage_backend": get_settings().resume_storage_backend})
                 audit(db, owner_id, application.id, "SCREENING_QUEUED", {"task_id": task.id, "run_id": run.id})
             except HTTPException as exc:
                 batch.failed += 1
@@ -2121,42 +2110,16 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         return application_dict(item)
 
 
-@app.post("/api/applications/{application_id}/delete")
-def soft_delete_application(application_id: str, owner_id: str = Depends(current_tenant_id),
-                            actor: dict[str, str] = Depends(current_actor)) -> dict:
-    """Move the candidate out of the way without destroying anything.
-
-    Separate from DELETE /data, which erases the record for a privacy request and cannot be
-    undone. A recruiter clearing low scores out of the list wants the opposite of that.
-    """
+@app.delete("/api/applications/{application_id}")
+def permanently_delete_application(application_id: str, owner_id: str = Depends(current_tenant_id),
+                                   actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Permanently delete the candidate, related workflow data, and original CV object."""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
-        if item.status == ApplicationStatus.DELETED.value:
-            return application_dict(item)
-        item.previous_status = item.status
-        item.status = ApplicationStatus.DELETED.value
-        item.deleted_at = item.status_changed_at = utcnow()
-        item.deleted_by = item.status_changed_by = actor.get("email") or actor.get("name") or ""
-        audit(db, owner_id, item.id, "CANDIDATE_DELETED",
-              {"candidate": item.candidate_name, "from_status": item.previous_status}, actor=actor)
-        return application_dict(item)
-
-
-@app.post("/api/applications/{application_id}/restore")
-def restore_application(application_id: str, owner_id: str = Depends(current_tenant_id),
-                        actor: dict[str, str] = Depends(current_actor)) -> dict:
-    with session_scope() as db:
-        item = require_application(db, application_id, owner_id)
-        if item.status != ApplicationStatus.DELETED.value:
-            raise HTTPException(409, "Hồ sơ này không nằm trong mục đã xoá")
-        item.status = item.previous_status or ApplicationStatus.WAITING_REVIEW.value
-        item.previous_status = ""
-        item.deleted_at = None; item.deleted_by = ""
-        item.status_changed_at = utcnow()
-        item.status_changed_by = actor.get("email") or actor.get("name") or ""
-        audit(db, owner_id, item.id, "CANDIDATE_RESTORED",
-              {"candidate": item.candidate_name, "to_status": item.status}, actor=actor)
-        return application_dict(item)
+        candidate = item.candidate_name
+        _erase_application(db, item, "recruiter_permanent_delete")
+        return {"status": "deleted", "application_id": application_id, "candidate": candidate,
+                "deleted_by": actor.get("email") or actor.get("name") or ""}
 
 
 @app.get("/api/interviewers/{interviewer_id}/available-slots")

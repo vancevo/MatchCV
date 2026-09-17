@@ -13,6 +13,9 @@ services:
       - { key: DATABASE_URL, sync: false }
       - { key: SUPABASE_URL, sync: false }
       - { key: SUPABASE_SERVICE_ROLE_KEY, sync: false }
+      - { key: RESUME_STORAGE_BACKEND, value: supabase }
+      - { key: RESUME_STORAGE_BUCKET, value: resumes }
+      - { key: RESUME_SIGNED_URL_TTL_SECONDS, value: 300 }
       - { key: MASTER_EMAIL, sync: false }
       - { key: MASTER_PASSWORD, sync: false }
       - { key: MASTER_FULL_NAME, value: "Master Admin" }

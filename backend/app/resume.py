@@ -5,7 +5,9 @@ import itertools
 import re
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 from docx import Document
 from fastapi import HTTPException, UploadFile
 from pypdf import PdfReader
@@ -133,6 +135,67 @@ def storage_dir() -> Path:
     return Path(get_settings().resume_storage_dir)
 
 
+def _object_key(owner_id: str, application_id: str, filename: str | None) -> str | None:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        return None
+    # Tenant and application IDs are independent path segments. Quoting keeps an unexpected
+    # slash or space from moving an object outside its tenant prefix.
+    return f"{quote(owner_id, safe='')}/{quote(application_id, safe='')}/original{suffix}"
+
+
+def _storage_url(action: str, object_key: str) -> str:
+    settings = get_settings()
+    return (
+        f"{settings.supabase_url}/storage/v1/object/{action}/"
+        f"{quote(settings.resume_storage_bucket, safe='')}/{object_key}"
+    )
+
+
+def _storage_headers(content_type: str | None = None) -> dict[str, str]:
+    key = get_settings().supabase_service_role_key
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _raise_storage_error(response: httpx.Response, action: str) -> None:
+    if response.is_success:
+        return
+    detail = response.text[:300]
+    raise RuntimeError(f"Supabase Storage {action} failed ({response.status_code}): {detail}")
+
+
+def ensure_resume_bucket() -> None:
+    """Create the private bucket on first production startup; never make it public."""
+    settings = get_settings()
+    if settings.resume_storage_backend != "supabase":
+        return
+    bucket = quote(settings.resume_storage_bucket, safe="")
+    response = httpx.get(
+        f"{settings.supabase_url}/storage/v1/bucket/{bucket}", headers=_storage_headers(), timeout=15
+    )
+    if response.is_success:
+        return
+    if response.status_code != 404:
+        _raise_storage_error(response, "inspect bucket")
+    response = httpx.post(
+        f"{settings.supabase_url}/storage/v1/bucket",
+        headers=_storage_headers("application/json"),
+        json={
+            "id": settings.resume_storage_bucket,
+            "name": settings.resume_storage_bucket,
+            "public": False,
+            "file_size_limit": settings.max_upload_mb * 1024 * 1024,
+            "allowed_mime_types": ["application/pdf", "text/plain",
+                                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+        },
+        timeout=15,
+    )
+    _raise_storage_error(response, "create private bucket")
+
+
 def stored_resume_path(application_id: str, filename: str | None) -> Path | None:
     """Uploads are named after the application, so no extra database column is needed."""
     suffix = Path(filename or "").suffix.lower()
@@ -141,7 +204,22 @@ def stored_resume_path(application_id: str, filename: str | None) -> Path | None
     return storage_dir() / f"{application_id}{suffix}"
 
 
-def store_resume_file(application_id: str, filename: str | None, content: bytes) -> None:
+def store_resume_file(owner_id: str, application_id: str, filename: str | None, content: bytes) -> None:
+    settings = get_settings()
+    if settings.resume_storage_backend == "supabase":
+        object_key = _object_key(owner_id, application_id, filename)
+        if not object_key:
+            return
+        response = httpx.post(
+            f"{settings.supabase_url}/storage/v1/object/"
+            f"{quote(settings.resume_storage_bucket, safe='')}/{object_key}",
+            headers={**_storage_headers(CONTENT_TYPES.get(Path(filename or "").suffix.lower())),
+                     "x-upsert": "true"},
+            content=content,
+            timeout=30,
+        )
+        _raise_storage_error(response, "upload")
+        return
     path = stored_resume_path(application_id, filename)
     if not path:
         return
@@ -149,7 +227,45 @@ def store_resume_file(application_id: str, filename: str | None, content: bytes)
     path.write_bytes(content)
 
 
-def delete_resume_file(application_id: str, filename: str | None) -> None:
+def delete_resume_file(owner_id: str, application_id: str, filename: str | None) -> None:
+    settings = get_settings()
+    if settings.resume_storage_backend == "supabase":
+        object_key = _object_key(owner_id, application_id, filename)
+        if not object_key:
+            return
+        response = httpx.request(
+            "DELETE",
+            f"{settings.supabase_url}/storage/v1/object/{quote(settings.resume_storage_bucket, safe='')}",
+            headers={**_storage_headers("application/json")},
+            json={"prefixes": [object_key]},
+            timeout=30,
+        )
+        _raise_storage_error(response, "delete")
+        return
     path = stored_resume_path(application_id, filename)
     if path and path.exists():
         path.unlink()
+
+
+def resume_file_url(owner_id: str, application_id: str, filename: str | None) -> str | None:
+    """Return a short-lived private URL, or a protected API path for local development."""
+    settings = get_settings()
+    object_key = _object_key(owner_id, application_id, filename)
+    if not object_key:
+        return None
+    if settings.resume_storage_backend == "local":
+        path = stored_resume_path(application_id, filename)
+        return f"/api/applications/{application_id}/resume-file" if path and path.exists() else None
+    response = httpx.post(
+        _storage_url("sign", object_key),
+        headers=_storage_headers("application/json"),
+        json={"expiresIn": settings.resume_signed_url_ttl_seconds},
+        timeout=15,
+    )
+    if response.status_code == 404:
+        return None
+    _raise_storage_error(response, "sign URL")
+    signed_path = response.json().get("signedURL") or response.json().get("signedUrl")
+    if not signed_path:
+        raise RuntimeError("Supabase Storage sign URL response did not contain signedURL")
+    return signed_path if signed_path.startswith("http") else f"{settings.supabase_url}/storage/v1{signed_path}"

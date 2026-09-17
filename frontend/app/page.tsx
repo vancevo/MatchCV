@@ -23,7 +23,7 @@ type InterviewKit = {
 type Application = {
   id: string; job_id: string; status: string; resume_filename?: string;
   status_changed_at?: string | null; status_changed_by?: string;
-  deleted_at?: string | null; deleted_by?: string; created_at?: string | null;
+  created_at?: string | null;
   candidate: { name: string; email: string };
   screening: {
     final_score: number; raw_score?: number; confidence?: number; recommendation: string;
@@ -135,9 +135,8 @@ const statusLabel = (status: string) => ({
   ARCHIVED: "Lưu trữ",
   INTERVIEW_PENDING: "Chờ đặt lịch",
   INTERVIEW_SCHEDULED: "Đã đặt lịch",
-  DELETED: "Đã xoá",
 } as Record<string, string>)[status] || status;
-const statusTone = (status: string) => status === "DELETED" ? "rejected" : status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
+const statusTone = (status: string) => status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
 /** Every earlier time this person reached the company, newest first. */
 function priorSubmissions(item: Application, all: Application[], jobs: Job[]) {
   const email = item.candidate.email.trim().toLowerCase();
@@ -321,9 +320,7 @@ function RecruiterApp() {
     if (candidateTab === "rejected") return item.status === "REJECTED";
     if (candidateTab === "interview") return item.status.startsWith("INTERVIEW");
     if (candidateTab === "archived") return item.status === "ARCHIVED";
-    if (candidateTab === "deleted") return item.status === "DELETED";
-    // Everything except what the recruiter cleared out; deleted has its own tab.
-    return item.status !== "DELETED";
+    return true;
   }), [dashboard.applications, candidateTab]);
   const filtered = useMemo(() => tabbedApplications.filter(item =>
     `${item.candidate.name} ${item.candidate.email}`.toLowerCase().includes(query.toLowerCase())), [tabbedApplications, query]);
@@ -494,20 +491,13 @@ function RecruiterApp() {
     });
   };
 
-  const softDelete = async (item: Application) => {
+  const permanentlyDelete = async (item: Application) => {
+    if (!window.confirm(`Xoá vĩnh viễn ${item.candidate.name}? CV gốc và toàn bộ dữ liệu liên quan sẽ không thể khôi phục.`)) return;
     await runAction(`delete-${item.id}`, `Đang xoá ${item.candidate.name}`, async () => {
-      await request(`/api/applications/${item.id}/delete`, { method: "POST" });
+      await request(`/api/applications/${item.id}`, { method: "DELETE" });
       if (selected?.id === item.id) setSelected(null);
       await loadDashboard();
-      notify(`Đã chuyển ${item.candidate.name} vào mục đã xoá`);
-    });
-  };
-
-  const restore = async (item: Application) => {
-    await runAction(`restore-${item.id}`, `Đang khôi phục ${item.candidate.name}`, async () => {
-      await request(`/api/applications/${item.id}/restore`, { method: "POST" });
-      await loadDashboard();
-      notify(`Đã khôi phục ${item.candidate.name}`);
+      notify(`Đã xoá vĩnh viễn ${item.candidate.name}`);
     });
   };
 
@@ -604,13 +594,12 @@ function RecruiterApp() {
         : <><div className="dashboard-grid">
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
             {active === "Ứng viên" && <div className="candidate-tabs">{[
-              ["all", "Tất cả", dashboard.applications.filter(item => item.status !== "DELETED").length],
+              ["all", "Tất cả", dashboard.applications.length],
               ["waiting", "Chờ duyệt", dashboard.applications.filter(item => item.status === "WAITING_REVIEW").length],
               ["reviewed", "Xem xét", dashboard.applications.filter(item => item.status === "REVIEWED").length],
               ["interview", "Phỏng vấn", dashboard.applications.filter(item => item.status.startsWith("INTERVIEW")).length],
               ["rejected", "Từ chối", dashboard.applications.filter(item => item.status === "REJECTED").length],
               ["archived", "Lưu trữ", dashboard.applications.filter(item => item.status === "ARCHIVED").length],
-              ["deleted", "Đã xoá", dashboard.applications.filter(item => item.status === "DELETED").length],
             ].map(([key, label, count]) => <button key={key} className={candidateTab === key ? "active" : ""} onClick={() => setCandidateTab(String(key))}>{label}<span>{count}</span></button>)}</div>}
             <div className="table-head"><span>ỨNG VIÊN</span><span>ĐỘ PHÙ HỢP</span><span>TRẠNG THÁI</span><span/></div><div className="candidate-list">
               {filtered.map((item, index) => <div className="candidate-row" key={item.id}>
@@ -646,18 +635,12 @@ function RecruiterApp() {
                   <button className="why-button" disabled={resumeBusy === item.id}
                           title="Mở toàn bộ CV ứng viên đã nộp"
                           onClick={() => void openResumeFor(item)}><Icon name="file"/>{resumeBusy === item.id ? "Đang mở" : "Xem CV"}</button>
-                  {item.status === "DELETED"
-                    ? <button className="why-button restore" disabled={actionBusy}
-                              title="Đưa hồ sơ trở lại danh sách"
-                              onClick={() => void restore(item)}><Icon name="undo"/>Khôi phục</button>
-                    : <>
-                        <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
-                                title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
-                                onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
-                        <button className="why-button delete" disabled={actionBusy}
-                                title="Chuyển vào mục đã xoá, khôi phục lại được"
-                                onClick={() => void softDelete(item)}><Icon name="trash"/>Xoá</button>
-                      </>}
+                  <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
+                          title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
+                          onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
+                  <button className="why-button delete" disabled={actionBusy}
+                          title="Xoá vĩnh viễn CV và toàn bộ dữ liệu liên quan"
+                          onClick={() => void permanentlyDelete(item)}><Icon name="trash"/>Xoá vĩnh viễn</button>
                 </div>
               </div>)}
               {!filtered.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp.</div>}
@@ -812,7 +795,7 @@ function SlotPicker({ slots, busy, onChoose }: {
 
 type Resume = {
   application_id: string; filename: string | null; size: number | null; checksum: string | null;
-  text: string; file_available: boolean; file_type: string;
+  text: string; file_available: boolean; file_type: string; file_url: string | null;
 };
 
 function RejectCandidateDialog({ application, busy, onClose, onConfirm }: {
@@ -842,7 +825,7 @@ function ResumeViewer({ resume, candidateName, onClose }: {
   resume: Resume; candidateName: string; onClose: () => void;
 }) {
   const [showText, setShowText] = useState(false);
-  const fileUrl = `${API_URL}/api/applications/${resume.application_id}/resume-file`;
+  const fileUrl = resume.file_url?.startsWith("/") ? `${API_URL}${resume.file_url}` : resume.file_url;
   const canEmbed = resume.file_available && resume.file_type === "pdf";
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -863,12 +846,12 @@ function ResumeViewer({ resume, candidateName, onClose }: {
         <button className="close" onClick={onClose} aria-label="Đóng">×</button>
       </header>
       {canEmbed && !showText
-        ? <iframe className="resume-frame" src={fileUrl} title={`CV của ${candidateName}`}/>
+        ? <iframe className="resume-frame" src={fileUrl || undefined} title={`CV của ${candidateName}`}/>
         : <div className="resume-sheet"><pre>{resume.text}</pre></div>}
       <footer>
         {resume.file_available
           ? <>
-              <a className="resume-action" href={fileUrl} target="_blank" rel="noreferrer">
+              <a className="resume-action" href={fileUrl || undefined} target="_blank" rel="noreferrer">
                 {resume.file_type === "pdf" ? "Mở file gốc ở tab mới" : `Tải file gốc (.${resume.file_type})`}
               </a>
               {canEmbed && <button className="resume-action ghost" onClick={() => setShowText(value => !value)}>
