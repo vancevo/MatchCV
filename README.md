@@ -137,7 +137,7 @@ Backend đọc `backend/.env`:
 APP_ENV=local
 DATABASE_URL=sqlite:///./talentflow.db
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL=minimax/minimax-m3:free
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite
 SUPABASE_URL=
 SUPABASE_JWT_SECRET=
 AUTH_REQUIRED=false

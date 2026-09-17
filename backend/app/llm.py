@@ -9,6 +9,12 @@ import httpx
 
 from .config import get_settings
 from .pipeline import analyze_evidence, extract_requirements, generate_interview_kit, screen_candidate
+from .talentflow_model import (
+    candidate_profile_from_schema,
+    extract_requirements_schema_ai,
+    extract_resume_schema_ai,
+    talentflow_config,
+)
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -19,6 +25,7 @@ def llm_config() -> dict[str, Any]:
     return {
         "configured": bool(settings.openrouter_api_key),
         "model": settings.openrouter_model,
+        "talentflow": talentflow_config(),
     }
 
 
@@ -92,8 +99,29 @@ def _requirements(value: dict[str, Any], fallback: dict[str, Any]) -> dict[str, 
     }
 
 
+def _merge_talentflow_requirements(result: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    fallback_required = list(fallback.get("required_skills", []))
+    fallback_preferred = list(fallback.get("preferred_skills", []))
+    required = list(dict.fromkeys(fallback_required + result.get("required_skills", [])))
+    required_lookup = {item.casefold() for item in required}
+    preferred = list(dict.fromkeys(result.get("preferred_skills", []) + fallback_preferred))
+    preferred = [item for item in preferred if item.casefold() not in required_lookup]
+    if "sql optimization" in required_lookup:
+        preferred = [item for item in preferred if item.casefold() != "sql"]
+    minimum_experience = max(int(result.get("minimum_experience", 0) or 0), int(fallback.get("minimum_experience", 0) or 0))
+    return {
+        "required_skills": required,
+        "preferred_skills": preferred,
+        "minimum_experience": minimum_experience,
+        "extraction_source": "talentflow_hf_with_rules_guardrails",
+    }
+
+
 async def extract_requirements_ai(description: str) -> dict[str, Any]:
     fallback = {**extract_requirements(description), "extraction_source": "rules"}
+    talentflow_result = await extract_requirements_schema_ai(description)
+    if talentflow_result:
+        return _merge_talentflow_requirements(talentflow_result, fallback)
     result = await _complete(
         """You extract hiring requirements from a job description. Return JSON only with:
 required_skills (string array), preferred_skills (string array), minimum_experience (integer years).
@@ -160,6 +188,14 @@ async def screen_candidate_ai(
 ) -> dict[str, Any]:
     baseline = screen_candidate(cv_text, requirements)
     all_requirements = requirements.get("required_skills", []) + requirements.get("preferred_skills", [])
+    resume_schema = await extract_resume_schema_ai(cv_text)
+    if resume_schema:
+        return {
+            **baseline,
+            "evidence": analyze_evidence(cv_text, all_requirements),
+            "screening_source": "talentflow_hf_with_rules_evidence",
+            "candidate_profile": candidate_profile_from_schema(resume_schema, cv_text),
+        }
     profile_instruction = {
         "baseline": "",
         "strict_evidence": " Treat ambiguous or paraphrased evidence as unmatched; only accept literal support.",

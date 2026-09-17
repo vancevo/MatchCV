@@ -10,12 +10,27 @@ from dataclasses import dataclass, asdict
 
 
 SKILL_ALIASES = {
+    "aws": ("aws", "amazon web services"),
+    "blockchain": ("blockchain",),
+    "cloud computing": ("cloud computing", "cloud"),
+    "digital ocean": ("digital ocean", "digitalocean"),
+    "docker": ("docker", "container"),
+    "english": ("english", "tiếng anh"),
     "postgresql": ("postgresql", "postgres", "psql"),
     "fastapi": ("fastapi",),
+    "golang": ("golang", "go language", "go "),
+    "google cloud": ("google cloud", "gcp"),
+    "linux": ("linux",),
+    "monitoring": ("monitoring", "prometheus", "grafana", "observability"),
+    "nosql": ("nosql", "mongo", "mongodb", "dynamodb"),
     "python": ("python",),
-    "docker": ("docker", "container"),
     "redis": ("redis",),
     "rest api": ("rest api", "restful", "http api", "web service"),
+    "self-learning": ("tự học", "tự học hỏi", "self-learning"),
+    "sql optimization": ("tối ưu hóa sql", "sql optimization", "query optimization", "optimize sql"),
+    "teamwork": ("làm việc nhóm", "teamwork"),
+    "problem solving": ("giải quyết vấn đề", "problem solving"),
+    "web3": ("web3", "web 3"),
 }
 
 
@@ -29,12 +44,37 @@ class Evidence:
 
 def extract_requirements(description: str) -> dict:
     text = description.lower()
-    known = ["Python", "FastAPI", "PostgreSQL", "Docker", "Redis", "REST API", "React", "TypeScript", "AWS"]
-    skills = [skill for skill in known if skill.lower() in text]
-    preferred_marker = text.find("ưu tiên")
-    preferred = [s for s in skills if preferred_marker >= 0 and text.find(s.lower()) > preferred_marker]
+    known = [
+        "Python", "FastAPI", "PostgreSQL", "Docker", "Redis", "REST API", "React", "TypeScript",
+        "Golang", "SQL optimization", "NoSQL", "Linux", "Blockchain", "Web3", "Cloud computing",
+        "AWS", "Google Cloud", "Digital Ocean", "Monitoring", "English", "Self-learning",
+        "Problem solving", "Teamwork",
+    ]
+    skills = [skill for skill in known if any(alias in text for alias in _aliases(skill))]
+    section_markers = ("ưu tiên", "plus", "nice to have")
+    marker_positions = [text.find(marker) for marker in section_markers if text.find(marker) >= 0]
+    first_section_marker = min(marker_positions) if marker_positions else -1
+    preferred: list[str] = []
+    for skill in skills:
+        position = min((text.find(alias) for alias in _aliases(skill) if text.find(alias) >= 0), default=-1)
+        tail = text[position : position + 80] if position >= 0 else ""
+        sentence_start = max(text.rfind(".", 0, position), text.rfind("\n", 0, position)) + 1 if position >= 0 else 0
+        sentence_end_candidates = [idx for idx in (text.find(".", position), text.find("\n", position)) if idx >= 0]
+        sentence_end = min(sentence_end_candidates) if sentence_end_candidates else len(text)
+        sentence = text[sentence_start:sentence_end]
+        if first_section_marker >= 0 and position >= first_section_marker:
+            preferred.append(skill)
+        elif any(re.search(re.escape(alias.strip()) + r"\s+(?:là|is).{0,20}(?:lợi thế|plus)", tail) for alias in _aliases(skill)):
+            preferred.append(skill)
+        elif skill in {"Blockchain", "Web3"} and re.search(r"blockchain.{0,20}web3.{0,30}lợi thế", sentence):
+            preferred.append(skill)
+    if "Docker" in preferred and "Golang" in preferred and "golang" in text and "docker là lợi thế" in text:
+        preferred = [skill for skill in preferred if skill != "Golang"]
     required = [s for s in skills if s not in preferred]
-    years = re.search(r"(?:ít nhất|minimum|min\.?)\s*(\d+)\s*(?:năm|years?)", text)
+    years = (
+        re.search(r"(?:có|ít nhất|tối thiểu|minimum|min\.?)\s*(\d+)\+?\s*(?:năm|years?)", text)
+        or re.search(r"(\d+)\+?\s*(?:năm|years?).{0,30}(?:trở lên|kinh nghiệm)", text)
+    )
     return {
         "required_skills": required or skills[:3],
         "preferred_skills": preferred,

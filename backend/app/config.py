@@ -48,6 +48,12 @@ class Settings:
     openrouter_model: str
     openrouter_site_url: str
     openrouter_app_title: str
+    hf_token: str
+    talentflow_model_repo_id: str
+    talentflow_model_dir: str
+    talentflow_model_enabled: bool
+    talentflow_max_input_tokens: int
+    talentflow_max_new_tokens: int
     max_upload_mb: int
     redis_url: str
     queue_name: str
@@ -114,9 +120,15 @@ class Settings:
             supabase_url=supabase_url,
             supabase_jwt_secret=jwt_secret,
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
-            openrouter_model=os.getenv("OPENROUTER_MODEL", "minimax/minimax-m3:free").strip(),
+            openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite").strip(),
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
             openrouter_app_title=os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot").strip(),
+            hf_token=os.getenv("HF_TOKEN", "").strip(),
+            talentflow_model_repo_id=os.getenv("TALENTFLOW_MODEL_REPO_ID", "").strip(),
+            talentflow_model_dir=os.getenv("TALENTFLOW_MODEL_DIR", "artifacts/phase3-export/merged_model").strip(),
+            talentflow_model_enabled=_boolean("TALENTFLOW_MODEL_ENABLED", True),
+            talentflow_max_input_tokens=_positive_int("TALENTFLOW_MAX_INPUT_TOKENS", 8192, 32768),
+            talentflow_max_new_tokens=_positive_int("TALENTFLOW_MAX_NEW_TOKENS", 2048, 8192),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
             redis_url=redis_url,
             queue_name=os.getenv("QUEUE_NAME", "talentflow-screening").strip() or "talentflow-screening",

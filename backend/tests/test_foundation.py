@@ -98,6 +98,7 @@ def test_openrouter_failure_uses_rules(monkeypatch):
     async def unavailable(*_args, **_kwargs):
         return None
 
+    monkeypatch.setattr("app.llm.extract_requirements_schema_ai", unavailable)
     monkeypatch.setattr("app.llm._complete", unavailable)
     import asyncio
 

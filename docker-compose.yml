@@ -13,7 +13,7 @@ services:
       DATABASE_URL: postgresql://recruitment:recruitment@postgres:5432/recruitment
       APP_ENV: ${APP_ENV:-local}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-minimax/minimax-m3:free}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash-lite}
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       AUTO_SEED: ${AUTO_SEED:-true}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
@@ -46,7 +46,7 @@ services:
       DATABASE_URL: postgresql://recruitment:recruitment@postgres:5432/recruitment
       APP_ENV: ${APP_ENV:-local}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-minimax/minimax-m3:free}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash-lite}
       AUTO_SEED: "false"
       REDIS_URL: redis://redis:6379/0
       QUEUE_EAGER: "false"

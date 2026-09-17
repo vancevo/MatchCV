@@ -147,11 +147,14 @@ async def _execute(task_id: str) -> None:
             if screening_source == "rules":
                 run.provider = "rules"
                 run.fallback_reason = run.fallback_reason or "openrouter_unavailable_or_invalid_response"
+            elif screening_source.startswith("talentflow_hf"):
+                run.provider = "talentflow_hf"
+                run.fallback_reason = None
             else:
                 run.provider = "openrouter"
                 run.fallback_reason = None
-            run.input_tokens = max(1, len(payload["resume_text"]) // 4) if run.provider == "openrouter" else 0
-            run.output_tokens = max(1, len(str(result)) // 4) if run.provider == "openrouter" else 0
+            run.input_tokens = max(1, len(payload["resume_text"]) // 4) if run.provider in {"openrouter", "talentflow_hf"} else 0
+            run.output_tokens = max(1, len(str(result)) // 4) if run.provider in {"openrouter", "talentflow_hf"} else 0
             run.cost_micros = 0
             run.trace_json = {
                 "model": run.model,
