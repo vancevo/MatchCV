@@ -28,9 +28,9 @@ type Application = {
 };
 type Job = {
   id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
-  requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string }; shortlist_approval?: { status: string; application_ids?: string[] } };
+  requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string; version?: number }; shortlist_approval?: { status: string; application_ids?: string[] } };
 };
-type Interview = { id: string; application_id: string; start_at: string; status: string; meeting_url: string; reschedule_count?: number; outcome?: string };
+type Interview = { id: string; application_id: string; start_at: string; end_at?: string; status: string; meeting_url: string; reschedule_count?: number; outcome?: string };
 type PublicSchedule = { candidate_name: string; job_title: string; timezone: string; duration_minutes: number; expires_at: string; mode: "schedule" | "reschedule"; interview?: Interview; slots: { start_at: string; duration_minutes: number }[] };
 type Dashboard = {
   metrics: { open_jobs: number; candidates: number; awaiting_review: number; interviews: number };
@@ -128,6 +128,7 @@ const fullDateLabel = (value: string) => new Intl.DateTimeFormat("vi-VN", { day:
 
 const AUDIT_LABELS: Record<string, string> = {
   JOB_CREATED: "Tạo vị trí tuyển dụng",
+  JOB_DESCRIPTION_UPDATED: "Sửa mô tả công việc",
   CV_EXTRACTED: "Trích xuất nội dung CV",
   CV_DUPLICATE_SKIPPED: "Bỏ qua CV trùng",
   SCREENING_QUEUED: "Đưa CV vào hàng đợi chấm điểm",
@@ -151,7 +152,9 @@ const AUDIT_LABELS: Record<string, string> = {
   INTERVIEW_CANCEL_REQUESTED: "Yêu cầu huỷ lịch phỏng vấn",
   INTERVIEW_CANCELLED_BY_PROVIDER: "Lịch bị huỷ từ hệ thống lịch",
   INTERVIEW_NO_SHOW: "Ứng viên không đến phỏng vấn",
-  INTERVIEW_POLICY_UPDATED: "Cập nhật chính sách phỏng vấn",
+  INTERVIEW_POLICY_UPDATED: "Cập nhật lịch làm việc / chính sách phỏng vấn",
+  BUSY_BLOCK_ADDED: "Thêm khoảng bận",
+  BUSY_BLOCK_REMOVED: "Xoá khoảng bận",
   SCORECARD_SUBMITTED: "Nộp phiếu đánh giá phỏng vấn",
   EMAIL_BOUNCED: "Email gửi không thành công",
   MAIL_SANDBOX_UPDATED: "Cập nhật cấu hình Mail Sandbox",
@@ -194,9 +197,10 @@ const actorLabel = (entry: AuditLog) =>
   : entry.actor_id ? entry.actor_id
   : "";
 const auditGroup = (action: string): "decision" | "screening" | "interview" | "system" => {
-  if (["RECRUITER_REVIEWED", "CRITERIA_APPROVED", "CRITERIA_REVISION_REQUESTED", "SHORTLIST_APPROVED", "CRITERIA_VERSION_CREATED", "SHORTLIST_TRIGGER_UPDATED", "JOB_CREATED"].includes(action)) return "decision";
+  if (["RECRUITER_REVIEWED", "CRITERIA_APPROVED", "CRITERIA_REVISION_REQUESTED", "SHORTLIST_APPROVED", "CRITERIA_VERSION_CREATED", "SHORTLIST_TRIGGER_UPDATED", "JOB_CREATED", "JOB_DESCRIPTION_UPDATED"].includes(action)) return "decision";
   if (action.startsWith("SCREENING") || action.startsWith("CV_") || action === "RESCREEN_QUEUED" || action === "INTERVIEW_KIT_GENERATED") return "screening";
-  if (action.startsWith("INTERVIEW") || action.startsWith("SCHEDULING") || action.startsWith("CANDIDATE_RESCHEDULE") || action === "SCORECARD_SUBMITTED") return "interview";
+  if (action.startsWith("INTERVIEW") || action.startsWith("SCHEDULING") || action.startsWith("CANDIDATE_RESCHEDULE")
+      || action.startsWith("BUSY_BLOCK") || action === "SCORECARD_SUBMITTED") return "interview";
   return "system";
 };
 const AUDIT_GROUP_LABELS: Record<string, string> = {
@@ -397,11 +401,11 @@ function RecruiterApp() {
     });
   };
 
-  const approveCriteria = async (jobId: string, criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => {
-    await runAction(`criteria-${jobId}`, "Đang duyệt tiêu chí", async () => {
+  const saveCriteria = async (jobId: string, criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => {
+    await runAction(`criteria-${jobId}`, "Đang lưu tiêu chí", async () => {
       await request(`/api/jobs/${jobId}/criteria`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...criteria, note: "Recruiter reviewed criteria" }) });
-      await request(`/api/jobs/${jobId}/approve-criteria`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true, note: "Recruiter approved criteria" }) });
-      setModal(null); setCriteriaJob(null); await loadDashboard(); notify("Đã lưu và duyệt tiêu chí tuyển dụng");
+      setModal(null); setCriteriaJob(null); await loadDashboard();
+      notify("Đã lưu tiêu chí. Vào tab “Phê duyệt” để duyệt trước khi dùng chấm điểm.");
     });
   };
 
@@ -415,14 +419,14 @@ function RecruiterApp() {
     });
   };
 
-  const resolveApproval = async (approval: Approval, decision: "APPROVE" | "REJECT") => {
-    await runAction(`approval-${approval.id}`, `Đang ${decision === "APPROVE" ? "phê duyệt" : "từ chối"}`, async () => {
+  const resolveApproval = async (approval: Approval, decision: "APPROVE" | "REJECT", note = "") => {
+    await runAction(`approval-${approval.id}`, `Đang ${decision === "APPROVE" ? "phê duyệt" : "trả lại"}`, async () => {
       await request(`/api/approvals/${approval.id}/resolve`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision, note: `Recruiter ${decision.toLowerCase()} from approval inbox` }),
+        body: JSON.stringify({ decision, note: note.trim() || (decision === "APPROVE" ? "Recruiter phê duyệt" : "Recruiter trả lại") }),
       });
       await loadDashboard();
-      notify(decision === "APPROVE" ? "Đã phê duyệt đề xuất" : "Đã trả lại để xem xét");
+      notify(decision === "APPROVE" ? "Đã phê duyệt đề xuất" : "Đã trả lại kèm lý do");
     });
   };
 
@@ -462,7 +466,7 @@ function RecruiterApp() {
     <aside className="sidebar">
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
       <nav><p className="nav-label">WORKSPACE</p>
-        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
+        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch làm việc","clock"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
           <button key={label} className={active === label ? "nav-item active" : "nav-item"} onClick={() => setActive(label)}><Icon name={icon}/>{label}{label === "Ứng viên" && <span className="count">{dashboard.metrics.awaiting_review}</span>}{label === "Phê duyệt" && approvals.length > 0 && <span className="count">{approvals.length}</span>}</button>)}
         <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
       </nav>
@@ -474,7 +478,7 @@ function RecruiterApp() {
       <header><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
         {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
-        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.length || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
+        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.some(job => job.requirements?.approval?.status === "APPROVED") || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
         {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
         {lastBatch && <BatchStatusPanel batch={lastBatch} actionBusy={actionBusy} pendingAction={pendingAction} onRetry={retryBatchItem}/>}
         {loading && <DashboardSkeleton/>}
@@ -484,9 +488,10 @@ function RecruiterApp() {
             <article className="metric" key={m.label}><div className={`metric-icon ${m.tone}`}><Icon name={m.icon}/></div><div><p>{m.label}</p><strong>{loading ? "—" : m.value}</strong><span className={`delta ${m.tone}`}>Live</span></div></article>)}
         </section>}
 
-        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport}/>
+        {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport} onJobChanged={loadDashboard}/>
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction} onResolve={resolveApproval}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
+        : active === "Lịch làm việc" ? <AvailabilityView dashboard={dashboard}/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
         : active === "Xoá dữ liệu" ? <ClearDataView dashboard={dashboard} onCleared={async () => { setSelected(null); setLastBatch(null); await loadDashboard(); }}/>
@@ -514,7 +519,7 @@ function RecruiterApp() {
     {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
-    {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => approveCriteria(criteriaJob.id, criteria)}/>}
+    {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => saveCriteria(criteriaJob.id, criteria)}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
@@ -548,8 +553,101 @@ function PublicScheduling({ token }: { token: string }) {
     {error ? <div className="error-banner"><b>Không thể tiếp tục.</b> {error}</div>
     : booked ? <div className="booking-success"><i><Icon name="check"/></i><span className="eyebrow">ĐÃ GIỮ LỊCH</span><h1>{data?.mode === "reschedule" ? "Yêu cầu đổi lịch đã được ghi nhận" : "Khung giờ đã được giữ cho bạn"}</h1><p>{dateLabel(booked.start_at)}</p><small>HR sẽ xác nhận và gửi email kèm thông tin tham gia.</small>{booked.meeting_url && <a href={booked.meeting_url}>Mở phòng họp</a>}</div>
     : !data ? <InlineProgress label="Đang kiểm tra lịch trống"/>
-    : <><span className="eyebrow">{data.mode === "reschedule" ? "ĐỔI LỊCH TRONG POLICY" : "CHỌN LỊCH PHỎNG VẤN"}</span><h1>Chào {data.candidate_name}</h1><p>{data.mode === "reschedule" && data.interview ? <>Lịch hiện tại: <b>{dateLabel(data.interview.start_at)}</b>. </> : null}Chọn một khung giờ cho vị trí <b>{data.job_title}</b>. Thời lượng {data.duration_minutes} phút; giờ hiển thị theo thiết bị của bạn.</p><div className="slots public-slots">{data.slots.map(slot => <button key={slot.start_at} disabled={Boolean(busy)} onClick={() => void choose(slot.start_at)}>{busy === slot.start_at ? "Đang giữ lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div>{!data.slots.length && <div className="empty-state">Hiện chưa có lịch phù hợp. Vui lòng liên hệ recruiter.</div>}</>}
+    : <><span className="eyebrow">{data.mode === "reschedule" ? "ĐỔI LỊCH TRONG POLICY" : "CHỌN LỊCH PHỎNG VẤN"}</span>
+      <h1>Chào {data.candidate_name}</h1>
+      <p>
+        {data.mode === "reschedule" && data.interview ? <>Lịch hiện tại: <b>{dateLabel(data.interview.start_at)}</b>. </> : null}
+        Chọn một khung giờ cho vị trí <b>{data.job_title}</b>. Mỗi buổi kéo dài {data.duration_minutes} phút,
+        giờ hiển thị theo múi giờ trên thiết bị của bạn.
+      </p>
+      <SlotPicker slots={data.slots} busy={busy} onChoose={choose}/>
+    </>}
   </section></main>;
+}
+
+const VN_WEEKDAY = ["Chủ nhật", "Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7"];
+const PART_OF_DAY = (hour: number) => hour < 12 ? "Buổi sáng" : hour < 18 ? "Buổi chiều" : "Buổi tối";
+
+/** Days first, then times inside the chosen day — a candidate picks a date before an hour. */
+function SlotPicker({ slots, busy, onChoose }: {
+  slots: { start_at: string; duration_minutes: number }[];
+  busy: string;
+  onChoose: (slot: string) => Promise<void>;
+}) {
+  const days = useMemo(() => {
+    const grouped = new Map<string, { date: Date; times: string[] }>();
+    slots.forEach(slot => {
+      const date = new Date(slot.start_at);
+      const key = dayKey(date);
+      if (!grouped.has(key)) grouped.set(key, { date, times: [] });
+      grouped.get(key)!.times.push(slot.start_at);
+    });
+    return Array.from(grouped.entries()).map(([key, value]) => ({ key, ...value }));
+  }, [slots]);
+
+  const [active, setActive] = useState("");
+  const [chosen, setChosen] = useState("");
+  const current = days.find(day => day.key === active) || days[0];
+
+  if (!days.length) return <div className="empty-state">Hiện chưa có khung giờ trống. Vui lòng liên hệ lại nhà tuyển dụng.</div>;
+
+  const byPart = new Map<string, string[]>();
+  current.times.forEach(time => {
+    const part = PART_OF_DAY(new Date(time).getHours());
+    byPart.set(part, [...(byPart.get(part) || []), time]);
+  });
+
+  return <div className="slot-picker">
+    <div className="slot-step">
+      <span className="slot-step-no">1</span>
+      <div><b>Chọn ngày</b><small>{days.length} ngày còn nhận lịch</small></div>
+    </div>
+    <div className="slot-days">
+      {days.map(day => {
+        const selected = day.key === current.key;
+        return <button key={day.key} type="button" className={selected ? "slot-day on" : "slot-day"}
+          disabled={Boolean(busy)} onClick={() => setActive(day.key)}>
+          <span className="slot-dow">{VN_WEEKDAY[day.date.getDay()]}</span>
+          <b>{String(day.date.getDate()).padStart(2, "0")}/{String(day.date.getMonth() + 1).padStart(2, "0")}</b>
+          <small>{day.times.length} khung giờ</small>
+        </button>;
+      })}
+    </div>
+
+    <div className="slot-step">
+      <span className="slot-step-no">2</span>
+      <div>
+        <b>Chọn giờ</b>
+        <small>{VN_WEEKDAY[current.date.getDay()]}, ngày {String(current.date.getDate()).padStart(2, "0")}/{String(current.date.getMonth() + 1).padStart(2, "0")}/{current.date.getFullYear()}</small>
+      </div>
+    </div>
+    {Array.from(byPart.entries()).map(([part, times]) => <div className="slot-part" key={part}>
+      <span className="slot-part-label">{part}</span>
+      <div className="slot-times">
+        {times.map(time => <button key={time} type="button" disabled={Boolean(busy)}
+          className={time === chosen ? "slot-time on" : "slot-time"}
+          aria-pressed={time === chosen}
+          onClick={() => setChosen(time)}>
+          {new Date(time).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" })}
+        </button>)}
+      </div>
+    </div>)}
+
+    <div className="slot-confirm">
+      {chosen ? <>
+        <div className="slot-summary">
+          <span>Bạn đã chọn</span>
+          <b>{VN_WEEKDAY[new Date(chosen).getDay()]}, {fullDateLabel(chosen)}</b>
+        </div>
+        <div className="slot-confirm-actions">
+          <button type="button" className="secondary compact" disabled={Boolean(busy)} onClick={() => setChosen("")}>Chọn lại</button>
+          <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void onChoose(chosen)}>
+            {busy === chosen ? "Đang giữ lịch..." : "Xác nhận khung giờ này"}
+          </button>
+        </div>
+      </> : <p className="slot-empty-note">Bấm vào một khung giờ phía trên để chọn.</p>}
+    </div>
+  </div>;
 }
 
 function GlobalActionStatus({ label }: { label: string }) {
@@ -568,7 +666,7 @@ function DashboardSkeleton() {
   </section>;
 }
 
-function JobsView({ jobs, applications, actionBusy, pendingAction, onCreate, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
+function JobsView({ jobs, applications, actionBusy, pendingAction, onCreate, onDelete, onReviewCriteria, onApproveShortlist, onExportReport, onJobChanged }: {
   jobs: Job[];
   applications: Application[];
   actionBusy: boolean;
@@ -578,6 +676,7 @@ function JobsView({ jobs, applications, actionBusy, pendingAction, onCreate, onD
   onReviewCriteria: (job: Job) => void;
   onApproveShortlist: (jobId: string) => Promise<void>;
   onExportReport: (job: Job) => Promise<void>;
+  onJobChanged: () => Promise<void>;
 }) {
   return <section className="panel jobs-view">
     <div className="panel-head">
@@ -586,11 +685,11 @@ function JobsView({ jobs, applications, actionBusy, pendingAction, onCreate, onD
     </div>
     {jobs.map(job => <JobRow key={job.id} job={job} applications={applications} actionBusy={actionBusy}
                              pendingAction={pendingAction} onDelete={onDelete} onReviewCriteria={onReviewCriteria}
-                             onApproveShortlist={onApproveShortlist} onExportReport={onExportReport}/>)}
+                             onApproveShortlist={onApproveShortlist} onExportReport={onExportReport} onJobChanged={onJobChanged}/>)}
   </section>;
 }
 
-function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onReviewCriteria, onApproveShortlist, onExportReport }: {
+function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onReviewCriteria, onApproveShortlist, onExportReport, onJobChanged }: {
   job: Job;
   applications: Application[];
   actionBusy: boolean;
@@ -599,11 +698,20 @@ function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onRevi
   onReviewCriteria: (job: Job) => void;
   onApproveShortlist: (jobId: string) => Promise<void>;
   onExportReport: (job: Job) => Promise<void>;
+  onJobChanged: () => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   const required = job.requirements?.required_skills || [];
   const preferred = job.requirements?.preferred_skills || [];
-  const criteriaApproved = job.requirements?.approval?.status === "APPROVED";
+  const approval = job.requirements?.approval;
+  const criteriaApproved = approval?.status === "APPROVED";
+  // Version 1 is the posting itself; anything later is an edit to something already approved.
+  const isUpdate = (approval?.version || 1) > 1;
+  const jobState = criteriaApproved
+    ? { label: "Tiêu chí đã duyệt", tone: "interview" }
+    : approval?.status === "NEEDS_REVISION"
+      ? { label: isUpdate ? "Cập nhật bị trả lại" : "Công việc bị trả lại", tone: "rejected" }
+      : { label: isUpdate ? "Chờ duyệt cập nhật" : "Chờ duyệt công việc mới", tone: "review" };
   const shortlistApproved = job.requirements?.shortlist_approval?.status === "APPROVED";
 
   return <article className={open ? "job-row job-row-detailed job-row-open" : "job-row job-row-detailed"}>
@@ -618,13 +726,14 @@ function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onRevi
       </div>
     </div>
     <span>{job.applications_count} ứng viên</span>
-    <i className={criteriaApproved ? "status interview" : "status review"}>{criteriaApproved ? "Tiêu chí đã duyệt" : "Chờ duyệt tiêu chí"}</i>
+    <i className={`status ${jobState.tone}`}>{jobState.label}</i>
     <div className="job-actions">
       <button className="secondary compact" onClick={() => setOpen(value => !value)} aria-expanded={open}>
         {open ? "Ẩn chi tiết" : "Xem chi tiết"}
       </button>
-      <button className="secondary compact" disabled={actionBusy || criteriaApproved} onClick={() => onReviewCriteria(job)}>
-        {pendingAction?.key === `criteria-${job.id}` ? "Đang duyệt..." : "Kiểm tra tiêu chí"}
+      <button className="secondary compact" disabled={actionBusy} onClick={() => onReviewCriteria(job)}
+              title={criteriaApproved ? "Sửa sẽ tạo phiên bản mới và cần duyệt lại" : undefined}>
+        {pendingAction?.key === `criteria-${job.id}` ? "Đang lưu..." : criteriaApproved ? "Sửa tiêu chí" : "Kiểm tra tiêu chí"}
       </button>
       <button className="primary compact" disabled={actionBusy || !job.applications_count || shortlistApproved} onClick={() => void onApproveShortlist(job.id)}>
         {pendingAction?.key === `shortlist-${job.id}` ? "Đang duyệt..." : shortlistApproved ? "Đã duyệt Top 5" : "Duyệt Top 5"}
@@ -636,11 +745,11 @@ function JobRow({ job, applications, actionBusy, pendingAction, onDelete, onRevi
         {pendingAction?.key === `delete-${job.id}` ? "Đang xoá..." : "Xoá"}
       </button>
     </div>
-    {open && <JobDetail job={job} applications={applications}/>}
+    {open && <JobDetail job={job} applications={applications} onJobChanged={onJobChanged}/>}
   </article>;
 }
 
-function JobDetail({ job, applications }: { job: Job; applications: Application[] }) {
+function JobDetail({ job, applications, onJobChanged }: { job: Job; applications: Application[]; onJobChanged: () => Promise<void> }) {
   type CriteriaVersion = {
     id: string; version: number; status: string; change_note: string;
     criteria: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number };
@@ -651,6 +760,22 @@ function JobDetail({ job, applications }: { job: Job; applications: Application[
   const [history, setHistory] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [description, setDescription] = useState(job.description || "");
+  const [savingDescription, setSavingDescription] = useState(false);
+  const [descriptionNote, setDescriptionNote] = useState("");
+
+  const saveDescription = async () => {
+    setSavingDescription(true); setDescriptionNote("");
+    try {
+      await request(`/api/jobs/${job.id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description }),
+      });
+      await onJobChanged();
+      setDescriptionNote("Đã lưu mô tả. Tiêu chí chấm điểm không đổi — sửa riêng ở “Kiểm tra tiêu chí”.");
+    } catch (err) { setDescriptionNote(err instanceof Error ? err.message : "Không lưu được mô tả"); }
+    finally { setSavingDescription(false); }
+  };
 
   useEffect(() => {
     void Promise.all([
@@ -681,7 +806,19 @@ function JobDetail({ job, applications }: { job: Job; applications: Application[
     <div className="job-detail-grid">
       <section className="job-detail-block">
         <h4>Mô tả công việc</h4>
-        <p className="job-description">{job.description || "Chưa có mô tả."}</p>
+        <textarea className="job-description-edit" rows={9} value={description}
+                  disabled={savingDescription}
+                  onChange={event => setDescription(event.target.value)}
+                  placeholder="Mô tả yêu cầu, trách nhiệm và quyền lợi của vị trí này"/>
+        <div className="job-description-actions">
+          <button className="primary compact" onClick={() => void saveDescription()}
+                  disabled={savingDescription || description.trim().length < 10 || description === (job.description || "")}>
+            {savingDescription ? "Đang lưu..." : "Lưu mô tả"}
+          </button>
+          {description !== (job.description || "") && !savingDescription &&
+            <button className="secondary compact" onClick={() => setDescription(job.description || "")}>Hoàn tác</button>}
+        </div>
+        {descriptionNote && <p className="job-description-note">{descriptionNote}</p>}
       </section>
 
       <section className="job-detail-block">
@@ -718,7 +855,7 @@ function JobDetail({ job, applications }: { job: Job; applications: Application[
         {loading ? <small>Đang tải...</small> : versions.length ? <ol className="job-versions">
           {versions.map(version => <li key={version.id}>
             <b>v{version.version}</b>
-            <i className={`status ${version.status === "APPROVED" ? "interview" : "review"}`}>{version.status === "APPROVED" ? "Đã duyệt" : "Chờ duyệt"}</i>
+            <i className={`status ${CRITERIA_STATUS[version.status]?.tone || "manual"}`}>{CRITERIA_STATUS[version.status]?.label || version.status}</i>
             <span>{(version.criteria.required_skills || []).join(", ") || "không có kỹ năng nào"}</span>
             {version.change_note && <em>{version.change_note}</em>}
             <time dateTime={version.created_at}>{fullDateLabel(version.created_at)}</time>
@@ -762,7 +899,7 @@ function CriteriaModal({ job, busy, onClose, onSubmit }: {
     if (!required_skills.length) return;
     await onSubmit({ required_skills, preferred_skills: preferred.filter(item => item.checked).map(item => item.value), minimum_experience: experience });
   };
-  return <div className="modal-layer"><form className="modal form-modal criteria-modal" onSubmit={submit}><button type="button" className="close" disabled={busy} onClick={onClose}>×</button><span className="eyebrow">HUMAN REVIEW</span><h2>Duyệt tiêu chí · {job.title}</h2><p>Check/uncheck tiêu chí AI đã tách, hoặc bổ sung tiêu chí mới trước khi phê duyệt.</p><fieldset disabled={busy}><h3>Bắt buộc</h3><div className="criteria-checks">{required.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setRequired(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}</div><h3>Ưu tiên</h3><div className="criteria-checks">{preferred.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setPreferred(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}{!preferred.length && <small>Chưa có tiêu chí ưu tiên.</small>}</div><div className="criteria-add"><input value={newCriterion} onChange={event => setNewCriterion(event.target.value)} placeholder="Bổ sung kỹ năng/tiêu chí"/><select value={newKind} onChange={event => setNewKind(event.target.value as "required" | "preferred")}><option value="required">Bắt buộc</option><option value="preferred">Ưu tiên</option></select><button type="button" className="secondary compact" onClick={add}>Thêm</button></div><label><span>Kinh nghiệm tối thiểu (năm)</span><input type="number" min="0" max="60" value={experience} onChange={event => setExperience(Number(event.target.value))}/></label><button className="primary submit" disabled={!required.some(item => item.checked)}>{busy ? "Đang lưu và duyệt..." : "Lưu & duyệt tiêu chí"}</button></fieldset></form></div>;
+  return <div className="modal-layer"><form className="modal form-modal criteria-modal" onSubmit={submit}><button type="button" className="close" disabled={busy} onClick={onClose}>×</button><span className="eyebrow">HUMAN REVIEW</span><h2>Duyệt tiêu chí · {job.title}</h2><p>Check/uncheck tiêu chí AI đã tách, hoặc bổ sung tiêu chí mới. Lưu xong cần vào tab “Phê duyệt” để duyệt.</p><fieldset disabled={busy}><h3>Bắt buộc</h3><div className="criteria-checks">{required.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setRequired(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}</div><h3>Ưu tiên</h3><div className="criteria-checks">{preferred.map((item, index) => <label key={`${item.value}-${index}`}><input type="checkbox" checked={item.checked} onChange={event => setPreferred(values => values.map((entry, current) => current === index ? { ...entry, checked: event.target.checked } : entry))}/><span>{item.value}</span></label>)}{!preferred.length && <small>Chưa có tiêu chí ưu tiên.</small>}</div><div className="criteria-add"><input value={newCriterion} onChange={event => setNewCriterion(event.target.value)} placeholder="Bổ sung kỹ năng/tiêu chí"/><select value={newKind} onChange={event => setNewKind(event.target.value as "required" | "preferred")}><option value="required">Bắt buộc</option><option value="preferred">Ưu tiên</option></select><button type="button" className="secondary compact" onClick={add}>Thêm</button></div><label><span>Kinh nghiệm tối thiểu (năm)</span><input type="number" min="0" max="60" value={experience} onChange={event => setExperience(Number(event.target.value))}/></label><button className="primary submit" disabled={!required.some(item => item.checked)}>{busy ? "Đang lưu..." : "Lưu tiêu chí"}</button></fieldset></form></div>;
 }
 
 function ClearDataView({ dashboard, onCleared }: { dashboard: Dashboard; onCleared: () => Promise<void> }) {
@@ -783,7 +920,7 @@ function ClearDataView({ dashboard, onCleared }: { dashboard: Dashboard; onClear
 
 function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve }: {
   approvals: Approval[]; dashboard: Dashboard; actionBusy: boolean; pendingAction: PendingAction | null;
-  onResolve: (approval: Approval, decision: "APPROVE" | "REJECT") => Promise<void>;
+  onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
 }) {
   const labels: Record<Approval["type"], string> = { CRITERIA: "Tiêu chí", EVIDENCE: "Evidence yếu", SHORTLIST: "Shortlist", ESCALATION: "Ngoại lệ phỏng vấn" };
   return <section className="panel approval-view">
@@ -798,12 +935,49 @@ function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onReso
   </section>;
 }
 
+function RejectDialog({ title, busy, onCancel, onConfirm }: {
+  title: string; busy: boolean; onCancel: () => void; onConfirm: (note: string) => Promise<void>;
+}) {
+  const [note, setNote] = useState("");
+  const reasons = ["Tiêu chí chưa đầy đủ", "Sai yêu cầu của vị trí", "Cần bổ sung bằng chứng", "Chưa đúng thời điểm"];
+
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [onCancel]);
+
+  return <div className="modal-layer" onMouseDown={onCancel}>
+    <div className="modal reject-modal" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label="Lý do trả lại">
+      <button className="close" onClick={onCancel} aria-label="Đóng">×</button>
+      <span className="eyebrow">TRẢ LẠI ĐỀ XUẤT</span>
+      <h2>Vì sao trả lại?</h2>
+      <p className="reject-target">{title}</p>
+      <div className="reject-presets">
+        {reasons.map(reason => <button key={reason} type="button" className="reject-preset"
+          onClick={() => setNote(current => current ? `${current}. ${reason}` : reason)}>{reason}</button>)}
+      </div>
+      <textarea rows={4} value={note} autoFocus maxLength={500} disabled={busy}
+                placeholder="Ghi rõ cần sửa gì để người đề xuất biết đường chỉnh lại"
+                onChange={event => setNote(event.target.value)}/>
+      <p className="reject-hint">Lý do này được lưu vào nhật ký và hiện lại cho người đề xuất.</p>
+      <div className="reject-actions">
+        <button className="secondary compact" disabled={busy} onClick={onCancel}>Huỷ</button>
+        <button className="danger" disabled={busy || note.trim().length < 3} onClick={() => void onConfirm(note)}>
+          {busy ? "Đang gửi..." : "Xác nhận trả lại"}
+        </button>
+      </div>
+    </div>
+  </div>;
+}
+
 function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve }: {
   approval: Approval; typeLabel: string; dashboard: Dashboard; actionBusy: boolean;
   pendingAction: PendingAction | null;
-  onResolve: (approval: Approval, decision: "APPROVE" | "REJECT") => Promise<void>;
+  onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
 }) {
   const [history, setHistory] = useState<AuditLog[] | null>(null);
+  const [rejecting, setRejecting] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState("");
 
@@ -831,13 +1005,17 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
       <Icon name={approval.type === "SHORTLIST" ? "users" : approval.type === "CRITERIA" ? "briefcase" : "spark"}/>
     </div>
     <div className="approval-main">
-      <span className="eyebrow">{typeLabel}</span>
+      <span className="eyebrow">{approval.type === "CRITERIA"
+        ? (Number(payload.version) || 1) > 1 ? "Cập nhật công việc" : "Công việc mới"
+        : typeLabel}</span>
       <h3>{approval.title}</h3>
       <p>{approval.summary}</p>
 
       <div className="approval-meta">
         <span>Người đề xuất: <b>{requester || "Hệ thống tự đề xuất"}</b></span>
         {approval.created_at && <span>Thời gian: <b>{fullDateLabel(approval.created_at)}</b></span>}
+        {approval.status === "REJECTED" && typeof approval.resolution?.note === "string" &&
+          <span className="approval-rejected">Đã trả lại: <b>{approval.resolution.note as string}</b></span>}
         {job && <span>Vị trí: <b>{job.title}</b></span>}
         {candidate && <span>Ứng viên: <b>{candidate.candidate.name}</b></span>}
       </div>
@@ -917,8 +1095,12 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
       </ol>}
     </div>
 
+    {rejecting && <RejectDialog title={approval.title} busy={actionBusy}
+      onCancel={() => setRejecting(false)}
+      onConfirm={async note => { setRejecting(false); await onResolve(approval, "REJECT", note); }}/>}
+
     <div className="approval-actions">
-      <button className="secondary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "REJECT")}>Trả lại</button>
+      <button className="secondary compact" disabled={actionBusy} onClick={() => setRejecting(true)}>Trả lại</button>
       <button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "APPROVE")}>
         {pendingAction?.key === `approval-${approval.id}` ? "Đang xử lý..." : approval.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}
       </button>
@@ -1037,6 +1219,294 @@ function AuditLogView({ dashboard }: { dashboard: Dashboard }) {
   </section>;
 }
 
+type InterviewPolicy = {
+  reminder_minutes: number[]; max_reschedules: number; feedback_due_hours: number;
+  timezone_name: string; working_days: number[]; working_start_hour: number; working_end_hour: number;
+};
+type BusyBlock = { id: string; start_at: string; end_at: string; note: string };
+
+const CRITERIA_STATUS: Record<string, { label: string; tone: string }> = {
+  APPROVED: { label: "Đã duyệt", tone: "interview" },
+  PENDING: { label: "Chờ duyệt", tone: "review" },
+  NEEDS_REVISION: { label: "Đã trả lại", tone: "rejected" },
+  REJECTED: { label: "Đã từ chối", tone: "rejected" },
+  SUPERSEDED: { label: "Đã thay thế", tone: "archived" },
+};
+
+const WEEKDAYS = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+/** Monday-first weekday index, matching the backend's working_days numbering. */
+const weekdayIndex = (date: Date) => (date.getDay() + 6) % 7;
+const dayKey = (date: Date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+const cellKey = (day: string, hour: number) => `${day}:${hour}`;
+const shortDay = (date: Date) => `${String(date.getDate()).padStart(2, "0")}/${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+/** Contiguous hours on the same day become one block, so a full day is one row rather than eight. */
+function selectionToBlocks(selection: Set<string>): { start_at: string; end_at: string }[] {
+  const byDay = new Map<string, number[]>();
+  selection.forEach(key => {
+    const [day, hour] = key.split(":");
+    byDay.set(day, [...(byDay.get(day) || []), Number(hour)]);
+  });
+  const blocks: { start_at: string; end_at: string }[] = [];
+  byDay.forEach((hours, day) => {
+    hours.sort((left, right) => left - right);
+    let from = hours[0];
+    let previous = hours[0];
+    hours.slice(1).forEach(hour => {
+      if (hour !== previous + 1) {
+        blocks.push({
+          start_at: new Date(`${day}T${String(from).padStart(2, "0")}:00`).toISOString(),
+          end_at: new Date(`${day}T${String(previous + 1).padStart(2, "0")}:00`).toISOString(),
+        });
+        from = hour;
+      }
+      previous = hour;
+    });
+    blocks.push({
+      start_at: new Date(`${day}T${String(from).padStart(2, "0")}:00`).toISOString(),
+      end_at: new Date(`${day}T${String(previous + 1).padStart(2, "0")}:00`).toISOString(),
+    });
+  });
+  return blocks;
+}
+
+function AvailabilityView({ dashboard }: { dashboard: Dashboard }) {
+  const [policy, setPolicy] = useState<InterviewPolicy | null>(null);
+  const [blocks, setBlocks] = useState<BusyBlock[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const load = async () => {
+    const [nextPolicy, nextBlocks] = await Promise.all([
+      request<InterviewPolicy>("/api/interview-policy"),
+      request<BusyBlock[]>("/api/busy-blocks"),
+    ]);
+    setPolicy(nextPolicy); setBlocks(nextBlocks);
+  };
+  useEffect(() => {
+    void load().catch(err => setMessage(err instanceof Error ? err.message : "Không tải được lịch"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async (next: InterviewPolicy) => {
+    setPolicy(next); setBusy(true); setMessage("");
+    try {
+      setPolicy(await request<InterviewPolicy>("/api/interview-policy", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next),
+      }));
+      setMessage("Đã lưu. Ứng viên sẽ không còn thấy những khung giờ này.");
+    } catch (err) { setMessage(err instanceof Error ? err.message : "Không lưu được"); await load(); }
+    finally { setBusy(false); }
+  };
+
+  const toggleDay = (day: number) => {
+    if (!policy) return;
+    const days = policy.working_days.includes(day)
+      ? policy.working_days.filter(value => value !== day)
+      : [...policy.working_days, day].sort((left, right) => left - right);
+    if (!days.length) { setMessage("Phải giữ lại ít nhất một ngày làm việc."); return; }
+    void save({ ...policy, working_days: days });
+  };
+
+  if (loading) return <section className="panel"><InlineProgress label="Đang tải lịch làm việc"/></section>;
+  if (!policy) return <section className="panel"><div className="error-banner">{message || "Không tải được lịch"}</div></section>;
+
+  return <section className="panel availability-view">
+    <div className="panel-head">
+      <div><h2>Lịch làm việc & lịch bận</h2><p>Ứng viên chỉ chọn được những khung giờ còn trống ở đây</p></div>
+      <span className="bounded-badge">{blocks.length} khoảng bận đã khai</span>
+    </div>
+    {message && <p className="operations-message">{message}</p>}
+
+    <div className="availability-block">
+      <h3>Khung giờ làm việc</h3>
+      <div className="availability-row">
+        <span className="availability-label">Ngày làm việc</span>
+        <div className="day-toggles">
+          {WEEKDAYS.map((label, day) => <button key={label} type="button" disabled={busy}
+            className={policy.working_days.includes(day) ? "day-toggle on" : "day-toggle"}
+            aria-pressed={policy.working_days.includes(day)}
+            onClick={() => toggleDay(day)}>{label}</button>)}
+        </div>
+      </div>
+      <div className="availability-row">
+        <span className="availability-label">Giờ làm việc</span>
+        <div className="availability-fields">
+          <select disabled={busy} value={policy.working_start_hour}
+                  onChange={event => void save({ ...policy, working_start_hour: Number(event.target.value) })}>
+            {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+          </select>
+          <span>đến</span>
+          <select disabled={busy} value={policy.working_end_hour}
+                  onChange={event => void save({ ...policy, working_end_hour: Number(event.target.value) })}>
+            {Array.from({ length: 24 }, (_, index) => index + 1).map(hour =>
+              <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}
+          </select>
+          <select disabled={busy} value={policy.timezone_name}
+                  onChange={event => void save({ ...policy, timezone_name: event.target.value })}>
+            {["Asia/Ho_Chi_Minh", "Asia/Bangkok", "Asia/Singapore", "Asia/Tokyo", "UTC"].map(zone =>
+              <option key={zone} value={zone}>{zone}</option>)}
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <BusyBoard policy={policy} blocks={blocks} busy={busy}
+               interviews={dashboard.interviews || []} applications={dashboard.applications}
+               onSaved={async note => { setBlocks(await request<BusyBlock[]>("/api/busy-blocks")); setMessage(note); }}
+               setBusy={setBusy} onError={setMessage}/>
+
+  </section>;
+}
+
+function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, onSaved, onError }: {
+  policy: InterviewPolicy; blocks: BusyBlock[]; interviews: Interview[]; applications: Application[];
+  busy: boolean;
+  setBusy: (value: boolean) => void;
+  onSaved: (note: string) => Promise<void>;
+  onError: (note: string) => void;
+}) {
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [painting, setPainting] = useState<boolean | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const today = dayKey(new Date());
+
+  useEffect(() => {
+    const stop = () => setPainting(null);
+    window.addEventListener("mouseup", stop);
+    return () => window.removeEventListener("mouseup", stop);
+  }, []);
+
+  // Saved blocks are the source of truth until the grid is edited, so a reload shows them again.
+  useEffect(() => {
+    const marked = new Set<string>();
+    blocks.forEach(block => {
+      const end = new Date(block.end_at);
+      const cursor = new Date(block.start_at);
+      cursor.setMinutes(0, 0, 0);
+      while (cursor < end) {
+        marked.add(cellKey(dayKey(cursor), cursor.getHours()));
+        cursor.setHours(cursor.getHours() + 1);
+      }
+    });
+    setSelection(marked);
+    setDirty(false);
+  }, [blocks]);
+
+  const hours = Array.from({ length: Math.max(0, policy.working_end_hour - policy.working_start_hour) },
+                           (_, index) => policy.working_start_hour + index);
+
+  // Always this week plus the next two, rolling forward on its own as days pass.
+  const weeks = useMemo(() => {
+    const monday = new Date();
+    monday.setHours(0, 0, 0, 0);
+    monday.setDate(monday.getDate() - weekdayIndex(monday));
+    return [0, 1, 2].map(offset => Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(monday);
+      date.setDate(monday.getDate() + offset * 7 + index);
+      return date;
+    }).filter(date => policy.working_days.includes(weekdayIndex(date))));
+  }, [policy.working_days]);
+
+  const interviewCells = useMemo(() => {
+    const map = new Map<string, string>();
+    interviews.forEach(interview => {
+      if (interview.status === "CANCELLED") return;
+      const name = applications.find(item => item.id === interview.application_id)?.candidate.name || "Ứng viên";
+      const start = new Date(interview.start_at);
+      // Older records may not carry an end time; an interview slot is an hour by default.
+      const end = interview.end_at ? new Date(interview.end_at) : new Date(start.getTime() + 3600000);
+      const cursor = new Date(start);
+      cursor.setMinutes(0, 0, 0);
+      while (cursor < end) {
+        map.set(cellKey(dayKey(cursor), cursor.getHours()), name);
+        cursor.setHours(cursor.getHours() + 1);
+      }
+    });
+    return map;
+  }, [interviews, applications]);
+
+  const paint = (key: string, makeBusy: boolean) => {
+    setSelection(current => {
+      if (current.has(key) === makeBusy) return current;
+      const next = new Set(current);
+      if (makeBusy) next.add(key); else next.delete(key);
+      return next;
+    });
+    setDirty(true);
+  };
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const editable = blocks.filter(block => dayKey(new Date(block.start_at)) >= today);
+      for (const block of editable) await request(`/api/busy-blocks/${block.id}`, { method: "DELETE" });
+
+      const future = new Set(Array.from(selection).filter(key => key.split(":")[0] >= today));
+      for (const block of selectionToBlocks(future)) {
+        await request("/api/busy-blocks", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...block, note: "Lịch bận" }),
+        });
+      }
+      await onSaved(`Đã lưu ${future.size} giờ bận. Ứng viên sẽ không thấy các giờ này.`);
+    } catch (err) { onError(err instanceof Error ? err.message : "Không lưu được lịch bận"); }
+    finally { setBusy(false); }
+  };
+
+  return <div className="availability-block">
+    <div className="board-head">
+      <div>
+        <h3>Lịch 3 tuần</h3>
+        <p className="availability-hint">Kéo chuột để tô giờ bận. Ngày đã trôi qua bị đóng băng, chỉ xem lại được.</p>
+      </div>
+      <div className="board-legend">
+        <span><i className="swatch free"/>Trống</span>
+        <span><i className="swatch busy"/>Bận</span>
+        <span><i className="swatch interview"/>Có phỏng vấn</span>
+        <span><i className="swatch frozen"/>Đã qua</span>
+      </div>
+    </div>
+
+    {weeks.map((week, index) => <div className="planner-week" key={dayKey(week[0])}>
+      <h4>{["Tuần này", "Tuần sau", "Tuần kế tiếp"][index]} · {shortDay(week[0])} – {shortDay(week[week.length - 1])}</h4>
+      <div className="week-grid" style={{ gridTemplateColumns: `54px repeat(${week.length}, minmax(48px, 1fr))` }}>
+        <span className="week-corner"/>
+        {week.map(date => <span className={dayKey(date) === today ? "week-day current" : "week-day"} key={dayKey(date)}>
+          {WEEKDAYS[weekdayIndex(date)]}<i>{shortDay(date)}</i>
+        </span>)}
+        {hours.map(hour => <div key={hour} style={{ display: "contents" }}>
+          <span className="week-hour">{String(hour).padStart(2, "0")}:00</span>
+          {week.map(date => {
+            const day = dayKey(date);
+            const key = cellKey(day, hour);
+            const frozen = day < today;
+            const candidate = interviewCells.get(key);
+            const marked = selection.has(key);
+            const tone = candidate ? "interview" : marked ? "busy" : "free";
+            return <button key={key} type="button" disabled={busy || frozen || Boolean(candidate)}
+              className={`week-cell ${tone}${frozen ? " frozen" : ""}`}
+              aria-pressed={marked}
+              title={candidate ? `Phỏng vấn: ${candidate}` : frozen ? "Ngày đã trôi qua" : undefined}
+              aria-label={`${shortDay(date)} ${String(hour).padStart(2, "0")}:00 — ${candidate ? `phỏng vấn ${candidate}` : marked ? "bận" : "trống"}`}
+              onMouseDown={() => { setPainting(!marked); paint(key, !marked); }}
+              onMouseEnter={() => { if (painting !== null) paint(key, painting); }}/>;
+          })}
+        </div>)}
+      </div>
+    </div>)}
+
+    <div className="planner-actions">
+      <span>{Array.from(selection).filter(key => key.split(":")[0] >= today).length} giờ đang đánh dấu bận</span>
+      <button className="primary compact" disabled={busy || !dirty} onClick={() => void save()}>
+        {busy ? "Đang lưu..." : dirty ? "Lưu lịch bận" : "Đã lưu"}
+      </button>
+    </div>
+  </div>;
+}
+
 function MailSandboxView() {
   const [config, setConfig] = useState<MailSandbox | null>(null);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
@@ -1105,7 +1575,9 @@ function BatchStatusPanel({ batch, actionBusy, pendingAction, onRetry }: { batch
 function CandidateDrawer({ application, actionBusy, pendingAction, scoreClass, onClose, onReview }: { application: Application; actionBusy: boolean; pendingAction: PendingAction | null; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
   const kit = application.screening.interview_kit;
   const unavailable = ["PROCESSING", "SCREENING_FAILED"].includes(application.status);
-  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3>{unavailable && <p className="kit-summary">{application.status === "PROCESSING" ? "Agent đang xử lý hồ sơ này." : "Screening thất bại; hãy retry từ batch."}</p>}<div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy || unavailable} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy || unavailable} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : "Mời PV"}</button></div></aside></div>;
+  // Once a candidate has been invited, reviewing or inviting again would overwrite a live invitation.
+  const invited = application.status.startsWith("INTERVIEW");
+  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}</div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3>{invited && <p className="drawer-locked">Ứng viên đã được mời phỏng vấn — không thể xem xét hay mời lại. Quản lý lịch ở tab “Phỏng vấn”.</p>}{unavailable && <p className="kit-summary">{application.status === "PROCESSING" ? "Agent đang xử lý hồ sơ này." : "Screening thất bại; hãy retry từ batch."}</p>}<div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy || unavailable} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : invited ? "Đã mời PV" : "Mời PV"}</button></div></aside></div>;
 }
 
 function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {
@@ -1115,5 +1587,7 @@ function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boo
 function UploadModal({ jobs, submitting, progress, onClose, onSubmit }: { jobs: Job[]; submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
-  return <div className="modal-layer"><form className="modal form-modal" onSubmit={onSubmit}><button type="button" className="close" disabled={submitting} onClick={onClose}>×</button><span className="eyebrow">AI SCREENING</span><h2>Tải nhiều CV</h2><p>Chọn tối đa 20 file PDF, DOCX, TXT, mỗi file tối đa 10 MB. Chỉ text extract được lưu.</p><fieldset disabled={submitting}><label>Việc làm<select name="job_id" required>{jobs.map(job => <option key={job.id} value={job.id}>{job.title}</option>)}</select></label><label className={selectedFiles.length ? "file-drop selected" : "file-drop"} htmlFor="cv-file">{selectedFiles.length ? <><i className="file-check">✓</i><b>{selectedFiles.length} CV đã chọn</b><span>{(total / 1024 / 1024).toFixed(2)} MB · Bấm để chọn lại</span></> : <><Icon name="upload"/><b>Chọn nhiều CV từ máy</b><span>PDF, DOCX hoặc TXT</span></>}<input id="cv-file" name="files" type="file" multiple accept=".pdf,.docx,.txt" required onChange={event => setSelectedFiles(Array.from(event.target.files || []).slice(0, 20))}/></label>{selectedFiles.length > 0 && <div className="selected-files">{selectedFiles.map(file => <span key={`${file.name}-${file.size}`}>{file.name}<small>{(file.size / 1024).toFixed(0)} KB</small></span>)}</div>}</fieldset>{progress && <div className="upload-progress" role="status" aria-live="polite"><div><b>{progress.label}</b><strong>{progress.value}%</strong></div><div className="progress-track"><i style={{ width: `${progress.value}%` }}/></div><p>{progress.detail}</p><div className="progress-steps"><span className={progress.value >= 5 ? "done" : ""}>Upload</span><span className={progress.value >= 45 ? "done" : ""}>Extract</span><span className={progress.value >= 65 ? "done" : ""}>AI Profile</span><span className={progress.value >= 82 ? "done" : ""}>Evidence</span></div></div>}<button className="primary submit" disabled={submitting || !selectedFiles.length}>{submitting ? progress?.label || "Đang xử lý..." : `Extract ${selectedFiles.length || "nhiều"} CV`}</button></form></div>;
+  // Screening runs against approved criteria only, so an unapproved job cannot accept CVs yet.
+  const openJobs = jobs.filter(job => job.requirements?.approval?.status === "APPROVED");
+  return <div className="modal-layer"><form className="modal form-modal" onSubmit={onSubmit}><button type="button" className="close" disabled={submitting} onClick={onClose}>×</button><span className="eyebrow">AI SCREENING</span><h2>Tải nhiều CV</h2><p>Chọn tối đa 20 file PDF, DOCX, TXT, mỗi file tối đa 10 MB. Chỉ text extract được lưu.</p><fieldset disabled={submitting}><label>Việc làm<select name="job_id" required disabled={!openJobs.length}>{openJobs.map(job => <option key={job.id} value={job.id}>{job.title}</option>)}</select></label>{!openJobs.length && <p className="upload-blocked">Chưa có vị trí nào duyệt xong tiêu chí. Vào tab “Phê duyệt” duyệt tiêu chí trước, rồi mới tải CV lên được.</p>}<label className={selectedFiles.length ? "file-drop selected" : "file-drop"} htmlFor="cv-file">{selectedFiles.length ? <><i className="file-check">✓</i><b>{selectedFiles.length} CV đã chọn</b><span>{(total / 1024 / 1024).toFixed(2)} MB · Bấm để chọn lại</span></> : <><Icon name="upload"/><b>Chọn nhiều CV từ máy</b><span>PDF, DOCX hoặc TXT</span></>}<input id="cv-file" name="files" type="file" multiple accept=".pdf,.docx,.txt" required onChange={event => setSelectedFiles(Array.from(event.target.files || []).slice(0, 20))}/></label>{selectedFiles.length > 0 && <div className="selected-files">{selectedFiles.map(file => <span key={`${file.name}-${file.size}`}>{file.name}<small>{(file.size / 1024).toFixed(0)} KB</small></span>)}</div>}</fieldset>{progress && <div className="upload-progress" role="status" aria-live="polite"><div><b>{progress.label}</b><strong>{progress.value}%</strong></div><div className="progress-track"><i style={{ width: `${progress.value}%` }}/></div><p>{progress.detail}</p><div className="progress-steps"><span className={progress.value >= 5 ? "done" : ""}>Upload</span><span className={progress.value >= 45 ? "done" : ""}>Extract</span><span className={progress.value >= 65 ? "done" : ""}>AI Profile</span><span className={progress.value >= 82 ? "done" : ""}>Evidence</span></div></div>}<button className="primary submit" disabled={submitting || !selectedFiles.length || !openJobs.length}>{submitting ? progress?.label || "Đang xử lý..." : `Extract ${selectedFiles.length || "nhiều"} CV`}</button></form></div>;
 }

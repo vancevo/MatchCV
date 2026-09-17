@@ -7,6 +7,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -21,8 +22,10 @@ from .database import session_scope
 from .models import (
     Application,
     AuditLog,
+    BusyBlock,
     IntegrationConnection,
     Interview,
+    InterviewPolicy,
     Job,
     OutboxEvent,
     EmailTemplate,
@@ -270,19 +273,42 @@ def provider_busy(db, owner_id: str, start: datetime, end: datetime) -> list[tup
     return [(datetime.fromisoformat(x["start"]["dateTime"]).replace(tzinfo=timezone.utc), datetime.fromisoformat(x["end"]["dateTime"]).replace(tzinfo=timezone.utc)) for x in items]
 
 
-def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 7) -> list[datetime]:
+def availability_policy(db, owner_id: str) -> InterviewPolicy:
+    policy = db.scalar(select(InterviewPolicy).where(InterviewPolicy.owner_id == owner_id))
+    if not policy:
+        policy = InterviewPolicy(owner_id=owner_id)
+        db.add(policy)
+        db.flush()
+    return policy
+
+
+def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, days: int = 21) -> list[datetime]:
+    policy = availability_policy(db, owner_id)
+    try:
+        local_zone = ZoneInfo(policy.timezone_name or "Asia/Ho_Chi_Minh")
+    except ZoneInfoNotFoundError:
+        local_zone = ZoneInfo("Asia/Ho_Chi_Minh")
+    working_days = {int(value) for value in (policy.working_days or [])}
+    open_hour, close_hour = int(policy.working_start_hour), int(policy.working_end_hour)
+
     start = utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     end = start + timedelta(days=days)
     busy = provider_busy(db, owner_id, start, end)
     busy.extend(((_aware(i.start_at) or start), (_aware(i.end_at) or end)) for i in db.scalars(
         select(Interview).where(Interview.owner_id == owner_id, Interview.status != "CANCELLED", Interview.start_at < end, Interview.end_at > start)
     ))
+    busy.extend(((_aware(b.start_at) or start), (_aware(b.end_at) or end)) for b in db.scalars(
+        select(BusyBlock).where(BusyBlock.owner_id == owner_id, BusyBlock.start_at < end, BusyBlock.end_at > start)
+    ))
+
     slots: list[datetime] = []
     cursor = start
     duration = timedelta(minutes=duration_minutes)
-    while cursor + duration <= end and len(slots) < 20:
-        local = cursor.astimezone(timezone(timedelta(hours=7)))
-        if local.weekday() < 5 and 9 <= local.hour < 17 and not any(cursor < b_end and cursor + duration > b_start for b_start, b_end in busy):
+    while cursor + duration <= end and len(slots) < 120:
+        local = cursor.astimezone(local_zone)
+        if (local.weekday() in working_days
+                and open_hour <= local.hour < close_hour
+                and not any(cursor < b_end and cursor + duration > b_start for b_start, b_end in busy)):
             slots.append(cursor)
         cursor += timedelta(hours=1)
     return slots

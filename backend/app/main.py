@@ -13,7 +13,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sql_delete, func, or_, select, update as sql_update
 from sqlalchemy.exc import IntegrityError
 
@@ -32,7 +32,7 @@ from .database import SessionLocal, session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
 from .master_seed import create_master_user, has_master_seed_config
 from .models import (
-    AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem,
+    AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
     InterviewPolicy, InterviewScorecard, Job, OutboxEvent, ProviderWebhookEvent,
     SchedulingInvitation, ScreeningArtifact, ShortlistProposal, SourceConnector, SourceIngestion, Tenant,
@@ -122,6 +122,10 @@ class JobCreate(BaseModel):
     description: str = Field(min_length=10)
     department: str = "Engineering"
     location: str = "Remote"
+
+
+class JobUpdate(BaseModel):
+    description: str = Field(min_length=10, max_length=20000)
 
 
 class ApplicationCreate(BaseModel):
@@ -228,6 +232,10 @@ class InterviewPolicyUpdate(BaseModel):
     reminder_minutes: list[int] = Field(default_factory=lambda: [1440, 60], min_length=1, max_length=5)
     max_reschedules: int = Field(default=2, ge=0, le=10)
     feedback_due_hours: int = Field(default=24, ge=1, le=168)
+    timezone_name: str = Field(default="Asia/Ho_Chi_Minh", max_length=80)
+    working_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4], max_length=7)
+    working_start_hour: int = Field(default=9, ge=0, le=23)
+    working_end_hour: int = Field(default=17, ge=1, le=24)
 
     @field_validator("reminder_minutes")
     @classmethod
@@ -235,6 +243,40 @@ class InterviewPolicyUpdate(BaseModel):
         if any(minutes < 15 or minutes > 10080 for minutes in value):
             raise ValueError("reminder_minutes must be between 15 and 10080")
         return sorted(set(value), reverse=True)
+
+    @field_validator("working_days")
+    @classmethod
+    def valid_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 6 for day in value):
+            raise ValueError("working_days must contain weekday numbers 0-6")
+        return sorted(set(value))
+
+    @field_validator("timezone_name")
+    @classmethod
+    def valid_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone_name must be a valid IANA timezone") from exc
+        return value
+
+    @model_validator(mode="after")
+    def hours_in_order(self) -> "InterviewPolicyUpdate":
+        if self.working_end_hour <= self.working_start_hour:
+            raise ValueError("working_end_hour must be after working_start_hour")
+        return self
+
+
+class BusyBlockCreate(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    note: str = Field(default="", max_length=240)
+
+    @model_validator(mode="after")
+    def valid_range(self) -> "BusyBlockCreate":
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be after start_at")
+        return self
 
 
 class ScorecardAnswer(BaseModel):
@@ -539,11 +581,13 @@ def shortlist_report(job: Job, applications: list[Application]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def interview_dict(item: Interview) -> dict:
-    def utc_iso(value: datetime) -> str:
-        normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
-        return normalized.isoformat().replace("+00:00", "Z")
+def utc_iso(value: datetime) -> str:
+    """SQLite returns naive datetimes; without the marker a browser reads them as local time."""
+    normalized = value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
+    return normalized.isoformat().replace("+00:00", "Z")
 
+
+def interview_dict(item: Interview) -> dict:
     return {"id": item.id, "application_id": item.application_id, "start_at": utc_iso(item.start_at),
             "end_at": utc_iso(item.end_at), "status": item.status, "meeting_url": item.meeting_url,
             "provider": item.provider, "external_event_id": item.external_event_id,
@@ -1288,7 +1332,7 @@ def list_applications(
 async def create_job(payload: JobCreate, owner_id: str = Depends(current_tenant_id),
                      actor: dict[str, str] = Depends(current_actor)) -> dict:
     requirements = await extract_requirements_ai(payload.description)
-    requirements = {**requirements, "approval": {"status": "PENDING", "note": ""},
+    requirements = {**requirements, "approval": {"status": "PENDING", "note": "", "version": 1},
                     "shortlist_trigger": {"enabled": True, "min_completed": 2, "top_n": 5, "min_score": 65}}
     with session_scope() as db:
         job = Job(owner_id=owner_id, **payload.model_dump(), requirements=requirements)
@@ -1307,7 +1351,7 @@ def update_criteria(job_id: str, payload: CriteriaUpdate, owner_id: str = Depend
         job = require_job(db, job_id, owner_id)
         criteria = payload.model_dump(exclude={"note"})
         version = create_criteria_version(db, job, owner_id, criteria, payload.note, actor=actor)
-        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note},
+        job.requirements = {**criteria, "approval": {"status": "PENDING", "note": payload.note, "version": version.version},
                             "shortlist_trigger": (job.requirements or {}).get("shortlist_trigger", {})}
         audit(db, owner_id, None, "CRITERIA_VERSION_CREATED",
               {"job_id": job.id, "criteria_version_id": version.id, "version": version.version}, actor=actor)
@@ -1366,6 +1410,7 @@ async def approve_criteria(job_id: str, payload: CriteriaApproval, owner_id: str
             "approval": {
                 "status": "APPROVED" if payload.approved else "NEEDS_REVISION",
                 "note": payload.note,
+                "version": criteria.version,
                 "approved_at": datetime.now(timezone.utc).isoformat() if payload.approved else None,
             },
         }
@@ -1595,7 +1640,8 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             criteria.status = "APPROVED" if decision == "APPROVE" else "NEEDS_REVISION"
             criteria.approved_at = utcnow() if decision == "APPROVE" else None
             job.requirements = {**(job.requirements or {}), **criteria.criteria,
-                                "approval": {"status": criteria.status, "note": payload.note}}
+                                "approval": {"status": criteria.status, "note": payload.note,
+                                             "version": criteria.version}}
             if decision == "APPROVE":
                 task_ids = _queue_rescreens(db, job, criteria, owner_id)
         elif request.request_type == "SHORTLIST":
@@ -1652,6 +1698,17 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
     return response
 
 
+@app.put("/api/jobs/{job_id}")
+def update_job(job_id: str, payload: JobUpdate, owner_id: str = Depends(current_tenant_id),
+               actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Edit the posting text. Criteria are versioned separately and are left untouched."""
+    with session_scope() as db:
+        job = require_job(db, job_id, owner_id)
+        job.description = payload.description.strip()
+        audit(db, owner_id, None, "JOB_DESCRIPTION_UPDATED", {"job_id": job.id, "title": job.title}, actor=actor)
+        return job_dict(job)
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
     with session_scope() as db:
@@ -1659,8 +1716,14 @@ def delete_job(job_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
         linked = list(db.scalars(select(Application).where(Application.job_id == job_id, Application.owner_id == owner_id)))
         if any(a.status not in {ApplicationStatus.REJECTED.value, ApplicationStatus.ARCHIVED.value} for a in linked):
             raise HTTPException(409, "Only jobs with no candidates or rejected/archived candidates can be deleted")
+        # SQLite runs with foreign keys off, so the ON DELETE CASCADE never fires and the
+        # approval inbox would keep showing cards for a job that no longer exists.
+        approvals = db.execute(sql_delete(ApprovalRequest).where(ApprovalRequest.job_id == job_id)).rowcount
+        db.execute(sql_delete(ShortlistProposal).where(ShortlistProposal.job_id == job_id))
+        db.execute(sql_delete(CriteriaVersion).where(CriteriaVersion.job_id == job_id))
         db.delete(job)
-        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked)}
+        return {"status": "deleted", "job_id": job_id, "removed_applications": len(linked),
+                "removed_approvals": approvals}
 
 
 @app.post("/api/applications", status_code=201)
@@ -1694,7 +1757,10 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
-        criteria = latest_criteria(db, job.id, approved_only=True) or ensure_criteria_version(db, job)
+        criteria = latest_criteria(db, job.id, approved_only=True)
+        if not criteria:
+            # Screening against unapproved criteria would walk straight past the review gate.
+            raise HTTPException(409, f"{job.title}: tiêu chí chưa được duyệt nên chưa nhận CV")
         batch = UploadBatch(owner_id=owner_id, job_id=job_id, total=len(files)); db.add(batch); db.flush()
         for file in files:
             filename = (file.filename or "unnamed")[:255]
@@ -1989,7 +2055,14 @@ def create_email_template(payload: EmailTemplateCreate, owner_id: str = Depends(
 
 def policy_dict(value: InterviewPolicy) -> dict:
     return {"reminder_minutes": value.reminder_minutes, "max_reschedules": value.max_reschedules,
-            "feedback_due_hours": value.feedback_due_hours}
+            "feedback_due_hours": value.feedback_due_hours, "timezone_name": value.timezone_name,
+            "working_days": value.working_days, "working_start_hour": value.working_start_hour,
+            "working_end_hour": value.working_end_hour}
+
+
+def busy_block_dict(value: BusyBlock) -> dict:
+    return {"id": value.id, "note": value.note,
+            "start_at": utc_iso(value.start_at), "end_at": utc_iso(value.end_at)}
 
 
 @app.get("/api/interview-policy")
@@ -1999,14 +2072,50 @@ def read_interview_policy(owner_id: str = Depends(current_tenant_id)) -> dict:
 
 
 @app.put("/api/interview-policy")
-def update_interview_policy(payload: InterviewPolicyUpdate, owner_id: str = Depends(current_tenant_id)) -> dict:
+def update_interview_policy(payload: InterviewPolicyUpdate, owner_id: str = Depends(current_tenant_id),
+                            actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         value = get_policy(db, owner_id)
         value.reminder_minutes = payload.reminder_minutes
         value.max_reschedules = payload.max_reschedules
         value.feedback_due_hours = payload.feedback_due_hours
-        audit(db, owner_id, None, "INTERVIEW_POLICY_UPDATED", policy_dict(value))
+        value.timezone_name = payload.timezone_name
+        value.working_days = payload.working_days
+        value.working_start_hour = payload.working_start_hour
+        value.working_end_hour = payload.working_end_hour
+        audit(db, owner_id, None, "INTERVIEW_POLICY_UPDATED", policy_dict(value), actor=actor)
         return policy_dict(value)
+
+
+@app.get("/api/busy-blocks")
+def list_busy_blocks(owner_id: str = Depends(current_tenant_id)) -> list[dict]:
+    with session_scope() as db:
+        values = db.scalars(select(BusyBlock).where(BusyBlock.owner_id == owner_id)
+                            .order_by(BusyBlock.start_at))
+        return [busy_block_dict(value) for value in values]
+
+
+@app.post("/api/busy-blocks", status_code=201)
+def create_busy_block(payload: BusyBlockCreate, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        value = BusyBlock(owner_id=owner_id, start_at=payload.start_at, end_at=payload.end_at,
+                          note=payload.note.strip())
+        db.add(value); db.flush()
+        audit(db, owner_id, None, "BUSY_BLOCK_ADDED", busy_block_dict(value), actor=actor)
+        return busy_block_dict(value)
+
+
+@app.delete("/api/busy-blocks/{block_id}")
+def delete_busy_block(block_id: str, owner_id: str = Depends(current_tenant_id),
+                      actor: dict[str, str] = Depends(current_actor)) -> dict:
+    with session_scope() as db:
+        value = db.scalar(select(BusyBlock).where(BusyBlock.id == block_id, BusyBlock.owner_id == owner_id))
+        if not value:
+            raise HTTPException(404, "Busy block not found")
+        audit(db, owner_id, None, "BUSY_BLOCK_REMOVED", busy_block_dict(value), actor=actor)
+        db.delete(value)
+        return {"status": "deleted", "id": block_id}
 
 
 def scorecard_dict(value: InterviewScorecard) -> dict:

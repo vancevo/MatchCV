@@ -215,8 +215,24 @@ class InterviewPolicy(Base):
     reminder_minutes: Mapped[list] = mapped_column(JSON, default=lambda: [1440, 60])
     max_reschedules: Mapped[int] = mapped_column(Integer, default=2)
     feedback_due_hours: Mapped[int] = mapped_column(Integer, default=24)
+    timezone_name: Mapped[str] = mapped_column(String(80), default="Asia/Ho_Chi_Minh")
+    working_days: Mapped[list] = mapped_column(JSON, default=lambda: [0, 1, 2, 3, 4])
+    working_start_hour: Mapped[int] = mapped_column(Integer, default=9)
+    working_end_hour: Mapped[int] = mapped_column(Integer, default=17)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BusyBlock(Base):
+    """A one-off period nobody is available, such as leave or an external meeting."""
+
+    __tablename__ = "busy_blocks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    note: Mapped[str] = mapped_column(String(240), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class InterviewScorecard(Base):
