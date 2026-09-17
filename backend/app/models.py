@@ -104,6 +104,14 @@ class Application(Base):
     screening: Mapped[dict] = mapped_column(JSON, default=dict)
     pipeline: Mapped[list] = mapped_column(JSON, default=list)
     review: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # When the card last changed hands, and who moved it — a recruiter reading the list needs to
+    # know whether a decision is from this morning or from three weeks ago.
+    status_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status_changed_by: Mapped[str] = mapped_column(String(320), default="")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(320), default="")
+    # Kept so restore puts the candidate back where they were, not into a generic bucket.
+    previous_status: Mapped[str] = mapped_column(String(40), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
