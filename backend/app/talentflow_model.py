@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import asyncio
 from functools import lru_cache
@@ -8,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SYSTEM_PROMPT = """You are TalentFlow Resume Extraction Engine.
@@ -56,12 +60,23 @@ JD_SCHEMA_FIELDS = ("required_skills", "preferred_skills", "minimum_experience")
 
 def talentflow_config() -> dict[str, Any]:
     settings = get_settings()
+    configured = _talentflow_is_configured(settings)
     return {
-        "configured": bool(settings.talentflow_model_repo_id),
+        "configured": configured,
         "enabled": settings.talentflow_model_enabled,
+        "backend": settings.talentflow_model_backend,
         "repo_id": settings.talentflow_model_repo_id,
         "model_dir": settings.talentflow_model_dir,
+        "endpoint_configured": bool(settings.talentflow_inference_endpoint_url),
     }
+
+
+def _talentflow_is_configured(settings: Any) -> bool:
+    if not settings.talentflow_model_enabled:
+        return False
+    if settings.talentflow_model_backend == "remote":
+        return bool(settings.hf_token and settings.talentflow_inference_endpoint_url)
+    return bool(settings.talentflow_model_repo_id or Path(settings.talentflow_model_dir).exists())
 
 
 def build_messages(cv_text: str) -> list[dict[str, str]]:
@@ -216,8 +231,11 @@ class TalentFlowResumeExtractor:
         self.model_dir = Path(settings.talentflow_model_dir)
         self.repo_id = settings.talentflow_model_repo_id
         self.token = settings.hf_token or None
+        self.backend = settings.talentflow_model_backend
+        self.endpoint_url = settings.talentflow_inference_endpoint_url
         self._tokenizer = None
         self._model = None
+        self._remote_client = None
 
     def _ensure_local_model(self) -> Path:
         if (self.model_dir / "config.json").exists() and (self.model_dir / "model.safetensors.index.json").exists():
@@ -261,7 +279,7 @@ class TalentFlowResumeExtractor:
         )
         self._model.eval()
 
-    def _generate_json(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:
+    def _generate_json_local(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:
         self._load()
         assert self._tokenizer is not None
         assert self._model is not None
@@ -288,6 +306,40 @@ class TalentFlowResumeExtractor:
         text = self._tokenizer.decode(generated, skip_special_tokens=True)
         return parse_json_object(text)
 
+    def _ensure_remote_client(self) -> Any:
+        if self._remote_client is not None:
+            return self._remote_client
+        if not self.endpoint_url:
+            raise RuntimeError("TALENTFLOW_INFERENCE_ENDPOINT_URL is not configured")
+        if not self.token:
+            raise RuntimeError("HF_TOKEN is not configured")
+        try:
+            from huggingface_hub import InferenceClient
+        except ImportError as exc:
+            raise RuntimeError("huggingface_hub is required for TalentFlow remote inference") from exc
+        self._remote_client = InferenceClient(
+            model=self.endpoint_url,
+            token=self.token,
+            timeout=self.settings.talentflow_inference_timeout_seconds,
+        )
+        return self._remote_client
+
+    def _generate_json_remote(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:
+        response = self._ensure_remote_client().chat_completion(
+            messages=messages,
+            max_tokens=self.settings.talentflow_max_new_tokens,
+            temperature=0,
+        )
+        content = response.choices[0].message.content
+        if not isinstance(content, str):
+            raise RuntimeError("TalentFlow endpoint returned an unsupported response")
+        return parse_json_object(content)
+
+    def _generate_json(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:
+        if self.backend == "remote":
+            return self._generate_json_remote(messages)
+        return self._generate_json_local(messages)
+
     def extract(self, cv_text: str) -> dict[str, Any] | None:
         parsed = self._generate_json(build_messages(cv_text))
         return normalize_resume_schema(parsed) if parsed else None
@@ -304,23 +356,21 @@ def _extractor() -> TalentFlowResumeExtractor:
 
 async def extract_resume_schema_ai(cv_text: str) -> dict[str, Any] | None:
     settings = get_settings()
-    if not settings.talentflow_model_enabled:
-        return None
-    if not settings.talentflow_model_repo_id and not Path(settings.talentflow_model_dir).exists():
+    if not _talentflow_is_configured(settings):
         return None
     try:
         return await asyncio.to_thread(_extractor().extract, cv_text)
     except Exception:
+        logger.exception("TalentFlow resume extraction failed")
         return None
 
 
 async def extract_requirements_schema_ai(description: str) -> dict[str, Any] | None:
     settings = get_settings()
-    if not settings.talentflow_model_enabled:
-        return None
-    if not settings.talentflow_model_repo_id and not Path(settings.talentflow_model_dir).exists():
+    if not _talentflow_is_configured(settings):
         return None
     try:
         return await asyncio.to_thread(_extractor().extract_requirements, description)
     except Exception:
+        logger.exception("TalentFlow job-description extraction failed")
         return None

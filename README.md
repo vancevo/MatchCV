@@ -119,6 +119,12 @@ cp .env.example .env
 
 Mặc định backend dùng `backend/talentflow.db`, tự seed dữ liệu demo và không yêu cầu đăng nhập. API chạy tại [http://localhost:8000](http://localhost:8000), Swagger tại [http://localhost:8000/docs](http://localhost:8000/docs).
 
+Để chạy model TalentFlow 3B trực tiếp trên máy local, cài thêm các dependency nặng bằng
+`.venv/bin/pip install -r requirements-local-hf.txt` và giữ `TALENTFLOW_MODEL_BACKEND=local`.
+Trên Render, dùng `TALENTFLOW_MODEL_BACKEND=remote`, đặt `HF_TOKEN` và
+`TALENTFLOW_INFERENCE_ENDPOINT_URL` thành URL của Hugging Face Inference Endpoint đã deploy.
+Backend production chỉ gọi API từ xa, không tải PyTorch hoặc model 3B vào Render.
+
 ### 2. Frontend
 
 ```bash
