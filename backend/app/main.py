@@ -25,8 +25,11 @@ from .agentic import (
     create_criteria_version,
     ensure_criteria_version,
     latest_criteria,
+    is_ready_for_approval,
     maybe_create_shortlist,
     record_screening_artifact,
+    resync_score_routing,
+    route_scored_application,
     utcnow,
 )
 from .auth import current_actor, current_tenant_id, current_user_id, require_tenant_role
@@ -367,6 +370,15 @@ class TenantPolicyUpdate(BaseModel):
     mail_sandbox_enabled: bool = False
     mail_sandbox_base_email: str = Field(default="", max_length=320)
     mail_sandbox_max_alias: int = Field(default=100, ge=1, le=10000)
+    auto_approve_threshold: float = Field(default=80.0, ge=0, le=100)
+    auto_reject_threshold: float = Field(default=40.0, ge=0, le=100)
+    min_confidence_threshold: float = Field(default=65.0, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def thresholds_in_order(self) -> "TenantPolicyUpdate":
+        if self.auto_reject_threshold > self.auto_approve_threshold:
+            raise ValueError("auto_reject_threshold must not be greater than auto_approve_threshold")
+        return self
 
 
 class MailSandboxUpdate(BaseModel):
@@ -676,11 +688,12 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
         model_override=model_override, prompt_profile=prompt_profile,
     )
     result["interview_kit"] = await generate_interview_kit_ai(text, criteria.criteria, result, job.title, name, email)
-    result, embedding = calibrate_screening(result, text, criteria.criteria)
+    result, embedding = calibrate_screening(result, text, criteria.criteria, policy_for(db, owner_id).min_confidence_threshold)
     item = Application(owner_id=owner_id, job_id=job.id, batch_id=batch_id, candidate_name=name,
                        candidate_email=email, resume_filename=filename, resume_size=size,
                        resume_checksum=digest, resume_text=text, screening=result, pipeline=pipeline())
     db.add(item); db.flush()
+    route_scored_application(db, item, owner_id)
     ai = llm_config()
     used_openrouter = result.get("screening_source") != "rules"
     input_tokens = max(1, len(text) // 4) if used_openrouter else 0
@@ -704,7 +717,7 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
     db.add(run); db.flush()
     record_screening_usage(db, owner_id, input_tokens, output_tokens, run.cost_micros)
     record_screening_artifact(db, item, run, result, embedding)
-    maybe_create_shortlist(db, job.id, owner_id, "application_created")
+    maybe_create_shortlist(db, job.id, owner_id)
     audit(db, owner_id, item.id, "SCREENING_COMPLETED", {"score": result["final_score"], "run_id": run.id,
                                                           "criteria_version_id": criteria.id})
     return item
@@ -729,6 +742,9 @@ def _policy_dict(policy: TenantPolicy, usage: TenantUsage) -> dict:
         "mail_sandbox_enabled": policy.mail_sandbox_enabled,
         "mail_sandbox_base_email": policy.mail_sandbox_base_email,
         "mail_sandbox_max_alias": policy.mail_sandbox_max_alias,
+        "auto_approve_threshold": policy.auto_approve_threshold,
+        "auto_reject_threshold": policy.auto_reject_threshold,
+        "min_confidence_threshold": policy.min_confidence_threshold,
         "usage": {"period": usage.period, "screenings": usage.screenings,
                   "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
                   "cost_micros": usage.cost_micros},
@@ -835,11 +851,16 @@ def get_tenant_policy(owner_id: str = Depends(current_tenant_id)) -> dict:
 @app.put("/api/tenant-policy")
 def update_tenant_policy(payload: TenantPolicyUpdate,
                          owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN"))) -> dict:
+    threshold_fields = {"auto_approve_threshold", "auto_reject_threshold", "min_confidence_threshold"}
     with session_scope() as db:
         policy = policy_for(db, owner_id)
+        changed_thresholds = any(getattr(policy, field) != getattr(payload, field) for field in threshold_fields)
         for key, value in payload.model_dump().items():
             setattr(policy, key, value)
         audit(db, owner_id, None, "TENANT_POLICY_UPDATED", payload.model_dump())
+        if changed_thresholds:
+            resync = resync_score_routing(db, owner_id)
+            audit(db, owner_id, None, "SCORE_THRESHOLDS_RESYNCED", resync)
         return _policy_dict(policy, usage_for(db, owner_id))
 
 
@@ -1344,8 +1365,9 @@ def dashboard(owner_id: str = Depends(current_tenant_id)) -> dict:
         interviews = list(db.scalars(select(Interview).where(Interview.owner_id == owner_id).order_by(Interview.start_at)))
         counts = dict(db.execute(select(Application.job_id, func.count()).where(Application.owner_id == owner_id).group_by(Application.job_id)).all())
         ranked = sorted(apps, key=lambda a: a.screening.get("final_score", 0), reverse=True)
+        policy = policy_for(db, owner_id)
         return {"metrics": {"open_jobs": len(jobs), "candidates": len(apps),
-                            "awaiting_review": sum(a.status == ApplicationStatus.WAITING_REVIEW.value for a in apps), "interviews": len(interviews)},
+                            "awaiting_review": sum(is_ready_for_approval(a, policy) for a in apps), "interviews": len(interviews)},
                 "applications": [application_dict(a) for a in ranked], "jobs": [job_dict(j, counts.get(j.id, 0)) for j in jobs],
                 "interviews": [interview_dict(i) for i in interviews]}
 
@@ -1783,6 +1805,69 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
     for outbox_id in invitation_outbox_ids:
         dispatch_outbox(outbox_id)
     for invitation in invitations:
+        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
+    return response
+
+
+@app.post("/api/approvals/{approval_id}/shortlist-items/{application_id}/approve")
+def approve_shortlist_item(approval_id: str, application_id: str, owner_id: str = Depends(current_tenant_id),
+                           actor: dict[str, str] = Depends(current_actor)) -> dict:
+    """Pull one candidate out of a still-open shortlist proposal and shortlist just them,
+    leaving the rest of the proposal pending for the recruiter to keep deciding on."""
+    invitation: dict | None = None
+    outbox_id: str | None = None
+    with session_scope() as db:
+        request = db.scalar(select(ApprovalRequest).where(
+            ApprovalRequest.id == approval_id, ApprovalRequest.owner_id == owner_id,
+            ApprovalRequest.request_type == "SHORTLIST",
+        ))
+        if not request:
+            raise HTTPException(404, "Shortlist approval not found")
+        if request.status != "PENDING":
+            raise HTTPException(409, "Shortlist approval is already resolved")
+        proposal = db.scalar(select(ShortlistProposal).where(
+            ShortlistProposal.id == request.resource_id, ShortlistProposal.owner_id == owner_id,
+        ))
+        if not proposal or application_id not in proposal.application_ids:
+            raise HTTPException(404, "Candidate is not part of this shortlist")
+        application = db.scalar(select(Application).where(
+            Application.id == application_id, Application.job_id == proposal.job_id, Application.owner_id == owner_id,
+        ))
+        if not application:
+            raise HTTPException(404, "Application not found")
+        if application.status != ApplicationStatus.WAITING_REVIEW.value:
+            raise HTTPException(409, "Candidate is no longer waiting for review")
+        application.status = ApplicationStatus.SHORTLISTED.value
+        if application.candidate_email:
+            invitation, outbox_id = _create_scheduling_invitation(db, application, SchedulingInvitationCreate())
+        remaining_ids = [item for item in proposal.application_ids if item != application_id]
+        proposal.application_ids = remaining_ids
+        proposal.ranking = [row for row in proposal.ranking if row.get("application_id") != application_id]
+        still_pending = bool(remaining_ids) and bool(list(db.scalars(select(Application).where(
+            Application.id.in_(remaining_ids), Application.status == ApplicationStatus.WAITING_REVIEW.value,
+        ))))
+        job = require_job(db, proposal.job_id, owner_id)
+        approved_so_far = set((job.requirements or {}).get("shortlist_approval", {}).get("application_ids") or [])
+        approved_so_far.add(application.id)
+        job.requirements = {**(job.requirements or {}), "shortlist_approval": {
+            "status": "APPROVED", "application_ids": list(approved_so_far), "note": "Xử lý từng ứng viên",
+            "approved_at": utcnow().isoformat(), "proposal_id": proposal.id,
+        }}
+        if not still_pending:
+            proposal.status = "APPROVED"
+            proposal.decision_note = "Đã xử lý từng ứng viên trong danh sách"
+            proposal.decided_at = utcnow()
+            request.status = "APPROVED"
+            request.resolution = {"note": "Xử lý từng ứng viên", **decided_by(actor)}
+            request.decided_at = utcnow()
+        else:
+            request.payload = {**request.payload, "application_ids": proposal.application_ids, "ranking": proposal.ranking}
+        audit(db, owner_id, application.id, "SHORTLIST_ITEM_APPROVED",
+              {"approval_id": request.id, "proposal_id": proposal.id}, actor=actor)
+        response = {"approval": approval_dict(request), "application": application_dict(application)}
+    if outbox_id:
+        dispatch_outbox(outbox_id)
+    if invitation:
         schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
     return response
 
