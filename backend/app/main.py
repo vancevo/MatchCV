@@ -36,12 +36,22 @@ from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config,
 from .master_seed import create_master_user, has_master_seed_config
 from .models import (
     AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
+    CandidateProfile, CandidateResumeVersion, ResumeVersionComparison, ResumeVersionEmbedding,
+    ResumeVersionSkill,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
     InterviewPolicy, InterviewScorecard, Job, OutboxEvent, ProviderWebhookEvent,
     SchedulingInvitation, ScreeningArtifact, ShortlistProposal, SourceConnector, SourceIngestion, Tenant,
     TenantMembership, TenantPolicy, TenantUsage, ModelPolicy, OperationalAlert, OperationalSLOPolicy,
     ReleaseGate, UploadBatch,
 )
+from .candidate_profiles import (
+    candidate_phone, candidate_profile_dict, create_resume_version, resolve_candidate_profile,
+    resume_extraction_snapshot,
+)
+from .resume_comparison import comparison_dict, ensure_resume_version_comparison, sync_resume_version_skills
+from .candidate_search import CandidateVersionMatch, cosine_similarity, rank_candidate_versions
+from .embedding_service import EmbeddingUnavailable, get_embedding_service
+from .semantic_index import index_resume_versions
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
 from .resume import (
     CONTENT_TYPES,
@@ -193,6 +203,27 @@ class ClearRecruitmentData(BaseModel):
         if value.strip().upper() != "XOA TOAN BO":
             raise ValueError("confirmation must be XOA TOAN BO")
         return value
+
+
+class CandidateSearchFilters(BaseModel):
+    minimum_experience: float | None = Field(default=None, ge=0, le=60)
+    latest_cv_only: bool = False
+    required_skill_ids: list[str] = Field(default_factory=list, max_length=30)
+    preferred_skill_ids: list[str] = Field(default_factory=list, max_length=30)
+
+
+class CandidateSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=500)
+    filters: CandidateSearchFilters = Field(default_factory=CandidateSearchFilters)
+    limit: int = Field(default=20, ge=1, le=50)
+
+    @field_validator("query")
+    @classmethod
+    def require_meaningful_query(cls, value: str) -> str:
+        cleaned = value.strip()
+        if len(cleaned) < 2:
+            raise ValueError("query must contain at least 2 visible characters")
+        return cleaned
 
 
 class CriteriaUpdate(BaseModel):
@@ -553,7 +584,10 @@ def application_dict(item: Application) -> dict:
             "experience_years": 0,
         }
     return {"id": item.id, "job_id": item.job_id, "batch_id": item.batch_id,
-            "candidate": {"name": item.candidate_name, "email": item.candidate_email}, "status": item.status,
+            "candidate_profile_id": item.candidate_profile_id,
+            "resume_version_id": item.resume_version_id,
+            "candidate": {"name": item.candidate_name, "email": item.candidate_email,
+                          "phone": item.candidate_phone or ""}, "status": item.status,
             "resume_filename": item.resume_filename, "resume_size": item.resume_size,
             "screening": screening, "pipeline": item.pipeline, "review": item.review,
             "status_changed_at": utc_iso(item.status_changed_at) if item.status_changed_at else None,
@@ -663,6 +697,26 @@ def require_application(db, application_id: str, owner_id: str) -> Application:
     return value
 
 
+def require_candidate_profile(db, profile_id: str, owner_id: str) -> CandidateProfile:
+    value = db.scalar(select(CandidateProfile).where(
+        CandidateProfile.id == profile_id, CandidateProfile.owner_id == owner_id,
+    ))
+    if not value:
+        raise HTTPException(404, "Candidate profile not found")
+    return value
+
+
+def require_resume_version(db, profile_id: str, version_id: str, owner_id: str) -> CandidateResumeVersion:
+    value = db.scalar(select(CandidateResumeVersion).where(
+        CandidateResumeVersion.id == version_id,
+        CandidateResumeVersion.candidate_profile_id == profile_id,
+        CandidateResumeVersion.owner_id == owner_id,
+    ))
+    if not value:
+        raise HTTPException(404, "Resume version not found")
+    return value
+
+
 async def build_application(db, owner_id: str, job: Job, name: str, email: str, text: str,
                             filename: str | None = None, size: int | None = None,
                             digest: str | None = None, batch_id: str | None = None) -> Application:
@@ -677,8 +731,23 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
     )
     result["interview_kit"] = await generate_interview_kit_ai(text, criteria.criteria, result, job.title, name, email)
     result, embedding = calibrate_screening(result, text, criteria.criteria)
-    item = Application(owner_id=owner_id, job_id=job.id, batch_id=batch_id, candidate_name=name,
-                       candidate_email=email, resume_filename=filename, resume_size=size,
+    application_id = str(uuid4())
+    digest = digest or hashlib.sha256(text.encode()).hexdigest()
+    phone = candidate_phone(text)
+    profile = resolve_candidate_profile(
+        db, owner_id=owner_id, name=name, email=email, phone=phone,
+    )
+    version = create_resume_version(
+        db, profile=profile, storage_key=application_id, original_filename=filename,
+        file_size=size, checksum=digest, extracted_text=text,
+        extraction=resume_extraction_snapshot(
+            name=name, email=email, phone=phone, screening=result,
+        ),
+    )
+    item = Application(id=application_id, owner_id=owner_id, job_id=job.id, batch_id=batch_id,
+                       candidate_profile_id=profile.id, resume_version_id=version.id,
+                       candidate_name=name, candidate_email=email, candidate_phone=phone,
+                       resume_filename=version.version_filename, resume_size=size,
                        resume_checksum=digest, resume_text=text, screening=result, pipeline=pipeline())
     db.add(item); db.flush()
     ai = llm_config()
@@ -738,7 +807,13 @@ def _policy_dict(policy: TenantPolicy, usage: TenantUsage) -> dict:
 def _erase_application(db, item: Application, reason: str) -> None:
     # Remove the private object before deleting database metadata. A storage error aborts the
     # transaction, so the UI never reports success while a personal-data object is left behind.
-    delete_resume_file(item.owner_id, item.id, item.resume_filename)
+    version = db.get(CandidateResumeVersion, item.resume_version_id) if item.resume_version_id else None
+    profile_id = item.candidate_profile_id
+    delete_resume_file(
+        item.owner_id,
+        version.storage_key if version else item.id,
+        version.version_filename if version else item.resume_filename,
+    )
     interview_ids = list(db.scalars(select(Interview.id).where(Interview.application_id == item.id)))
     run_ids = list(db.scalars(select(AgentRun.id).where(AgentRun.application_id == item.id)))
     for ingestion in db.scalars(select(SourceIngestion).where(SourceIngestion.application_id == item.id)):
@@ -777,6 +852,30 @@ def _erase_application(db, item: Application, reason: str) -> None:
         "application_hash": hashlib.sha256(item.id.encode()).hexdigest(), "reason": reason,
     })
     db.delete(item)
+    db.flush()
+    if version and not db.scalar(select(func.count()).select_from(Application).where(
+        Application.resume_version_id == version.id
+    )):
+        db.execute(sql_delete(ResumeVersionComparison).where(or_(
+            ResumeVersionComparison.from_version_id == version.id,
+            ResumeVersionComparison.to_version_id == version.id,
+        )))
+        db.execute(sql_delete(ResumeVersionEmbedding).where(
+            ResumeVersionEmbedding.resume_version_id == version.id
+        ))
+        db.execute(sql_delete(ResumeVersionSkill).where(
+            ResumeVersionSkill.resume_version_id == version.id
+        ))
+        db.delete(version)
+        db.flush()
+    if profile_id and not db.scalar(select(func.count()).select_from(Application).where(
+        Application.candidate_profile_id == profile_id
+    )) and not db.scalar(select(func.count()).select_from(CandidateResumeVersion).where(
+        CandidateResumeVersion.candidate_profile_id == profile_id
+    )):
+        profile = db.get(CandidateProfile, profile_id)
+        if profile:
+            db.delete(profile)
 
 
 @app.post("/api/tenants", status_code=201)
@@ -1146,7 +1245,8 @@ def live() -> dict:
 def health() -> dict:
     queue = queue_summary()
     return {"status": "ok" if queue["reachable"] else "degraded", "service": "talentflow-api", "ai": llm_config(),
-            "queue": queue, "auth_required": get_settings().auth_required,
+            "queue": queue, "embedding": get_embedding_service().status(),
+            "auth_required": get_settings().auth_required,
             "environment": get_settings().environment,
             "integrations": {"provider": get_settings().integration_provider,
                              "real_side_effects": get_settings().integration_provider != "local",
@@ -1360,16 +1460,32 @@ def clear_recruitment_data(
         counts = {
             "jobs": db.scalar(select(func.count()).select_from(Job).where(Job.owner_id == owner_id)) or 0,
             "applications": db.scalar(select(func.count()).select_from(Application).where(Application.owner_id == owner_id)) or 0,
+            "candidate_profiles": db.scalar(select(func.count()).select_from(CandidateProfile).where(CandidateProfile.owner_id == owner_id)) or 0,
+            "resume_versions": db.scalar(select(func.count()).select_from(CandidateResumeVersion).where(CandidateResumeVersion.owner_id == owner_id)) or 0,
             "interviews": db.scalar(select(func.count()).select_from(Interview).where(Interview.owner_id == owner_id)) or 0,
         }
+        versions = list(db.scalars(select(CandidateResumeVersion).where(
+            CandidateResumeVersion.owner_id == owner_id
+        )))
+        version_ids = {value.id for value in versions}
+        for value in versions:
+            delete_resume_file(value.owner_id, value.storage_key, value.version_filename)
+        # Legacy applications created before CV versioning may still own their file directly.
         applications = list(db.scalars(select(Application).where(Application.owner_id == owner_id)))
         for item in applications:
-            delete_resume_file(item.owner_id, item.id, item.resume_filename)
+            if not item.resume_version_id or item.resume_version_id not in version_ids:
+                delete_resume_file(item.owner_id, item.id, item.resume_filename)
+        if version_ids:
+            db.execute(sql_delete(ResumeVersionSkill).where(
+                ResumeVersionSkill.resume_version_id.in_(version_ids)
+            ))
         # Delete in dependency order so the operation behaves consistently in SQLite and PostgreSQL.
         for model in (
             FeedbackSummary, InterviewScorecard, OutboxEvent, SchedulingInvitation, Interview,
             ScreeningArtifact, AgentTask, AgentStep, AgentRun, BatchItem, ShortlistProposal,
-            ApprovalRequest, CriteriaVersion, UploadBatch, Application, Job, AuditLog,
+            ApprovalRequest, CriteriaVersion, UploadBatch, ResumeVersionComparison, ResumeVersionEmbedding,
+            Application, CandidateResumeVersion,
+            CandidateProfile, Job, AuditLog,
         ):
             db.execute(sql_delete(model).where(model.owner_id == owner_id))
         audit(db, owner_id, None, "RECRUITMENT_DATA_CLEARED", counts)
@@ -1412,9 +1528,247 @@ def list_applications(
             statement = statement.where(Application.job_id == job_id)
         if q and q.strip():
             pattern = f"%{q.strip()}%"
-            statement = statement.where(or_(Application.candidate_name.ilike(pattern), Application.candidate_email.ilike(pattern)))
+            statement = statement.where(or_(Application.candidate_name.ilike(pattern),
+                                            Application.candidate_email.ilike(pattern),
+                                            Application.candidate_phone.ilike(pattern)))
         statement = statement.order_by(Application.created_at.desc()).offset(offset).limit(limit)
         return [application_dict(item) for item in db.scalars(statement)]
+
+
+@app.get("/api/candidate-profiles")
+def list_candidate_profiles(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    q: str | None = Query(None, max_length=200),
+    owner_id: str = Depends(current_tenant_id),
+) -> list[dict]:
+    with session_scope() as db:
+        statement = select(CandidateProfile).where(CandidateProfile.owner_id == owner_id)
+        if q and q.strip():
+            pattern = f"%{q.strip()}%"
+            statement = statement.where(or_(
+                CandidateProfile.full_name.ilike(pattern),
+                CandidateProfile.email.ilike(pattern),
+                CandidateProfile.phone.ilike(pattern),
+            ))
+        values = db.scalars(statement.order_by(CandidateProfile.last_seen_at.desc()).offset(offset).limit(limit))
+        return [candidate_profile_dict(db, value) for value in values]
+
+
+def _search_result(db, ranked, profiles: dict[str, CandidateProfile],
+                   versions: dict[str, CandidateResumeVersion],
+                   entries: dict[str, ResumeVersionEmbedding]) -> dict:
+    profile = profiles[ranked.candidate_profile_id]
+    version = versions[ranked.matched_version_id]
+    other_versions = [versions[value] for value in ranked.other_matching_version_ids if value in versions]
+    return {
+        "candidate_profile": candidate_profile_dict(db, profile),
+        "matched_version": {"id": version.id, "version": version.version_number,
+                            "filename": version.version_filename},
+        "score": ranked.score,
+        "score_components": dict(ranked.score_components),
+        "matched_skills": list(ranked.matched_required_skills) or list(
+            entries[version.id].canonical_skills or []
+        ),
+        "missing_skills": list(ranked.missing_required_skills),
+        "evidence": [dict(value) for value in ranked.evidence],
+        "other_matching_versions": [
+            {"id": value.id, "version": value.version_number, "filename": value.version_filename}
+            for value in other_versions
+        ],
+    }
+
+
+def _candidate_search_matches(
+    versions: list[CandidateResumeVersion],
+    entries: dict[str, ResumeVersionEmbedding],
+    *,
+    query_vector: list[float] | None = None,
+    query: str = "",
+) -> list[CandidateVersionMatch]:
+    tokens = {token for token in re.findall(r"\w+", query.casefold(), flags=re.UNICODE) if len(token) > 1}
+    matches = []
+    for version in versions:
+        entry = entries.get(version.id)
+        if not entry:
+            continue
+        if query_vector is not None and entry.status == "READY" and entry.embedding:
+            similarity = cosine_similarity(query_vector, entry.embedding)
+        else:
+            document_tokens = set(re.findall(r"\w+", entry.search_document.casefold(), flags=re.UNICODE))
+            similarity = len(tokens & document_tokens) / max(1, len(tokens))
+        skills = frozenset(str(value).casefold() for value in (entry.canonical_skills or []))
+        evidence_text = next((line for line in entry.search_document.splitlines()
+                              if tokens & set(re.findall(r"\w+", line.casefold(), flags=re.UNICODE))), "")
+        evidence = ({"text": evidence_text or entry.search_document[:360], "category": "CV",
+                     "resume_version_id": version.id, "version": version.version_number},)
+        matches.append(CandidateVersionMatch(
+            candidate_profile_id=version.candidate_profile_id,
+            resume_version_id=version.id,
+            version_number=version.version_number,
+            semantic_similarity=similarity,
+            skill_ids=skills,
+            experience_years=entry.experience_years,
+            submitted_at=version.submitted_at,
+            evidence=evidence,
+        ))
+    return matches
+
+
+@app.post("/api/candidate-profiles/search")
+def search_candidate_profiles(
+    payload: CandidateSearchRequest,
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    query = payload.query.strip()
+    with session_scope() as db:
+        versions = list(db.scalars(select(CandidateResumeVersion).where(
+            CandidateResumeVersion.owner_id == owner_id,
+        ).order_by(CandidateResumeVersion.version_number.desc())))
+        versions = [value for value in versions if value.extraction]
+        if payload.filters.latest_cv_only:
+            latest: dict[str, CandidateResumeVersion] = {}
+            for version in versions:
+                latest.setdefault(version.candidate_profile_id, version)
+            versions = list(latest.values())
+
+        index_result = index_resume_versions(db, versions)
+        runtime = get_embedding_service()
+        entries = list(db.scalars(select(ResumeVersionEmbedding).where(
+            ResumeVersionEmbedding.owner_id == owner_id,
+            ResumeVersionEmbedding.resume_version_id.in_([value.id for value in versions]),
+            ResumeVersionEmbedding.model_name == runtime.config.model_name,
+            ResumeVersionEmbedding.model_revision == runtime.config.model_revision,
+        ))) if versions else []
+        entries_by_version = {value.resume_version_id: value for value in entries}
+        mode = "SEMANTIC"
+        warning = None
+        query_vector = None
+        try:
+            query_vector = runtime.embed_query(query)
+            if not any(value.status == "READY" and value.embedding for value in entries):
+                raise EmbeddingUnavailable("Chưa có CV nào được lập chỉ mục semantic")
+        except (EmbeddingUnavailable, RuntimeError) as exc:
+            mode = "KEYWORD_FALLBACK"
+            warning = f"Semantic Search chưa sẵn sàng ({exc}). Đang dùng tìm kiếm từ khoá trên dữ liệu CV."
+
+        matches = _candidate_search_matches(
+            versions, entries_by_version, query_vector=query_vector if mode == "SEMANTIC" else None,
+            query=query,
+        )
+        required = [value.strip().casefold() for value in payload.filters.required_skill_ids if value.strip()]
+        preferred = [value.strip().casefold() for value in payload.filters.preferred_skill_ids if value.strip()]
+        ranked = rank_candidate_versions(
+            matches,
+            required_skill_ids=required,
+            preferred_skill_ids=preferred,
+            minimum_experience=payload.filters.minimum_experience,
+            minimum_experience_is_hard_filter=payload.filters.minimum_experience is not None,
+            limit=payload.limit,
+        )
+        if mode == "KEYWORD_FALLBACK":
+            ranked = [value for value in ranked if value.score_components["semantic"] > 50]
+        profiles = {value.id: value for value in db.scalars(select(CandidateProfile).where(
+            CandidateProfile.owner_id == owner_id,
+            CandidateProfile.id.in_([value.candidate_profile_id for value in ranked]),
+        ))} if ranked else {}
+        versions_by_id = {value.id: value for value in versions}
+        return {
+            "query": query,
+            "mode": mode,
+            "semantic_available": mode == "SEMANTIC",
+            "warning": warning or index_result.get("warning"),
+            "results": [_search_result(db, value, profiles, versions_by_id, entries_by_version)
+                        for value in ranked],
+        }
+
+
+@app.get("/api/candidate-profiles/search/status")
+def candidate_search_status(owner_id: str = Depends(current_tenant_id)) -> dict:
+    with session_scope() as db:
+        counts = dict(db.execute(select(
+            ResumeVersionEmbedding.status, func.count(),
+        ).where(ResumeVersionEmbedding.owner_id == owner_id).group_by(ResumeVersionEmbedding.status)).all())
+    return {"runtime": get_embedding_service().status(), "index": counts}
+
+
+@app.post("/api/candidate-profiles/search/reindex")
+def reindex_candidate_profiles(
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        versions = list(db.scalars(select(CandidateResumeVersion).where(
+            CandidateResumeVersion.owner_id == owner_id,
+        ).order_by(CandidateResumeVersion.submitted_at)))
+        result = index_resume_versions(db, versions, force=True)
+        audit(db, owner_id, None, "CANDIDATE_SEMANTIC_INDEX_REBUILT", result)
+        return result
+
+
+@app.get("/api/candidate-profiles/{profile_id}")
+def get_candidate_profile(profile_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
+    with session_scope() as db:
+        return candidate_profile_dict(db, require_candidate_profile(db, profile_id, owner_id))
+
+
+def _comparison_response(db, value: ResumeVersionComparison) -> dict:
+    previous = db.get(CandidateResumeVersion, value.from_version_id)
+    current = db.get(CandidateResumeVersion, value.to_version_id)
+    if not previous or not current:
+        raise HTTPException(404, "Resume comparison versions not found")
+    return comparison_dict(value, previous, current)
+
+
+@app.get("/api/candidate-profiles/{profile_id}/resume-comparisons")
+def list_resume_version_comparisons(
+    profile_id: str,
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    with session_scope() as db:
+        require_candidate_profile(db, profile_id, owner_id)
+        values = list(db.scalars(select(ResumeVersionComparison).where(
+            ResumeVersionComparison.candidate_profile_id == profile_id,
+            ResumeVersionComparison.owner_id == owner_id,
+        ).order_by(ResumeVersionComparison.created_at.desc())))
+        return {"items": [_comparison_response(db, value) for value in values]}
+
+
+@app.get("/api/candidate-profiles/{profile_id}/resume-comparisons/{comparison_id}")
+def get_resume_version_comparison(
+    profile_id: str,
+    comparison_id: str,
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    with session_scope() as db:
+        value = db.scalar(select(ResumeVersionComparison).where(
+            ResumeVersionComparison.id == comparison_id,
+            ResumeVersionComparison.candidate_profile_id == profile_id,
+            ResumeVersionComparison.owner_id == owner_id,
+        ))
+        if not value:
+            raise HTTPException(404, "Resume version comparison not found")
+        return _comparison_response(db, value)
+
+
+@app.post("/api/candidate-profiles/{profile_id}/resume-comparisons/rebuild")
+def rebuild_resume_version_comparisons(
+    profile_id: str,
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    with session_scope() as db:
+        require_candidate_profile(db, profile_id, owner_id)
+        versions = list(db.scalars(select(CandidateResumeVersion).where(
+            CandidateResumeVersion.candidate_profile_id == profile_id,
+            CandidateResumeVersion.owner_id == owner_id,
+        ).order_by(CandidateResumeVersion.version_number)))
+        rebuilt = []
+        for version in versions:
+            if version.extraction:
+                sync_resume_version_skills(db, version)
+                comparison = ensure_resume_version_comparison(db, version, rebuild=True)
+                if comparison:
+                    rebuilt.append(comparison.id)
+        return {"profile_id": profile_id, "rebuilt": len(rebuilt), "comparison_ids": rebuilt}
 
 
 @app.post("/api/jobs", status_code=201)
@@ -1830,11 +2184,20 @@ def read_resume(application_id: str, owner_id: str = Depends(current_tenant_id))
     """Extracted CV text plus a short-lived URL for the private original upload."""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
-        file_url = resume_file_url(owner_id, item.id, item.resume_filename)
-        suffix = Path(item.resume_filename or "").suffix.lower()
-        return {"application_id": item.id, "filename": item.resume_filename,
-                "size": item.resume_size, "checksum": item.resume_checksum,
-                "text": item.resume_text or "",
+        version = db.get(CandidateResumeVersion, item.resume_version_id) if item.resume_version_id else None
+        storage_key = version.storage_key if version else item.id
+        filename = version.version_filename if version else item.resume_filename
+        file_url = resume_file_url(owner_id, storage_key, filename)
+        suffix = Path(filename or "").suffix.lower()
+        return {"application_id": item.id, "resume_version_id": version.id if version else None,
+                "version": version.version_number if version else None, "filename": filename,
+                "original_filename": version.original_filename if version else item.resume_filename,
+                "size": version.file_size if version else item.resume_size,
+                "checksum": version.checksum if version else item.resume_checksum,
+                "submitted_at": utc_iso(version.submitted_at) if version else utc_iso(item.created_at),
+                "extracted_at": utc_iso(version.extracted_at) if version and version.extracted_at else None,
+                "extraction": version.extraction if version else {},
+                "text": version.extracted_text if version else (item.resume_text or ""),
                 "file_available": bool(file_url), "file_url": file_url,
                 "file_type": suffix.lstrip(".")}
 
@@ -1844,17 +2207,63 @@ def read_resume_file(application_id: str, owner_id: str = Depends(current_tenant
     """Compatibility route for local development; production returns a private signed URL above."""
     with session_scope() as db:
         item = require_application(db, application_id, owner_id)
+        version = db.get(CandidateResumeVersion, item.resume_version_id) if item.resume_version_id else None
+        storage_key = version.storage_key if version else item.id
+        filename = version.version_filename if version else item.resume_filename
         if settings.resume_storage_backend != "local":
-            url = resume_file_url(owner_id, item.id, item.resume_filename)
+            url = resume_file_url(owner_id, storage_key, filename)
             if not url:
                 raise HTTPException(404, "Original file is not stored for this application")
             return RedirectResponse(url)
-        filename = item.resume_filename
-        path = stored_resume_path(item.id, filename)
+        path = stored_resume_path(storage_key, filename)
     if not path or not path.exists():
         raise HTTPException(404, "Original file is not stored for this application")
     return FileResponse(path, media_type=CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"),
                         filename=filename or path.name, content_disposition_type="inline")
+
+
+@app.get("/api/candidate-profiles/{profile_id}/resume-versions/{version_id}")
+def read_candidate_resume_version(
+    profile_id: str, version_id: str, owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    with session_scope() as db:
+        version = require_resume_version(db, profile_id, version_id, owner_id)
+        if settings.resume_storage_backend == "local":
+            path = stored_resume_path(version.storage_key, version.version_filename)
+            file_url = (
+                f"/api/candidate-profiles/{profile_id}/resume-versions/{version_id}/file"
+                if path and path.exists() else None
+            )
+        else:
+            file_url = resume_file_url(owner_id, version.storage_key, version.version_filename)
+        suffix = Path(version.version_filename).suffix.lower()
+        return {"application_id": None, "resume_version_id": version.id,
+                "version": version.version_number, "filename": version.version_filename,
+                "original_filename": version.original_filename, "size": version.file_size,
+                "checksum": version.checksum, "submitted_at": utc_iso(version.submitted_at),
+                "extracted_at": utc_iso(version.extracted_at) if version.extracted_at else None,
+                "extraction": version.extraction or {},
+                "text": version.extracted_text, "file_available": bool(file_url),
+                "file_url": file_url, "file_type": suffix.lstrip(".")}
+
+
+@app.get("/api/candidate-profiles/{profile_id}/resume-versions/{version_id}/file")
+def read_candidate_resume_version_file(
+    profile_id: str, version_id: str, owner_id: str = Depends(current_tenant_id),
+) -> Response:
+    with session_scope() as db:
+        version = require_resume_version(db, profile_id, version_id, owner_id)
+        if settings.resume_storage_backend != "local":
+            url = resume_file_url(owner_id, version.storage_key, version.version_filename)
+            if not url:
+                raise HTTPException(404, "Original file is not stored for this resume version")
+            return RedirectResponse(url)
+        path = stored_resume_path(version.storage_key, version.version_filename)
+        filename = version.version_filename
+    if not path or not path.exists():
+        raise HTTPException(404, "Original file is not stored for this resume version")
+    return FileResponse(path, media_type=CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                        filename=filename, content_disposition_type="inline")
 
 
 @app.get("/api/applications/{application_id}/interview-kit")
@@ -1904,33 +2313,40 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                     continue
 
                 name, email = candidate_identity(text, filename)
+                phone = candidate_phone(text)
                 application_id = str(uuid5(NAMESPACE_URL, f"talentflow:{owner_id}:{job_id}:{digest}"))
                 run_suffix = "v1"
-                application = Application(
-                    id=application_id,
-                    owner_id=owner_id,
-                    job_id=job.id,
-                    batch_id=batch.id,
-                    candidate_name=name,
-                    candidate_email=email,
-                    status=ApplicationStatus.PROCESSING.value,
-                    resume_filename=filename,
-                    resume_size=len(content),
-                    resume_checksum=digest,
-                    resume_text=text,
-                    screening={},
-                    pipeline=screening_pipeline("Candidate Extracted"),
-                )
                 try:
                     with db.begin_nested():
+                        profile = resolve_candidate_profile(
+                            db, owner_id=owner_id, name=name, email=email, phone=phone,
+                        )
+                        version = create_resume_version(
+                            db, profile=profile, storage_key=application_id,
+                            original_filename=filename, file_size=len(content),
+                            checksum=digest, extracted_text=text,
+                        )
+                        application = Application(
+                            id=application_id,
+                            owner_id=owner_id,
+                            job_id=job.id,
+                            batch_id=batch.id,
+                            candidate_profile_id=profile.id,
+                            resume_version_id=version.id,
+                            candidate_name=name,
+                            candidate_email=email,
+                            candidate_phone=phone,
+                            status=ApplicationStatus.PROCESSING.value,
+                            resume_filename=version.version_filename,
+                            resume_size=len(content),
+                            resume_checksum=digest,
+                            resume_text=text,
+                            screening={},
+                            pipeline=screening_pipeline("Candidate Extracted"),
+                        )
                         db.add(application)
                         db.flush()
-                    try:
-                        store_resume_file(owner_id, application_id, filename, content)
-                    except Exception:
-                        db.delete(application)
-                        db.flush()
-                        raise
+                        store_resume_file(owner_id, application_id, version.version_filename, content)
                 except IntegrityError:
                     duplicate = db.scalar(select(Application).where(
                         Application.owner_id == owner_id,
@@ -1968,7 +2384,9 @@ async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(.
                 batch_item.task_id = task.id
                 task_ids.append(task.id)
                 audit(db, owner_id, application.id, "CV_EXTRACTED",
-                      {"filename": filename, "size": len(content), "checksum": digest, "stored_original": True,
+                      {"filename": version.version_filename, "original_filename": filename,
+                       "resume_version": version.version_number, "candidate_profile_id": profile.id,
+                       "size": len(content), "checksum": digest, "stored_original": True,
                        "storage_backend": get_settings().resume_storage_backend})
                 audit(db, owner_id, application.id, "SCREENING_QUEUED", {"task_id": task.id, "run_id": run.id})
             except HTTPException as exc:
@@ -2774,6 +3192,22 @@ def seed(owner_id: str = "00000000-0000-0000-0000-000000000001") -> None:
         screening = screen_candidate(SAMPLE_CV, job.requirements)
         screening, _embedding = calibrate_screening(screening, SAMPLE_CV, criteria.criteria)
         screening["interview_kit"] = generate_interview_kit(SAMPLE_CV, job.requirements, screening, job.title)
-        db.add(Application(id="app-001", owner_id=owner_id, job_id=job.id, candidate_name="Nguyễn Minh Anh",
-                           candidate_email="minhanh@example.com", resume_text=SAMPLE_CV,
+        seed_phone = candidate_phone(SAMPLE_CV)
+        profile = resolve_candidate_profile(
+            db, owner_id=owner_id, name="Nguyễn Minh Anh", email="minhanh@example.com", phone=seed_phone,
+        )
+        version = create_resume_version(
+            db, profile=profile, storage_key="app-001", original_filename="Nguyen_Minh_Anh.txt",
+            file_size=len(SAMPLE_CV.encode()), checksum=hashlib.sha256(SAMPLE_CV.encode()).hexdigest(),
+            extracted_text=SAMPLE_CV,
+            extraction=resume_extraction_snapshot(
+                name="Nguyễn Minh Anh", email="minhanh@example.com", phone=seed_phone,
+                screening=screening,
+            ),
+        )
+        db.add(Application(id="app-001", owner_id=owner_id, job_id=job.id,
+                           candidate_profile_id=profile.id, resume_version_id=version.id,
+                           candidate_name="Nguyễn Minh Anh", candidate_email="minhanh@example.com",
+                           candidate_phone=seed_phone, resume_filename=version.version_filename,
+                           resume_size=version.file_size, resume_checksum=version.checksum, resume_text=SAMPLE_CV,
                            screening=screening, pipeline=pipeline()))

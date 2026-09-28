@@ -22,9 +22,10 @@ type InterviewKit = {
 };
 type Application = {
   id: string; job_id: string; status: string; resume_filename?: string;
+  candidate_profile_id?: string | null; resume_version_id?: string | null;
   status_changed_at?: string | null; status_changed_by?: string;
   created_at?: string | null;
-  candidate: { name: string; email: string };
+  candidate: { name: string; email: string; phone?: string };
   screening: {
     final_score: number; raw_score?: number; confidence?: number; recommendation: string;
     evidence: Evidence[]; experience_years: number; interview_kit?: InterviewKit;
@@ -34,6 +35,57 @@ type Application = {
   };
   pipeline: Step[];
 };
+type ResumeExtraction = {
+  candidate?: { name?: string; email?: string; phone?: string };
+  profile?: {
+    skills?: string[]; experience_years?: number; education?: string[];
+    summary?: string; extraction_source?: string;
+  };
+  evidence?: Evidence[];
+  screening_source?: string;
+};
+type CandidateProfile = {
+  id: string; name: string; email: string; phone: string;
+  first_seen_at: string | null; last_seen_at: string | null;
+  resume_count: number; application_count: number;
+  resume_versions: {
+    id: string; version: number; filename: string; original_filename: string | null;
+    size: number | null; checksum: string; submitted_at: string;
+    extracted_at: string | null; extraction: ResumeExtraction;
+    change: { kind: string; similarity_percent: number | null; word_delta: number; summary: string };
+    applications: { id: string; job_id: string; job_title: string; status: string; submitted_at: string }[];
+  }[];
+};
+type ResumeComparisonItem = { category: string; value: string; evidence?: string | null };
+type ResumeComparisonModified = {
+  category: string; before: string; after: string; change_type?: string; evidence?: string | null;
+};
+type ResumeComparisonConflict = { category: string; before: string; after: string; reason: string };
+type ResumeComparison = {
+  id: string; candidate_profile_id: string;
+  from_version: { id: string; version: number; filename: string };
+  to_version: { id: string; version: number; filename: string };
+  added: ResumeComparisonItem[]; removed: ResumeComparisonItem[];
+  modified: ResumeComparisonModified[]; unchanged: ResumeComparisonItem[];
+  conflicts: ResumeComparisonConflict[];
+  summary: { added_count: number; removed_count: number; modified_count: number; unchanged_count: number; conflict_count: number };
+  confidence: number; analysis_method: string; model_name?: string | null; model_version?: string | null; created_at: string;
+};
+type CandidateSearchEvidence = {
+  text?: string; evidence?: string; quote?: string; category?: string; field?: string; section?: string;
+  resume_version_id?: string; version?: number; source?: string;
+};
+type CandidateSearchResult = {
+  candidate_profile: CandidateProfile;
+  matched_version: { id: string; version: number; filename: string } | null;
+  score: number;
+  score_components?: Record<string, number>;
+  matched_skills?: string[];
+  missing_skills?: string[];
+  evidence?: CandidateSearchEvidence[];
+  other_matching_versions?: { id: string; version: number; filename: string; score?: number }[];
+};
+type CandidateSearchResponse = { query: string; mode: string; semantic_available?: boolean; warning?: string; results: CandidateSearchResult[] };
 type Job = {
   id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
   requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string; version?: number }; shortlist_approval?: { status: string; application_ids?: string[] } };
@@ -71,6 +123,35 @@ type AuditLog = {
 type Integration = {
   provider: string; status: string; account_email: string; scopes: string[]; expires_at: string | null;
 };
+type SidebarItem = {
+  view: string; label: string; icon: string; badge?: "applications" | "approvals" | "interviews";
+};
+type SidebarGroup = {
+  id: string; label: string; icon: string; children: SidebarItem[];
+};
+
+const SIDEBAR_GROUPS: SidebarGroup[] = [
+  { id: "recruitment", label: "Tuyển dụng", icon: "briefcase", children: [
+    { view: "Việc làm", label: "Việc làm", icon: "briefcase" },
+    { view: "Ứng viên", label: "Hồ sơ ứng tuyển", icon: "users", badge: "applications" },
+    { view: "Phê duyệt", label: "Phê duyệt", icon: "bell", badge: "approvals" },
+    { view: "Phỏng vấn", label: "Phỏng vấn", icon: "calendar", badge: "interviews" },
+  ] },
+  { id: "talent-pool", label: "Ứng viên", icon: "users", children: [
+    { view: "Kho ứng viên", label: "Hồ sơ ứng viên", icon: "file" },
+  ] },
+  { id: "calendar", label: "Lịch & Liên lạc", icon: "calendar", children: [
+    { view: "Lịch làm việc", label: "Lịch làm việc", icon: "clock" },
+    { view: "Mail Sandbox", label: "Mail Sandbox", icon: "bell" },
+  ] },
+  { id: "ai-agent", label: "AI Agent", icon: "spark", children: [
+    { view: "Pipeline", label: "Pipeline", icon: "spark" },
+    { view: "Lịch sử", label: "Lịch sử hoạt động", icon: "clock" },
+  ] },
+  { id: "system", label: "Hệ thống", icon: "grid", children: [
+    { view: "Xoá dữ liệu", label: "Quản lý dữ liệu", icon: "trash" },
+  ] },
+];
 
 const emptyDashboard: Dashboard = {
   metrics: { open_jobs: 0, candidates: 0, awaiting_review: 0, interviews: 0 },
@@ -267,6 +348,8 @@ function RecruiterApp() {
   const [authReady, setAuthReady] = useState(!supabase);
   const [dashboard, setDashboard] = useState<Dashboard>(emptyDashboard);
   const [active, setActive] = useState("Tổng quan");
+  const [expandedGroup, setExpandedGroup] = useState<string | null>("recruitment");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [selected, setSelected] = useState<Application | null>(null);
   const [explained, setExplained] = useState<Application | null>(null);
   const [rowResume, setRowResume] = useState<{ resume: Resume; name: string } | null>(null);
@@ -313,6 +396,16 @@ function RecruiterApp() {
     return () => data.subscription.unsubscribe();
   }, []);
   useEffect(() => { if (authReady && (!supabase || session)) void loadDashboard(); }, [authReady, session]);
+  useEffect(() => {
+    const saved = window.localStorage.getItem("talentflow.sidebar.group");
+    if (saved && SIDEBAR_GROUPS.some(group => group.id === saved)) setExpandedGroup(saved);
+  }, []);
+  useEffect(() => {
+    const group = SIDEBAR_GROUPS.find(item => item.children.some(child => child.view === active));
+    if (!group) return;
+    setExpandedGroup(group.id);
+    window.localStorage.setItem("talentflow.sidebar.group", group.id);
+  }, [active]);
 
   const tabbedApplications = useMemo(() => dashboard.applications.filter(item => {
     if (candidateTab === "waiting") return item.status === "WAITING_REVIEW";
@@ -327,6 +420,10 @@ function RecruiterApp() {
   const current = selected ? dashboard.applications.find(item => item.id === selected.id) || selected : null;
   const latest = dashboard.applications[0];
   const chartScores = dashboard.applications.slice(0, 7).reverse().map(item => item.screening.final_score);
+  const activeTitle = active === "Ứng viên" ? "Hồ sơ ứng tuyển"
+    : active === "Lịch sử" ? "Lịch sử hoạt động"
+    : active === "Xoá dữ liệu" ? "Quản lý dữ liệu"
+    : active;
 
   const createJob = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -552,26 +649,62 @@ function RecruiterApp() {
       if (error) throw new Error(error.message);
     });
   };
+  const selectView = (view: string) => {
+    setActive(view);
+    setMobileMenuOpen(false);
+  };
+  const toggleSidebarGroup = (groupId: string) => {
+    setExpandedGroup(current => {
+      const next = current === groupId ? null : groupId;
+      if (next) window.localStorage.setItem("talentflow.sidebar.group", next);
+      else window.localStorage.removeItem("talentflow.sidebar.group");
+      return next;
+    });
+  };
+  const sidebarBadge = (item: SidebarItem) => {
+    if (item.badge === "applications") return dashboard.metrics.awaiting_review;
+    if (item.badge === "approvals") return approvals.length;
+    if (item.badge === "interviews") return dashboard.metrics.interviews;
+    return 0;
+  };
 
   if (!authReady) return <main className="auth-page"><div className="auth-card">Đang kiểm tra phiên đăng nhập...</div></main>;
   if (supabase && !session) return <AuthScreen/>;
   return <div className="shell">
-    <aside className="sidebar">
+    <aside className={mobileMenuOpen ? "sidebar mobile-open" : "sidebar"}>
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
-      <nav><p className="nav-label">WORKSPACE</p>
-        {[["Tổng quan","grid"],["Việc làm","briefcase"],["Ứng viên","users"],["Phê duyệt","bell"],["Phỏng vấn","calendar"],["Lịch làm việc","clock"],["Lịch sử","clock"],["Mail Sandbox","bell"],["Xoá dữ liệu","users"]].map(([label,icon]) =>
-          <button key={label} className={active === label ? "nav-item active" : "nav-item"} onClick={() => setActive(label)}><Icon name={icon}/>{label}{label === "Ứng viên" && <span className="count">{dashboard.metrics.awaiting_review}</span>}{label === "Phê duyệt" && approvals.length > 0 && <span className="count">{approvals.length}</span>}</button>)}
-        <p className="nav-label section">AI AGENT</p><button className={active === "Pipeline" ? "nav-item active" : "nav-item"} onClick={() => setActive("Pipeline")}><Icon name="spark"/>Pipeline <span className="live-dot"/></button>
+      <nav className="sidebar-nav"><p className="nav-label">WORKSPACE</p>
+        <button className={active === "Tổng quan" ? "nav-item active" : "nav-item"} onClick={() => selectView("Tổng quan")}><Icon name="grid"/>Tổng quan</button>
+        {SIDEBAR_GROUPS.map(group => {
+          const expanded = expandedGroup === group.id;
+          const groupActive = group.children.some(item => item.view === active);
+          return <div className={`nav-group ${expanded ? "expanded" : ""}`} key={group.id}>
+            <button className={`nav-group-trigger ${groupActive ? "has-active" : ""}`} aria-expanded={expanded} onClick={() => toggleSidebarGroup(group.id)}>
+              <Icon name={group.icon}/><span>{group.label}</span><i className="nav-chevron"><Icon name="arrow"/></i>
+            </button>
+            <div className="nav-children" aria-hidden={!expanded}>
+              {group.children.map(item => {
+                const count = sidebarBadge(item);
+                return <button key={item.view} className={active === item.view ? "nav-item nav-child active" : "nav-item nav-child"} onClick={() => selectView(item.view)}>
+                  <Icon name={item.icon}/>{item.label}
+                  {count > 0 && <span className="count">{count}</span>}
+                  {item.view === "Pipeline" && <span className="live-dot"/>}
+                </button>;
+              })}
+            </div>
+          </div>;
+        })}
       </nav>
       <div className="agent-card"><div className="agent-icon"><Icon name="spark"/></div><b>Agent đang hoạt động</b><p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p><div className="agent-progress"><span/></div><small>Dữ liệu đồng bộ từ API</small></div>
       <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || LOCAL_ACTOR_NAME}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
     </aside>
+    {mobileMenuOpen && <button className="mobile-nav-backdrop" aria-label="Đóng menu" onClick={() => setMobileMenuOpen(false)}/>}
 
     <main>
-      <header><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
+      <header><button className="mobile-menu-button" aria-label="Mở menu" onClick={() => setMobileMenuOpen(true)}>☰</button><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
         {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
-        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : active}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.some(job => job.requirements?.approval?.status === "APPROVED") || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
+        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : activeTitle}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.some(job => job.requirements?.approval?.status === "APPROVED") || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
         {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
         {lastBatch && <BatchStatusPanel batch={lastBatch} actionBusy={actionBusy} pendingAction={pendingAction} onRetry={retryBatchItem}/>}
         {loading && <DashboardSkeleton/>}
@@ -582,6 +715,10 @@ function RecruiterApp() {
         </section>}
 
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport} onJobChanged={loadDashboard}/>
+        : active === "Kho ứng viên" ? <CandidateProfilesView query={query} onOpenApplication={applicationId => {
+            const application = dashboard.applications.find(item => item.id === applicationId);
+            if (application) { setSelected(application); setActive("Ứng viên"); }
+          }}/>
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction}
                                                   onResolve={resolveApproval} onResolveMany={resolveMany}
                                                   resumeBusy={resumeBusy} onExplain={setExplained}
@@ -661,7 +798,7 @@ function RecruiterApp() {
                                          onConfirm={reason => void rejectFromRow(rejecting, reason)}/>}
     {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
-    {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>} 
+    {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>}
     {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => saveCriteria(criteriaJob.id, criteria)}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
@@ -795,6 +932,8 @@ function SlotPicker({ slots, busy, onChoose }: {
 
 type Resume = {
   application_id: string; filename: string | null; size: number | null; checksum: string | null;
+  resume_version_id?: string | null; version?: number | null; original_filename?: string | null;
+  submitted_at?: string | null; extracted_at?: string | null; extraction?: ResumeExtraction;
   text: string; file_available: boolean; file_type: string; file_url: string | null;
 };
 
@@ -2111,6 +2250,253 @@ function MailSandboxView() {
   </section>;
 }
 
+function VersionExtraction({ extraction, extractedAt }: { extraction: ResumeExtraction; extractedAt: string | null }) {
+  const profile = extraction.profile || {};
+  const skills = profile.skills || [];
+  const education = profile.education || [];
+  const evidence = extraction.evidence || [];
+  const matchedEvidence = evidence.filter(item => item.matched);
+  const hasContent = skills.length || education.length || profile.summary || profile.experience_years || evidence.length;
+  return <details className="version-extraction">
+    <summary><Icon name="spark"/>Kết quả extraction đã lưu {extractedAt ? `· ${fullDateLabel(extractedAt)}` : ""}</summary>
+    {hasContent ? <div className="extraction-body">
+      <div className="extraction-facts">
+        <span><small>Kinh nghiệm</small><b>{profile.experience_years || 0} năm</b></span>
+        <span><small>Nguồn extraction</small><b>{profile.extraction_source || extraction.screening_source || "rules"}</b></span>
+      </div>
+      {profile.summary && <p>{profile.summary}</p>}
+      {!!skills.length && <div className="extraction-group"><small>Kỹ năng</small><div>{skills.map(skill => <i key={skill}>{skill}</i>)}</div></div>}
+      {!!education.length && <div className="extraction-group"><small>Học vấn</small><div>{education.map(item => <i key={item}>{item}</i>)}</div></div>}
+      {!!matchedEvidence.length && <div className="extraction-group"><small>Evidence đã nhận diện</small><div>{matchedEvidence.map(item => <i key={item.requirement}>{item.requirement}</i>)}</div></div>}
+    </div> : <p className="extraction-empty">Phiên bản cũ chưa có dữ liệu extraction có cấu trúc.</p>}
+  </details>;
+}
+
+const comparisonCategoryLabel = (category: string) => ({
+  skills: "Kỹ năng", experience: "Kinh nghiệm", experience_years: "Số năm kinh nghiệm", experiences: "Kinh nghiệm làm việc", education: "Học vấn", projects: "Dự án",
+  certificates: "Chứng chỉ", contact: "Liên hệ", role: "Chức danh", company: "Công ty",
+  responsibilities: "Trách nhiệm", summary: "Tóm tắt",
+} as Record<string, string>)[category.toLocaleLowerCase("vi")] || category;
+
+function VersionComparison({ comparison }: { comparison: ResumeComparison }) {
+  const totalChanges = comparison.summary.added_count + comparison.summary.removed_count
+    + comparison.summary.modified_count + comparison.summary.conflict_count;
+  return <details className="version-comparison">
+    <summary><Icon name="spark"/><span>So sánh với v{comparison.from_version.version}</span><b>{totalChanges} thay đổi</b></summary>
+    <div className="comparison-body">
+      <div className="comparison-route"><span>v{comparison.from_version.version}</span><Icon name="arrow"/><span>v{comparison.to_version.version}</span></div>
+      {!!comparison.added.length && <ComparisonGroup tone="added" title="Đã thêm" items={comparison.added.map(item => ({
+        label: comparisonCategoryLabel(item.category), value: item.value, evidence: item.evidence,
+      }))}/>}
+      {!!comparison.removed.length && <ComparisonGroup tone="removed" title="Đã xoá" items={comparison.removed.map(item => ({
+        label: comparisonCategoryLabel(item.category), value: item.value, evidence: item.evidence,
+      }))}/>}
+      {!!comparison.modified.length && <ComparisonGroup tone="modified" title="Đã thay đổi" items={comparison.modified.map(item => ({
+        label: comparisonCategoryLabel(item.category), value: `${item.before || "—"} → ${item.after || "—"}`, evidence: item.evidence,
+      }))}/>}
+      {!!comparison.conflicts.length && <ComparisonGroup tone="conflict" title="Cần kiểm tra" items={comparison.conflicts.map(item => ({
+        label: comparisonCategoryLabel(item.category), value: `${item.before || "—"} ↔ ${item.after || "—"}`, evidence: item.reason,
+      }))}/>}
+      {!totalChanges && <p className="comparison-empty">Không phát hiện khác biệt nội dung có cấu trúc.</p>}
+      <p className="comparison-meta">Phân tích: {comparison.analysis_method}{comparison.model_name ? ` · ${comparison.model_name}` : ""} · {Math.round(comparison.confidence <= 1 ? comparison.confidence * 100 : comparison.confidence)}% tin cậy</p>
+    </div>
+  </details>;
+}
+
+function ComparisonGroup({ tone, title, items }: {
+  tone: "added" | "removed" | "modified" | "conflict";
+  title: string; items: { label: string; value: string; evidence?: string | null }[];
+}) {
+  return <section className={`comparison-group ${tone}`}><h4>{title}<i>{items.length}</i></h4><ul>{items.map((item, index) =>
+    <li key={`${item.label}-${item.value}-${index}`}><b>{item.label}</b><span>{item.value}</span>{item.evidence && <small>{item.evidence}</small>}</li>
+  )}</ul></section>;
+}
+
+function CandidateProfilesView({ query, onOpenApplication }: {
+  query: string;
+  onOpenApplication: (applicationId: string) => void;
+}) {
+  const [profiles, setProfiles] = useState<CandidateProfile[]>([]);
+  const [selectedProfile, setSelectedProfile] = useState<CandidateProfile | null>(null);
+  const [loadingProfiles, setLoadingProfiles] = useState(true);
+  const [profileError, setProfileError] = useState("");
+  const [versionBusy, setVersionBusy] = useState("");
+  const [versionResume, setVersionResume] = useState<Resume | null>(null);
+  const [comparisons, setComparisons] = useState<ResumeComparison[]>([]);
+  const [comparisonBusy, setComparisonBusy] = useState(false);
+  const [comparisonError, setComparisonError] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [minimumExperience, setMinimumExperience] = useState("");
+  const [latestCvOnly, setLatestCvOnly] = useState(false);
+  const [searchResponse, setSearchResponse] = useState<CandidateSearchResponse | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [fallbackQuery, setFallbackQuery] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setLoadingProfiles(true);
+    void request<CandidateProfile[]>("/api/candidate-profiles?limit=100")
+      .then(items => { if (active) { setProfiles(items); setProfileError(""); } })
+      .catch(error => { if (active) setProfileError(error instanceof Error ? error.message : "Không tải được kho ứng viên"); })
+      .finally(() => { if (active) setLoadingProfiles(false); });
+    return () => { active = false; };
+  }, []);
+
+  const visibleProfiles = useMemo(() => {
+    const normalized = (fallbackQuery || query).trim().toLocaleLowerCase("vi");
+    if (!normalized) return profiles;
+    return profiles.filter(profile => `${profile.name} ${profile.email} ${profile.phone}`
+      .toLocaleLowerCase("vi").includes(normalized));
+  }, [profiles, query, fallbackQuery]);
+  const totalVersions = profiles.reduce((sum, profile) => sum + profile.resume_count, 0);
+  const returningCandidates = profiles.filter(profile => profile.resume_count > 1).length;
+
+  const openProfile = async (profile: CandidateProfile) => {
+    setSelectedProfile(profile); setProfileError(""); setComparisonError(""); setComparisons([]); setComparisonBusy(true);
+    try {
+      const [fresh, comparisonPayload] = await Promise.all([
+        request<CandidateProfile>(`/api/candidate-profiles/${profile.id}`),
+        request<{ items: ResumeComparison[] } | ResumeComparison[]>(`/api/candidate-profiles/${profile.id}/resume-comparisons`)
+          .catch(error => { setComparisonError(error instanceof Error ? error.message : "Không tải được so sánh CV"); return { items: [] }; }),
+      ]);
+      setSelectedProfile(fresh);
+      setProfiles(items => items.map(item => item.id === fresh.id ? fresh : item));
+      setComparisons(Array.isArray(comparisonPayload) ? comparisonPayload : comparisonPayload.items || []);
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : "Không tải được hồ sơ ứng viên");
+    } finally { setComparisonBusy(false); }
+  };
+
+  const openVersion = async (profileId: string, versionId: string) => {
+    setVersionBusy(versionId); setProfileError("");
+    try {
+      setVersionResume(await request<Resume>(`/api/candidate-profiles/${profileId}/resume-versions/${versionId}`));
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : "Không mở được phiên bản CV");
+    } finally { setVersionBusy(""); }
+  };
+
+  const runSemanticSearch = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const semanticQuery = searchQuery.trim();
+    if (!semanticQuery) { setSearchResponse(null); setFallbackQuery(""); setSearchError(""); return; }
+    setSearchBusy(true); setSearchError(""); setFallbackQuery("");
+    try {
+      const response = await request<CandidateSearchResponse>("/api/candidate-profiles/search", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: semanticQuery,
+          filters: {
+            minimum_experience: minimumExperience ? Number(minimumExperience) : null,
+            latest_cv_only: latestCvOnly,
+          },
+          limit: 20,
+        }),
+      });
+      setSearchResponse(response);
+    } catch (error) {
+      setSearchResponse(null); setFallbackQuery(semanticQuery);
+      setSearchError(`${error instanceof Error ? error.message : "Semantic Search chưa sẵn sàng"}. Đang dùng tìm kiếm chính xác trong kho.`);
+    } finally { setSearchBusy(false); }
+  };
+
+  const resetSearch = () => {
+    setSearchQuery(""); setMinimumExperience(""); setLatestCvOnly(false);
+    setSearchResponse(null); setFallbackQuery(""); setSearchError("");
+  };
+
+  const comparisonFor = (versionId: string) => comparisons.find(item => item.to_version.id === versionId);
+  const semanticResults = searchResponse?.results || [];
+
+  return <>
+    <section className="talent-pool-metrics">
+      <article><span>Hồ sơ duy nhất</span><strong>{profiles.length}</strong><small>Đã chuẩn hoá email và SĐT</small></article>
+      <article><span>Tổng phiên bản CV</span><strong>{totalVersions}</strong><small>Lưu độc lập theo từng lần nộp</small></article>
+      <article><span>Ứng viên quay lại</span><strong>{returningCandidates}</strong><small>Có từ 2 phiên bản CV trở lên</small></article>
+    </section>
+    <section className="panel talent-pool">
+      <div className="panel-head"><div><h2>Kho ứng viên</h2><p>Mỗi người là một hồ sơ duy nhất, gom toàn bộ CV và lịch sử ứng tuyển.</p></div><span className="pool-count">{searchResponse ? semanticResults.length : visibleProfiles.length} hồ sơ</span></div>
+      <form className="talent-search" onSubmit={runSemanticSearch}>
+        <div className="talent-search-main"><Icon name="spark"/><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="Mô tả ứng viên cần tìm, ví dụ: Frontend có React, TypeScript và từng làm ERP..."/><button className="primary compact" disabled={searchBusy}>{searchBusy ? "Đang tìm..." : "Tìm bằng AI"}</button>{(searchQuery || searchResponse) && <button type="button" className="search-reset" onClick={resetSearch} aria-label="Xoá tìm kiếm">×</button>}</div>
+        <div className="talent-search-filters"><label>Kinh nghiệm tối thiểu <input type="number" min="0" max="50" value={minimumExperience} onChange={event => setMinimumExperience(event.target.value)} placeholder="Năm"/></label><label className="search-check"><input type="checkbox" checked={latestCvOnly} onChange={event => setLatestCvOnly(event.target.checked)}/> Chỉ CV mới nhất</label><span>Không dùng tên, email hoặc SĐT để xếp hạng semantic.</span></div>
+      </form>
+      {searchResponse && <div className="search-summary"><div><Icon name="spark"/><b>{semanticResults.length} kết quả</b><span>cho “{searchResponse.query}”</span></div><i>{searchResponse.mode === "SEMANTIC" ? "Semantic Search" : searchResponse.mode}</i></div>}
+      {searchResponse?.warning && <div className="search-fallback"><Icon name="search"/>{searchResponse.warning}</div>}
+      {searchError && <div className="search-fallback"><Icon name="search"/>{searchError}</div>}
+      {profileError && !selectedProfile && <div className="error-banner"><b>Không tải được kho ứng viên.</b> {profileError}</div>}
+      {searchBusy ? <div className="semantic-loading"><i/><div><b>Đang tìm trong các phiên bản CV</b><span>BGE-M3 đang đối chiếu nội dung đa ngôn ngữ và evidence đã lưu.</span></div></div>
+      : searchResponse ? <div className="semantic-results">
+        {semanticResults.map((result, index) => {
+          const profile = result.candidate_profile;
+          const score = result.score <= 1 ? result.score * 100 : result.score;
+          return <article className="semantic-result" key={profile.id}>
+            <div className="semantic-rank">#{index + 1}</div>
+            <i className={`avatar ${["violet","blue","orange"][index % 3]}`}>{initials(profile.name)}</i>
+            <div className="semantic-result-main"><div className="semantic-result-title"><button onClick={() => void openProfile(profile)}>{profile.name}</button><span>{Math.round(score)}% phù hợp</span></div><p>{profile.email || "Chưa có email"}{profile.phone ? ` · ${profile.phone}` : ""}</p>
+              {!!result.matched_skills?.length && <div className="semantic-skills">{result.matched_skills.map(skill => <i key={skill}>{skill}</i>)}</div>}
+              {result.matched_version && <small>Khớp tốt nhất từ <b>CV v{result.matched_version.version}</b> · {result.matched_version.filename}</small>}
+              {!!result.evidence?.length && <blockquote>“{result.evidence[0].text || result.evidence[0].evidence || result.evidence[0].quote || "Có dữ liệu phù hợp trong CV đã lưu."}”</blockquote>}
+              <details className="search-explanation"><summary>Vì sao xuất hiện?</summary><div>
+                {!!result.score_components && <div className="score-components">{Object.entries(result.score_components).map(([key, value]) => <span key={key}><small>{key.replaceAll("_", " ")}</small><b>{Math.round(value <= 1 ? value * 100 : value)}%</b></span>)}</div>}
+                {!!result.evidence?.length && <ul>{result.evidence.map((item, evidenceIndex) => <li key={`${item.category || item.field || item.section}-${evidenceIndex}`}><b>{item.category || item.field || item.section || "Evidence"}</b><span>{item.text || item.evidence || item.quote}</span>{(item.version || item.source) && <small>{item.version ? `CV v${item.version}` : item.source}</small>}</li>)}</ul>}
+                {!!result.missing_skills?.length && <p className="missing-skills">Chưa tìm thấy: {result.missing_skills.join(", ")}</p>}
+              </div></details>
+            </div>
+            <div className="semantic-actions"><button className="secondary compact" onClick={() => void openProfile(profile)}>Xem profile</button>{result.matched_version && <button className="secondary compact" disabled={versionBusy === result.matched_version.id} onClick={() => void openVersion(profile.id, result.matched_version!.id)}>{versionBusy === result.matched_version.id ? "Đang mở" : `Xem CV v${result.matched_version.version}`}</button>}</div>
+          </article>;
+        })}
+        {!semanticResults.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp. Hãy mô tả rộng hơn hoặc bỏ bớt bộ lọc.</div>}
+      </div>
+      : loadingProfiles ? <div className="empty-state">Đang tải kho ứng viên...</div> : <div className="profile-grid">
+        {visibleProfiles.map((profile, index) => <button className="profile-card" key={profile.id} onClick={() => void openProfile(profile)}>
+          <i className={`avatar ${["violet","blue","orange"][index % 3]}`}>{initials(profile.name)}</i>
+          <span className="profile-card-main"><b>{profile.name}</b><small>{profile.email || "Chưa có email"}</small><small>{profile.phone || "Chưa có SĐT"}</small></span>
+          <span className="profile-card-stats"><b>{profile.resume_count}</b><small>phiên bản CV</small></span>
+          <span className="profile-card-stats"><b>{profile.application_count}</b><small>lần ứng tuyển</small></span>
+          <span className="profile-card-seen"><small>Cập nhật gần nhất</small><b>{profile.last_seen_at ? agoLabel(profile.last_seen_at) : "—"}</b></span>
+          <Icon name="arrow"/>
+        </button>)}
+        {!visibleProfiles.length && <div className="empty-state">{query || fallbackQuery ? "Không tìm thấy hồ sơ theo tên, email hoặc SĐT." : "Chưa có hồ sơ ứng viên nào."}</div>}
+      </div>}
+    </section>
+    {selectedProfile && <div className="overlay" onMouseDown={() => setSelectedProfile(null)}>
+      <aside className="drawer profile-detail" onMouseDown={event => event.stopPropagation()}>
+        <button className="close" onClick={() => setSelectedProfile(null)}>×</button>
+        <div className="drawer-person">
+          <i className="avatar large violet">{initials(selectedProfile.name)}</i>
+          <div><span className="eyebrow">TALENT POOL PROFILE</span><h2>{selectedProfile.name}</h2><p>{selectedProfile.email || "Chưa có email"}{selectedProfile.phone ? ` · ${selectedProfile.phone}` : ""}</p></div>
+        </div>
+        <div className="profile-facts">
+          <div><span>CV đã lưu</span><b>{selectedProfile.resume_count}</b></div>
+          <div><span>Lần ứng tuyển</span><b>{selectedProfile.application_count}</b></div>
+          <div><span>Ghi nhận đầu tiên</span><b>{selectedProfile.first_seen_at ? fullDateLabel(selectedProfile.first_seen_at) : "—"}</b></div>
+          <div><span>Cập nhật gần nhất</span><b>{selectedProfile.last_seen_at ? fullDateLabel(selectedProfile.last_seen_at) : "—"}</b></div>
+        </div>
+        <section className="resume-history profile-resume-history">
+          <div className="resume-history-head"><div><span className="eyebrow">VERSION HISTORY</span><h3>Các CV ứng viên đã nộp</h3></div><b>Mới nhất trước</b></div>
+          {profileError && <p className="resume-history-error">{profileError}</p>}
+          {comparisonBusy && <p className="resume-history-empty">Đang tải so sánh các phiên bản...</p>}
+          {comparisonError && <p className="comparison-warning">Chưa có dữ liệu so sánh: {comparisonError}</p>}
+          {selectedProfile.resume_versions.map(version => <article className="resume-version" key={version.id}>
+            <i>v{version.version}</i>
+            <div><b>{version.filename}</b><span>Nộp lúc {fullDateLabel(version.submitted_at)}</span><small>{version.change.summary}</small>
+              <VersionExtraction extraction={version.extraction || {}} extractedAt={version.extracted_at}/>
+              {comparisonFor(version.id) && <VersionComparison comparison={comparisonFor(version.id)!}/>}
+              {version.applications.map(application => <button className="version-application" key={application.id} onClick={() => onOpenApplication(application.id)}>
+                {application.job_title} · {statusLabel(application.status)}
+              </button>)}
+            </div>
+            <button className="secondary compact" disabled={versionBusy === version.id} onClick={() => void openVersion(selectedProfile.id, version.id)}>{versionBusy === version.id ? "Đang mở" : "Xem CV"}</button>
+          </article>)}
+          {!selectedProfile.resume_versions.length && <p className="resume-history-empty">Ứng viên chưa có phiên bản CV.</p>}
+        </section>
+      </aside>
+    </div>}
+    {versionResume && <ResumeViewer resume={versionResume} candidateName={selectedProfile?.name || "Ứng viên"} onClose={() => setVersionResume(null)}/>}
+  </>;
+}
+
 function BatchStatusPanel({ batch, actionBusy, pendingAction, onRetry }: { batch: BatchResult; actionBusy: boolean; pendingAction: PendingAction | null; onRetry: (batchId: string, itemId: string) => Promise<void> }) {
   return <section className="panel jobs-view"><div className="panel-head"><div><h2>Batch screening gần nhất</h2><p>{batch.processed}/{batch.total} hoàn tất · {batch.completed} thành công · {batch.skipped} trùng · {batch.failed} lỗi</p></div><i className={`status ${batch.status === "COMPLETED" ? "interview" : batch.status === "PROCESSING" ? "review" : "rejected"}`}>{batch.status}</i></div>{batch.items.map(item => <article className="job-row" key={item.id}><div className="metric-icon blue"><Icon name="spark"/></div><div><h3>{item.application?.candidate.name || item.filename}</h3><p>{item.filename}{item.error ? ` · ${item.error}` : ""}</p></div><i className={`status ${item.status === "COMPLETED" || item.status === "DUPLICATE" ? "interview" : item.status === "FAILED" ? "rejected" : "review"}`}>{item.status}</i>{item.status === "FAILED" && item.application && <button className="secondary compact" disabled={actionBusy} onClick={() => void onRetry(batch.batch_id, item.id)}>{pendingAction?.key === `retry-${item.id}` ? "Đang retry..." : "Retry"}</button>}</article>)}</section>;
 }
@@ -2118,9 +2504,85 @@ function BatchStatusPanel({ batch, actionBusy, pendingAction, onRetry }: { batch
 function CandidateDrawer({ application, actionBusy, pendingAction, scoreClass, onClose, onReview }: { application: Application; actionBusy: boolean; pendingAction: PendingAction | null; scoreClass: (score: number) => string; onClose: () => void; onReview: (decision: ReviewDecision) => Promise<void> }) {
   const kit = application.screening.interview_kit;
   const unavailable = ["PROCESSING", "SCREENING_FAILED"].includes(application.status);
-  // Once a candidate has been invited, reviewing or inviting again would overwrite a live invitation.
   const invited = application.status.startsWith("INTERVIEW");
-  return <div className="overlay" onMouseDown={onClose}><aside className="drawer" onMouseDown={e => e.stopPropagation()}><button className="close" disabled={actionBusy} onClick={onClose}>×</button><div className="drawer-person"><i className="avatar large violet">{initials(application.candidate.name)}</i><div><span className="eyebrow">CANDIDATE PROFILE</span><h2>{application.candidate.name}</h2><p>{application.candidate.email} · {application.screening.experience_years} năm kinh nghiệm</p>{application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}<div className="intake-meta">{application.created_at && <span><Icon name="clock"/>Công ty nhận hồ sơ này lúc <b>{fullDateLabel(application.created_at)}</b></span>}{application.status_changed_at && <span><Icon name="check"/>Cập nhật gần nhất <b>{fullDateLabel(application.status_changed_at)}</b>{application.status_changed_by ? ` · ${application.status_changed_by}` : ""}</span>}</div></div></div><div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>{pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3>{invited && <p className="drawer-locked">Ứng viên đã được mời phỏng vấn — không thể xem xét hay mời lại. Quản lý lịch ở tab “Phỏng vấn”.</p>}{unavailable && <p className="kit-summary">{application.status === "PROCESSING" ? "Agent đang xử lý hồ sơ này." : "Screening thất bại; hãy retry từ batch."}</p>}<div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>{kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}<h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div><div className="drawer-actions four"><button className="secondary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy || unavailable} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : invited ? "Đã mời PV" : "Mời PV"}</button></div></aside></div>;
+  const [profile, setProfile] = useState<CandidateProfile | null>(null);
+  const [profileError, setProfileError] = useState("");
+  const [versionBusy, setVersionBusy] = useState("");
+  const [versionResume, setVersionResume] = useState<Resume | null>(null);
+
+  useEffect(() => {
+    setProfile(null); setProfileError("");
+    if (!application.candidate_profile_id) return;
+    void request<CandidateProfile>(`/api/candidate-profiles/${application.candidate_profile_id}`)
+      .then(setProfile)
+      .catch(error => setProfileError(error instanceof Error ? error.message : "Không tải được kho hồ sơ ứng viên"));
+  }, [application.candidate_profile_id]);
+
+  const openVersion = async (versionId: string) => {
+    if (!application.candidate_profile_id) return;
+    setVersionBusy(versionId); setProfileError("");
+    try {
+      setVersionResume(await request<Resume>(
+        `/api/candidate-profiles/${application.candidate_profile_id}/resume-versions/${versionId}`,
+      ));
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : "Không mở được phiên bản CV");
+    } finally { setVersionBusy(""); }
+  };
+
+  return <div className="overlay" onMouseDown={onClose}>
+    <aside className="drawer" onMouseDown={event => event.stopPropagation()}>
+      <button className="close" disabled={actionBusy} onClick={onClose}>×</button>
+      <div className="drawer-person">
+        <i className="avatar large violet">{initials(application.candidate.name)}</i>
+        <div>
+          <span className="eyebrow">CANDIDATE PROFILE</span>
+          <h2>{application.candidate.name}</h2>
+          <p>{application.candidate.email || "Chưa có email"}
+            {application.candidate.phone ? ` · ${application.candidate.phone}` : ""}
+            {` · ${application.screening.experience_years} năm kinh nghiệm`}</p>
+          {application.resume_filename && <span className="resume-link"><Icon name="upload"/>Đã extract · {application.resume_filename}</span>}
+          <div className="intake-meta">
+            {application.created_at && <span><Icon name="clock"/>Công ty nhận hồ sơ này lúc <b>{fullDateLabel(application.created_at)}</b></span>}
+            {application.status_changed_at && <span><Icon name="check"/>Cập nhật gần nhất <b>{fullDateLabel(application.status_changed_at)}</b>{application.status_changed_by ? ` · ${application.status_changed_by}` : ""}</span>}
+          </div>
+        </div>
+      </div>
+
+      <section className="resume-history">
+        <div className="resume-history-head">
+          <div><span className="eyebrow">TALENT POOL</span><h3>Lịch sử phiên bản CV</h3></div>
+          {profile && <b>{profile.resume_count} phiên bản · {profile.application_count} lần ứng tuyển</b>}
+        </div>
+        {!profile && !profileError && <p className="resume-history-empty">Đang tải lịch sử CV...</p>}
+        {profileError && <p className="resume-history-error">{profileError}</p>}
+        {profile?.resume_versions.map(version => <article className="resume-version" key={version.id}>
+          <i>v{version.version}</i>
+          <div>
+            <b>{version.filename}</b>
+            <span>Nộp lúc {fullDateLabel(version.submitted_at)}</span>
+            <small>{version.change.summary}</small>
+            <VersionExtraction extraction={version.extraction || {}} extractedAt={version.extracted_at}/>
+            {version.applications.map(item => <em key={item.id}>{item.job_title} · {statusLabel(item.status)}</em>)}
+          </div>
+          <button className="secondary compact" disabled={versionBusy === version.id}
+                  onClick={() => void openVersion(version.id)}>
+            {versionBusy === version.id ? "Đang mở" : "Xem CV"}
+          </button>
+        </article>)}
+      </section>
+
+      <div className="overall"><div><span>Mức độ phù hợp</span><strong>{application.screening.final_score}%</strong></div><i className={`score-ring large ${scoreClass(application.screening.final_score)}`} style={{"--score": `${application.screening.final_score * 3.6}deg`} as React.CSSProperties}>{Math.round(application.screening.final_score)}</i></div>
+      {pendingAction?.key.startsWith("review-") && <InlineProgress label={pendingAction.label}/>}<h3 className="evidence-title">AI Evidence</h3>
+      {invited && <p className="drawer-locked">Ứng viên đã được mời phỏng vấn — không thể xem xét hay mời lại. Quản lý lịch ở tab “Phỏng vấn”.</p>}
+      {unavailable && <p className="kit-summary">{application.status === "PROCESSING" ? "Agent đang xử lý hồ sơ này." : "Screening thất bại; hãy retry từ batch."}</p>}
+      <div className="evidence-list">{application.screening.evidence.map(e => <div className="evidence" key={e.requirement}><i className={e.matched ? "found" : "missing"}>{e.matched ? "✓" : "?"}</i><div><div><b>{e.requirement}</b><span>{Math.round(e.confidence*100)}% tin cậy</span></div><p>“{e.evidence}”</p></div></div>)}</div>
+      {kit && <><h3 className="evidence-title">Bộ câu hỏi phỏng vấn</h3><p className="kit-summary">{kit.summary}</p><div className="question-list">{kit.questions.map((item, index) => <article key={`${item.type}-${index}`}><span>{item.type}</span><b>{item.question}</b><p>{item.signal}</p></article>)}</div><div className="rubric-list">{kit.rubric.map(item => <span key={item.criterion}>{item.criterion}<b>{item.weight}%</b></span>)}</div></>}
+      <h3 className="evidence-title">Pipeline</h3><div className="compact-pipeline">{application.pipeline.map(step => <span key={step.node}><i>{step.status === "completed" ? "✓" : "○"}</i>{step.node}</span>)}</div>
+      <div className="drawer-actions four"><button className="secondary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("MANUAL_REVIEW")}>{pendingAction?.key === `review-MANUAL_REVIEW-${application.id}` ? "Đang lưu..." : "Xem xét"}</button><button className="danger" disabled={actionBusy || unavailable} onClick={() => void onReview("REJECT")}>{pendingAction?.key === `review-REJECT-${application.id}` ? "Đang từ chối..." : "Từ chối"}</button><button className="secondary" disabled={actionBusy || unavailable} onClick={() => void onReview("ARCHIVE")}>{pendingAction?.key === `review-ARCHIVE-${application.id}` ? "Đang lưu..." : "Lưu trữ"}</button><button className="primary" disabled={actionBusy || unavailable || invited} title={invited ? "Ứng viên đã được mời phỏng vấn" : undefined} onClick={() => void onReview("INTERVIEW")}><Icon name="calendar"/>{pendingAction?.key === `review-INTERVIEW-${application.id}` ? "Đang xử lý..." : invited ? "Đã mời PV" : "Mời PV"}</button></div>
+    </aside>
+    {versionResume && <ResumeViewer resume={versionResume} candidateName={application.candidate.name} onClose={() => setVersionResume(null)}/>}
+  </div>;
 }
 
 function JobModal({ submitting, progress, onClose, onSubmit }: { submitting: boolean; progress: ProgressState | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {

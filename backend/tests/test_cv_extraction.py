@@ -1,5 +1,6 @@
 """A PDF decides where its own lines break; nothing downstream may depend on that choice."""
 from app.pipeline import analyze_evidence
+from app.candidate_profiles import candidate_phone
 from app.resume import candidate_identity, flatten
 
 
@@ -18,6 +19,11 @@ def test_full_name_survives_instead_of_only_the_surname():
     # pypdf used to hand us one word per line, so this was cut down to "NGUYỄN".
     assert name == "NGUYỄN THỊ HỒNG NHUNG"
     assert email == "hong.nhung@example.com"
+
+
+def test_vietnam_phone_is_normalized_for_candidate_identity():
+    assert candidate_phone(CV) == "0917620483"
+    assert candidate_phone("Liên hệ +84 917 620 483") == "0917620483"
 
 
 def test_name_is_read_the_same_however_the_pdf_broke_its_lines():

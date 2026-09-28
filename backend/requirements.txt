@@ -14,3 +14,4 @@ redis==5.2.1
 rq==2.1.0
 cryptography==44.0.0
 huggingface_hub==0.36.0
+sentence-transformers==5.1.2

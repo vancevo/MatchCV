@@ -47,6 +47,13 @@ class Vector96(UserDefinedType):
         return load
 
 
+class Vector1024(Vector96):
+    """BGE-M3 dense vector; JSON-compatible processor keeps local SQLite portable."""
+
+    def get_col_spec(self, **_kw) -> str:
+        return "VECTOR(1024)"
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -88,14 +95,176 @@ class BatchItem(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class CandidateProfile(Base):
+    """A person in the tenant talent pool, independent from a single job application."""
+
+    __tablename__ = "candidate_profiles"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "normalized_email", name="uq_candidate_profile_owner_email"),
+        UniqueConstraint("owner_id", "normalized_phone", name="uq_candidate_profile_owner_phone"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    full_name: Mapped[str] = mapped_column(String(200))
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    normalized_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    normalized_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class CandidateResumeVersion(Base):
+    """An immutable CV snapshot submitted by a candidate."""
+
+    __tablename__ = "candidate_resume_versions"
+    __table_args__ = (
+        UniqueConstraint("candidate_profile_id", "version_number", name="uq_candidate_resume_profile_version"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer)
+    original_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    version_filename: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(64), index=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    extracted_text: Mapped[str] = mapped_column(Text)
+    extraction: Mapped[dict] = mapped_column(JSON, default=dict)
+    extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Skill(Base):
+    """Canonical, shared skill used to compare extractor output consistently."""
+
+    __tablename__ = "skills"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    canonical_name: Mapped[str] = mapped_column(String(120), unique=True)
+    normalized_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    category: Mapped[str] = mapped_column(String(80), default="OTHER")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class SkillAlias(Base):
+    __tablename__ = "skill_aliases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    skill_id: Mapped[str] = mapped_column(ForeignKey("skills.id", ondelete="CASCADE"), index=True)
+    alias: Mapped[str] = mapped_column(String(120))
+    normalized_alias: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="SEED")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    approved: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ResumeVersionSkill(Base):
+    __tablename__ = "resume_version_skills"
+    __table_args__ = (
+        UniqueConstraint("resume_version_id", "canonical_key", name="uq_resume_version_canonical_skill"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    resume_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    skill_id: Mapped[str | None] = mapped_column(
+        ForeignKey("skills.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    canonical_key: Mapped[str] = mapped_column(String(140), index=True)
+    canonical_name: Mapped[str] = mapped_column(String(120))
+    raw_value: Mapped[str] = mapped_column(String(120))
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    match_method: Mapped[str] = mapped_column(String(32), default="UNCLASSIFIED")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ResumeVersionComparison(Base):
+    """Neutral, immutable snapshot of differences between two CV versions."""
+
+    __tablename__ = "resume_version_comparisons"
+    __table_args__ = (
+        UniqueConstraint("from_version_id", "to_version_id", name="uq_resume_version_comparison_pair"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    from_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    to_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    added: Mapped[list] = mapped_column(JSON, default=list)
+    removed: Mapped[list] = mapped_column(JSON, default=list)
+    modified: Mapped[list] = mapped_column(JSON, default=list)
+    unchanged: Mapped[list] = mapped_column(JSON, default=list)
+    conflicts: Mapped[list] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    analysis_method: Mapped[str] = mapped_column(String(80), default="STRUCTURED_DIFF")
+    model_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    model_version: Mapped[str] = mapped_column(String(80), default="cv-diff-v1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ResumeVersionEmbedding(Base):
+    """Versioned, PII-free semantic index entry for one immutable CV snapshot."""
+
+    __tablename__ = "resume_version_embeddings"
+    __table_args__ = (
+        UniqueConstraint(
+            "resume_version_id", "model_name", "model_revision", "template_version",
+            name="uq_resume_version_embedding_index",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    resume_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    search_document: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list] = mapped_column(Vector1024(), default=list)
+    canonical_skills: Mapped[list] = mapped_column(JSON, default=list)
+    experience_years: Mapped[float] = mapped_column(Float, default=0.0)
+    model_name: Mapped[str] = mapped_column(String(160))
+    model_revision: Mapped[str] = mapped_column(String(120), default="")
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    template_version: Mapped[str] = mapped_column(String(80))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class Application(Base):
     __tablename__ = "applications"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     owner_id: Mapped[str] = mapped_column(String(128), index=True)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("upload_batches.id", ondelete="SET NULL"), nullable=True)
+    candidate_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    resume_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     candidate_name: Mapped[str] = mapped_column(String(200))
     candidate_email: Mapped[str] = mapped_column(String(320), default="")
+    candidate_phone: Mapped[str] = mapped_column(String(40), default="")
     status: Mapped[str] = mapped_column(String(32), default=ApplicationStatus.WAITING_REVIEW.value)
     resume_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     resume_size: Mapped[int | None] = mapped_column(Integer, nullable=True)

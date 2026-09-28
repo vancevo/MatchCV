@@ -9,7 +9,9 @@ from sqlalchemy import select
 from .agentic import calibrate_screening, maybe_create_shortlist, record_screening_artifact
 from .database import session_scope
 from .llm import generate_interview_kit_ai, screen_candidate_ai
-from .models import AgentRun, AgentStep, AgentTask, Application, AuditLog, BatchItem, CriteriaVersion, Job, UploadBatch
+from .candidate_profiles import resume_extraction_snapshot
+from .resume_comparison import refresh_resume_comparisons_around
+from .models import AgentRun, AgentStep, AgentTask, Application, AuditLog, BatchItem, CandidateResumeVersion, CriteriaVersion, Job, UploadBatch
 from .statuses import ApplicationStatus, BatchItemStatus, BatchStatus, RunStatus, TaskStatus
 from .workflow import screening_pipeline
 from .governance import enforce_screening_budget, record_screening_usage, select_model_variant
@@ -132,6 +134,19 @@ async def _execute(task_id: str) -> None:
                   status="COMPLETED", attempt=task.attempts, started=kit_started,
                   metadata={"source": result["interview_kit"].get("source", "rules")})
             application.screening = result
+            version = db.get(CandidateResumeVersion, application.resume_version_id) if application.resume_version_id else None
+            if version and not version.extraction:
+                version.extraction = resume_extraction_snapshot(
+                    name=application.candidate_name,
+                    email=application.candidate_email,
+                    phone=application.candidate_phone,
+                    screening=result,
+                )
+                version.extracted_at = finished
+            if version and version.extraction:
+                refresh_resume_comparisons_around(db, version)
+                from .semantic_index import index_resume_version
+                index_resume_version(db, version)
             application.status = ApplicationStatus.WAITING_REVIEW.value
             application.pipeline = screening_pipeline("Interview Kit Generated")
             if item:
