@@ -90,7 +90,7 @@ type Job = {
   id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
   requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string; version?: number }; shortlist_approval?: { status: string; application_ids?: string[] } };
 };
-type Interview = { id: string; application_id: string; start_at: string; end_at?: string; status: string; meeting_url: string; reschedule_count?: number; outcome?: string };
+type Interview = { id: string; application_id: string; start_at: string; end_at?: string; status: string; meeting_url: string; provider?: string; timezone?: string; reschedule_count?: number; outcome?: string };
 type PublicSchedule = { candidate_name: string; job_title: string; timezone: string; duration_minutes: number; expires_at: string; mode: "schedule" | "reschedule"; interview?: Interview; slots: { start_at: string; duration_minutes: number }[] };
 type Dashboard = {
   metrics: { open_jobs: number; candidates: number; awaiting_review: number; interviews: number };
@@ -122,6 +122,12 @@ type AuditLog = {
 };
 type Integration = {
   provider: string; status: string; account_email: string; scopes: string[]; expires_at: string | null;
+};
+type TenantPolicy = {
+  tenant_id: string; retention_days: number; monthly_screening_limit: number; screenings_per_minute: number;
+  monthly_token_limit: number; monthly_cost_limit_micros: number; email_enabled: boolean; calendar_enabled: boolean;
+  mail_sandbox_enabled: boolean; mail_sandbox_base_email: string; mail_sandbox_max_alias: number;
+  auto_approve_threshold: number; auto_reject_threshold: number; min_confidence_threshold: number;
 };
 type SidebarItem = {
   view: string; label: string; icon: string; badge?: "applications" | "approvals" | "interviews";
@@ -218,6 +224,13 @@ const statusLabel = (status: string) => ({
   INTERVIEW_SCHEDULED: "Đã đặt lịch",
 } as Record<string, string>)[status] || status;
 const statusTone = (status: string) => status === "WAITING_REVIEW" ? "review" : status === "REJECTED" ? "rejected" : status === "ARCHIVED" ? "archived" : status.startsWith("INTERVIEW") ? "interview" : "manual";
+/** "Chờ duyệt" means WAITING_REVIEW *and* clear of both bars — everything else in WAITING_REVIEW
+ * is still being triaged through Phê duyệt/shortlist, so it doesn't belong in this count/list. */
+const isReadyForApproval = (item: Application, policy: TenantPolicy | null) => {
+  if (item.status !== "WAITING_REVIEW" || !policy) return false;
+  return item.screening.final_score >= policy.auto_approve_threshold
+    && (item.screening.confidence ?? 0) * 100 >= policy.min_confidence_threshold;
+};
 /** Every earlier time this person reached the company, newest first. */
 function priorSubmissions(item: Application, all: Application[], jobs: Job[]) {
   const email = item.candidate.email.trim().toLowerCase();
@@ -359,7 +372,8 @@ function RecruiterApp() {
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [modal, setModal] = useState<"job" | "upload" | "schedule" | "criteria" | null>(null);
+  const [modal, setModal] = useState<"job" | "upload" | "schedule" | "criteria" | "thresholds" | null>(null);
+  const [policy, setPolicy] = useState<TenantPolicy | null>(null);
   const [criteriaJob, setCriteriaJob] = useState<Job | null>(null);
   const [candidateTab, setCandidateTab] = useState("all");
   const [slots, setSlots] = useState<{ start_at: string; duration_minutes: number }[]>([]);
@@ -381,10 +395,10 @@ function RecruiterApp() {
   };
   const loadDashboard = async () => {
     try {
-      const [nextDashboard, nextApprovals] = await Promise.all([
-        request<Dashboard>("/api/dashboard"), request<Approval[]>("/api/approvals"),
+      const [nextDashboard, nextApprovals, nextPolicy] = await Promise.all([
+        request<Dashboard>("/api/dashboard"), request<Approval[]>("/api/approvals"), request<TenantPolicy>("/api/tenant-policy"),
       ]);
-      setDashboard(nextDashboard); setApprovals(nextApprovals); setError("");
+      setDashboard(nextDashboard); setApprovals(nextApprovals); setPolicy(nextPolicy); setError("");
     }
     catch (err) { setError(err instanceof Error ? err.message : "Không thể tải dữ liệu"); }
     finally { setLoading(false); }
@@ -408,13 +422,13 @@ function RecruiterApp() {
   }, [active]);
 
   const tabbedApplications = useMemo(() => dashboard.applications.filter(item => {
-    if (candidateTab === "waiting") return item.status === "WAITING_REVIEW";
+    if (candidateTab === "waiting") return isReadyForApproval(item, policy);
     if (candidateTab === "reviewed") return item.status === "REVIEWED";
     if (candidateTab === "rejected") return item.status === "REJECTED";
     if (candidateTab === "interview") return item.status.startsWith("INTERVIEW");
     if (candidateTab === "archived") return item.status === "ARCHIVED";
     return true;
-  }), [dashboard.applications, candidateTab]);
+  }), [dashboard.applications, candidateTab, policy]);
   const filtered = useMemo(() => tabbedApplications.filter(item =>
     `${item.candidate.name} ${item.candidate.email}`.toLowerCase().includes(query.toLowerCase())), [tabbedApplications, query]);
   const current = selected ? dashboard.applications.find(item => item.id === selected.id) || selected : null;
@@ -620,6 +634,27 @@ function RecruiterApp() {
       });
   };
 
+  const saveThresholds = async (approve: number, reject: number, minConfidence: number) => {
+    if (!policy) return;
+    await runAction("thresholds", "Đang lưu ngưỡng chấm điểm", async () => {
+      const next = await request<TenantPolicy>("/api/tenant-policy", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...policy, auto_approve_threshold: approve, auto_reject_threshold: reject, min_confidence_threshold: minConfidence }),
+      });
+      setPolicy(next); setModal(null);
+      await loadDashboard();
+      notify(`Đã lưu ngưỡng và cập nhật lại các CV đang chờ theo ngưỡng mới: duyệt ngay ≥${approve}%, rớt thẳng <${reject}%, cảnh báo tin cậy <${minConfidence}%`);
+    });
+  };
+
+  const approveShortlistItem = async (approval: Approval, applicationId: string) => {
+    await runAction(`shortlist-item-${applicationId}`, "Đang duyệt riêng ứng viên", async () => {
+      await request(`/api/approvals/${approval.id}/shortlist-items/${applicationId}/approve`, { method: "POST" });
+      await loadDashboard();
+      notify("Đã duyệt riêng ứng viên này");
+    });
+  };
+
   const exportReport = async (job: Job) => {
     await runAction(`export-${job.id}`, "Đang xuất report", async () => {
       await download(`/api/jobs/${job.id}/shortlist-report`, `${job.title.toLowerCase().replace(/\s+/g, "-")}-shortlist.md`);
@@ -704,7 +739,14 @@ function RecruiterApp() {
       <header><button className="mobile-menu-button" aria-label="Mở menu" onClick={() => setMobileMenuOpen(true)}>☰</button><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
         {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
-        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : activeTitle}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div><button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.some(job => job.requirements?.approval?.status === "APPROVED") || actionBusy}><Icon name="upload"/>Tải CV lên</button></section>
+        <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : activeTitle}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div>
+          <div className="welcome-actions">
+            {policy && <button className="threshold-trigger" disabled={actionBusy} onClick={() => setModal("thresholds")}>
+              <Icon name="spark"/><span>Ngưỡng chấm điểm<b>Duyệt ≥{policy.auto_approve_threshold}% · Rớt &lt;{policy.auto_reject_threshold}%</b></span>
+            </button>}
+            <button className="upload" onClick={() => setModal("upload")} disabled={!dashboard.jobs.some(job => job.requirements?.approval?.status === "APPROVED") || actionBusy}><Icon name="upload"/>Tải CV lên</button>
+          </div>
+        </section>
         {error && <div className="error-banner"><b>Không kết nối được backend.</b> {error} — kiểm tra {API_URL.includes("localhost") ? "API tại cổng 8000" : "backend Render"}.</div>}
         {lastBatch && <BatchStatusPanel batch={lastBatch} actionBusy={actionBusy} pendingAction={pendingAction} onRetry={retryBatchItem}/>}
         {loading && <DashboardSkeleton/>}
@@ -722,8 +764,11 @@ function RecruiterApp() {
         : active === "Phê duyệt" ? <ApprovalInbox approvals={approvals} dashboard={dashboard} actionBusy={actionBusy} pendingAction={pendingAction}
                                                   onResolve={resolveApproval} onResolveMany={resolveMany}
                                                   resumeBusy={resumeBusy} onExplain={setExplained}
-                                                  onViewResume={openResumeFor} onReject={setRejecting}/>
-        : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} onChanged={loadDashboard}/>
+                                                  onViewResume={openResumeFor} onReject={setRejecting}
+                                                  onApproveItem={approveShortlistItem}
+                                                  minConfidenceThreshold={policy?.min_confidence_threshold ?? 65}/>
+        : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} approvals={approvals} actionBusy={actionBusy}
+                                                    onChanged={loadDashboard} onResolveApproval={resolveApproval}/>
         : active === "Lịch làm việc" ? <AvailabilityView dashboard={dashboard}/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
@@ -732,7 +777,7 @@ function RecruiterApp() {
           <section className="panel candidates-panel"><div className="panel-head"><div><h2>{active === "Ứng viên" ? "Tất cả ứng viên" : "Ứng viên mới nhất"}</h2><p>Được AI xếp hạng theo mức độ phù hợp</p></div><button onClick={() => { setActive("Ứng viên"); setQuery(""); }}>Xem tất cả <Icon name="arrow"/></button></div>
             {active === "Ứng viên" && <div className="candidate-tabs">{[
               ["all", "Tất cả", dashboard.applications.length],
-              ["waiting", "Chờ duyệt", dashboard.applications.filter(item => item.status === "WAITING_REVIEW").length],
+              ["waiting", "Chờ duyệt", dashboard.applications.filter(item => isReadyForApproval(item, policy)).length],
               ["reviewed", "Xem xét", dashboard.applications.filter(item => item.status === "REVIEWED").length],
               ["interview", "Phỏng vấn", dashboard.applications.filter(item => item.status.startsWith("INTERVIEW")).length],
               ["rejected", "Từ chối", dashboard.applications.filter(item => item.status === "REJECTED").length],
@@ -800,6 +845,7 @@ function RecruiterApp() {
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>}
     {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => saveCriteria(criteriaJob.id, criteria)}/>}
+    {modal === "thresholds" && policy && <ScoreThresholdModal policy={policy} busy={actionBusy} onClose={() => setModal(null)} onSave={saveThresholds}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
@@ -1379,6 +1425,76 @@ function JobDetail({ job, applications, onJobChanged }: { job: Job; applications
   </div>;
 }
 
+function ScoreThresholdModal({ policy, busy, onClose, onSave }: {
+  policy: TenantPolicy; busy: boolean; onClose: () => void;
+  onSave: (approve: number, reject: number, minConfidence: number) => Promise<void>;
+}) {
+  const [approve, setApprove] = useState(policy.auto_approve_threshold);
+  const [reject, setReject] = useState(policy.auto_reject_threshold);
+  const [minConfidence, setMinConfidence] = useState(policy.min_confidence_threshold);
+  const changed = approve !== policy.auto_approve_threshold || reject !== policy.auto_reject_threshold
+    || minConfidence !== policy.min_confidence_threshold;
+
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [onClose]);
+
+  return <div className="modal-layer" onMouseDown={onClose}>
+    <div className="modal threshold-modal" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label="Ngưỡng chấm điểm CV">
+      <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+      <span className="eyebrow">TỰ ĐỘNG PHÂN LOẠI CV</span>
+      <h2>Ngưỡng chấm điểm</h2>
+
+      <h3 className="threshold-section-title">1. Điểm phù hợp (%match)</h3>
+      <p>Ngay khi một CV chấm điểm xong, hệ thống xếp nó vào 1 trong 3 nhóm dưới đây theo % phù hợp với JD. Kéo hai chấm tròn để đổi ranh giới.</p>
+
+      <div className="score-band-line">
+        <div className="score-band-track" style={{ "--reject": `${reject}%`, "--approve": `${approve}%` } as React.CSSProperties}>
+          <input type="range" min={0} max={100} step={1} value={reject} disabled={busy} aria-label="Ngưỡng rớt thẳng"
+                 onChange={event => setReject(Math.min(Number(event.target.value), approve))}/>
+          <input type="range" min={0} max={100} step={1} value={approve} disabled={busy} aria-label="Ngưỡng duyệt ngay"
+                 onChange={event => setApprove(Math.max(Number(event.target.value), reject))}/>
+        </div>
+      </div>
+
+      <div className="score-band-legend">
+        <div className="score-band-item reject"><i/><b>Rớt thẳng</b>
+          <span>&lt; {reject}%</span><small>Tự động loại ngay, không cần bạn duyệt</small></div>
+        <div className="score-band-item review"><i/><b>Xem xét</b>
+          <span>{reject}% – {approve}%</span><small>Vào danh sách chờ duyệt để bạn xem kỹ từng người</small></div>
+        <div className="score-band-item approve"><i/><b>Duyệt ngay</b>
+          <span>≥ {approve}%</span><small>Vào ngay danh sách chờ duyệt, được đề xuất duyệt nhanh</small></div>
+      </div>
+
+      <h3 className="threshold-section-title">2. Độ tin cậy của máy</h3>
+      <p>Khác với %match ở trên (đo mức độ phù hợp), độ tin cậy đo <b>máy tự tin đến đâu</b> về bằng chứng nó vừa trích ra từ CV. Dưới ngưỡng này, hồ sơ dù điểm cao vẫn được gắn cờ &quot;cần người kiểm tra&quot; trong mục Phê duyệt.</p>
+
+      <div className="score-band-line">
+        <div className="confidence-band-track" style={{ "--min-confidence": `${minConfidence}%` } as React.CSSProperties}>
+          <input type="range" min={0} max={100} step={1} value={minConfidence} disabled={busy} aria-label="Ngưỡng độ tin cậy tối thiểu"
+                 onChange={event => setMinConfidence(Number(event.target.value))}/>
+        </div>
+      </div>
+
+      <div className="score-band-legend two">
+        <div className="score-band-item reject"><i/><b>Cần kiểm tra thêm</b>
+          <span>&lt; {minConfidence}%</span><small>Gắn cờ cho bạn xem lại bằng chứng trước khi tin điểm số</small></div>
+        <div className="score-band-item approve"><i/><b>Đủ tin cậy</b>
+          <span>≥ {minConfidence}%</span><small>Không cần cờ cảnh báo thêm</small></div>
+      </div>
+
+      <div className="reject-actions">
+        <button className="secondary compact" disabled={busy} onClick={onClose}>Huỷ</button>
+        <button className="primary compact" disabled={busy || !changed} onClick={() => void onSave(approve, reject, minConfidence)}>
+          {busy ? "Đang lưu..." : "Lưu ngưỡng"}
+        </button>
+      </div>
+    </div>
+  </div>;
+}
+
 function CriteriaModal({ job, busy, onClose, onSubmit }: {
   job: Job; busy: boolean; onClose: () => void;
   onSubmit: (criteria: { required_skills: string[]; preferred_skills: string[]; minimum_experience: number }) => Promise<void>;
@@ -1427,12 +1543,12 @@ const APPROVAL_LABELS: Record<Approval["type"], string> = {
 };
 
 /** The stored codes are English shorthand; a recruiter needs the number that triggered them. */
-function escalationReasons(payload: Record<string, unknown>): string[] {
+function escalationReasons(payload: Record<string, unknown>, minConfidenceThreshold: number): string[] {
   const score = Number(payload.score);
   const confidence = Math.round(Number(payload.confidence || 0) * 100);
   const codes = Array.isArray(payload.reasons) ? (payload.reasons as string[]) : [];
   const explain: Record<string, string> = {
-    LOW_CONFIDENCE: `Máy chưa chắc về kết quả chấm (độ chắc chắn ${confidence}%, dưới ngưỡng 65%)`,
+    LOW_CONFIDENCE: `Máy chưa chắc về kết quả chấm (độ tin cậy ${confidence}%, dưới ngưỡng ${minConfidenceThreshold}%)`,
     BORDERLINE_SCORE: `Điểm ${score} nằm sát ranh giới đạt/không đạt (vùng 60–75)`,
     SCORE_EVIDENCE_MISMATCH: "Điểm cao nhưng CV thiếu quá nửa kỹ năng bắt buộc — có thể là khớp nhầm",
   };
@@ -1440,7 +1556,7 @@ function escalationReasons(payload: Record<string, unknown>): string[] {
 }
 
 function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve, onResolveMany,
-                         resumeBusy, onExplain, onViewResume, onReject }: {
+                         resumeBusy, onExplain, onViewResume, onReject, onApproveItem, minConfidenceThreshold }: {
   approvals: Approval[]; dashboard: Dashboard; actionBusy: boolean; pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
   onResolveMany: (items: Approval[], decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
@@ -1448,6 +1564,8 @@ function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onReso
   onExplain: (application: Application) => void;
   onViewResume: (application: Application) => void;
   onReject: (application: Application) => void;
+  onApproveItem: (approval: Approval, applicationId: string) => Promise<void>;
+  minConfidenceThreshold: number;
 }) {
   const [filter, setFilter] = useState<"ALL" | Approval["type"]>("ALL");
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -1518,7 +1636,8 @@ function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onReso
                     actionBusy={actionBusy} pendingAction={pendingAction} onResolve={onResolve}
                     picked={picked.has(item.id)} onPick={() => toggle(item.id)}
                     resumeBusy={resumeBusy} onExplain={onExplain}
-                    onViewResume={onViewResume} onReject={onReject}/>)
+                    onViewResume={onViewResume} onReject={onReject} onApproveItem={onApproveItem}
+                    minConfidenceThreshold={minConfidenceThreshold}/>)
       : <div className="empty-state">Không có đề xuất nào trong mục này.</div>}
 
     {bulkReject && <RejectDialog title={`Trả lại ${chosen.length} đề xuất`} busy={actionBusy}
@@ -1564,7 +1683,8 @@ function RejectDialog({ title, busy, onCancel, onConfirm }: {
 }
 
 function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve,
-                       picked, onPick, resumeBusy, onExplain, onViewResume, onReject }: {
+                       picked, onPick, resumeBusy, onExplain, onViewResume, onReject, onApproveItem,
+                       minConfidenceThreshold }: {
   approval: Approval; typeLabel: string; dashboard: Dashboard; actionBusy: boolean;
   pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
@@ -1572,11 +1692,14 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
   onExplain: (application: Application) => void;
   onViewResume: (application: Application) => void;
   onReject: (application: Application) => void;
+  onApproveItem: (approval: Approval, applicationId: string) => Promise<void>;
+  minConfidenceThreshold: number;
 }) {
   const [history, setHistory] = useState<AuditLog[] | null>(null);
   const [rejecting, setRejecting] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const [itemBusy, setItemBusy] = useState("");
 
   const payload = approval.payload || {};
   const requester = approval.requested_by_email?.trim()
@@ -1595,9 +1718,9 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
   };
 
   const criteria = (payload.criteria || {}) as { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number };
-  const ranking = (payload.ranking || []) as { application_id: string; score: number; confidence?: number }[];
+  const ranking = (payload.ranking || []) as { application_id: string; score: number; confidence?: number; band?: "APPROVE" | "REVIEW" }[];
 
-  const reasons = escalationReasons(payload as Record<string, unknown>);
+  const reasons = escalationReasons(payload as Record<string, unknown>, minConfidenceThreshold);
 
   return <article className={`approval-row approval-card${picked ? " approval-picked" : ""}`}>
     {approval.status === "PENDING"
@@ -1682,17 +1805,41 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
 
       {approval.type === "SHORTLIST" && <div className="approval-detail">
         <div className="approval-field wide">
-          <span>{ranking.length} ứng viên được đề xuất — chưa gửi email cho ai</span>
+          <span>{ranking.length} ứng viên trong danh sách — xem CV, duyệt riêng hoặc xoá từng người ngay tại đây</span>
           <table className="approval-table">
-            <thead><tr><th>#</th><th>Ứng viên</th><th>Điểm</th><th>Độ tin cậy</th></tr></thead>
+            <thead><tr><th>#</th><th>Ứng viên</th><th>Điểm</th><th>Độ tin cậy</th><th>Đề xuất</th><th>Xử lý riêng</th></tr></thead>
             <tbody>
               {ranking.map((row, index) => {
                 const person = dashboard.applications.find(item => item.id === row.application_id);
-                return <tr key={row.application_id}>
+                const decidedElsewhere = person && person.status !== "WAITING_REVIEW";
+                const busyKey = itemBusy === row.application_id;
+                return <tr key={row.application_id} className={decidedElsewhere ? "approval-row-done" : ""}>
                   <td>{index + 1}</td>
                   <td>{person?.candidate.name || row.application_id.slice(0, 8)}</td>
                   <td className="num">{row.score}</td>
                   <td className="num">{row.confidence != null ? `${Math.round(row.confidence * 100)}%` : "—"}</td>
+                  <td><span className={`band-tag ${row.band === "APPROVE" ? "approve" : "review"}`}>
+                    {row.band === "APPROVE" ? "Duyệt ngay" : "Cần xem xét"}</span></td>
+                  <td>
+                    {decidedElsewhere
+                      ? <span className="approval-item-done">{statusLabel(person!.status)}</span>
+                      : <div className="approval-table-actions">
+                          <button className="why-button mini" disabled={!person || resumeBusy === person.id}
+                                  onClick={() => person && onViewResume(person)}>
+                            <Icon name="file"/>{person && resumeBusy === person.id ? "..." : "Xem CV"}</button>
+                          <button className="why-button mini" disabled={!person || actionBusy || approval.status !== "PENDING"}
+                                  onClick={async () => {
+                                    if (!person) return;
+                                    setItemBusy(row.application_id);
+                                    try { await onApproveItem(approval, row.application_id); }
+                                    finally { setItemBusy(""); }
+                                  }}>
+                            <Icon name="check"/>{busyKey ? "..." : "Thêm"}</button>
+                          <button className="why-button mini reject" disabled={!person || actionBusy}
+                                  onClick={() => person && onReject(person)}>
+                            <Icon name="ban"/>Xoá</button>
+                        </div>}
+                  </td>
                 </tr>;
               })}
             </tbody>
@@ -1740,35 +1887,410 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
   </article>;
 }
 
-function InterviewsView({ dashboard, onChanged }: { dashboard: Dashboard; onChanged: () => Promise<void> }) {
-  type Ops = { reminders: { id: string; status: string; due_at: string }[]; scorecards: { id: string; interviewer_email: string; recommendation: string }[]; feedback_summary?: { summary: string; strengths: string[]; concerns: string[]; conflicts: unknown[]; sources: unknown[] } };
-  const [selectedId, setSelectedId] = useState("");
-  const [ops, setOps] = useState<Ops | null>(null);
-  const [busy, setBusy] = useState(false);
+type InterviewOps = {
+  interview?: Interview;
+  policy?: { max_reschedules: number; feedback_due_hours: number };
+  reminders: { id: string; status: string; due_at: string }[];
+  scorecards: { id: string; interviewer_email: string; recommendation: string }[];
+  feedback_summary?: { summary: string; strengths: string[]; concerns: string[]; conflicts: unknown[]; sources: unknown[] };
+};
+
+const INTERVIEW_STATUS: Record<string, { label: string; short: string; tone: string }> = {
+  PENDING_CONFIRMATION: { label: "Ứng viên đã chọn giờ — đang chờ bạn xác nhận", short: "Chờ xác nhận", tone: "review" },
+  PENDING_EXTERNAL: { label: "Đang đồng bộ lịch lên calendar...", short: "Đang xử lý", tone: "manual" },
+  SCHEDULED: { label: "Đã lên lịch", short: "Đã lên lịch", tone: "interview" },
+  RESCHEDULING: { label: "Đang chuyển sang lịch mới...", short: "Đang đổi lịch", tone: "manual" },
+  FEEDBACK_PENDING: { label: "Đã phỏng vấn xong — đang chờ chấm feedback", short: "Chờ feedback", tone: "review" },
+  NO_SHOW: { label: "Ứng viên không tham dự", short: "No-show", tone: "rejected" },
+  CANCELLING: { label: "Đang huỷ lịch...", short: "Đang huỷ", tone: "archived" },
+  CANCELLED: { label: "Đã huỷ", short: "Đã huỷ", tone: "archived" },
+  COMPLETED: { label: "Hoàn tất", short: "Hoàn tất", tone: "interview" },
+};
+const interviewStatusInfo = (status: string) => INTERVIEW_STATUS[status] || { label: status, short: status, tone: "manual" };
+const RECOMMENDATION_LABEL: Record<string, string> = {
+  STRONG_YES: "Rất nên nhận", YES: "Nên nhận", MIXED: "Cân nhắc thêm", NO: "Không nên nhận", STRONG_NO: "Chắc chắn từ chối",
+};
+type InterviewRow = {
+  interview: Interview; candidate?: Application; job?: Job; escalations: Approval[];
+  isToday: boolean; isDone: boolean; needsAction: boolean; isUpcoming: boolean;
+};
+const byStart = (a: InterviewRow, b: InterviewRow) => new Date(a.interview.start_at).getTime() - new Date(b.interview.start_at).getTime();
+const byStartDesc = (a: InterviewRow, b: InterviewRow) => new Date(b.interview.start_at).getTime() - new Date(a.interview.start_at).getTime();
+/** A transient status (waiting on an outbox event) that's still open after its own start time is stuck, not just "in progress". */
+const isStuckTransient = (interview: Interview) =>
+  ["PENDING_EXTERNAL", "RESCHEDULING", "CANCELLING"].includes(interview.status) && new Date(interview.start_at).getTime() < Date.now();
+const interviewNeedsAction = (interview: Interview, escalationCount: number) =>
+  interview.status === "PENDING_CONFIRMATION" || interview.status === "FEEDBACK_PENDING" || escalationCount > 0 || isStuckTransient(interview);
+
+function RescheduleModal({ interview, busy, onClose, onPick }: {
+  interview: Interview; busy: boolean; onClose: () => void; onPick: (slot: string) => void;
+}) {
+  const [slots, setSlots] = useState<{ start_at: string; duration_minutes: number }[] | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    request<{ start_at: string; duration_minutes: number }[]>("/api/interviewers/me/available-slots")
+      .then(data => { if (!cancelled) setSlots(data); })
+      .catch(err => { if (!cancelled) setError(err instanceof Error ? err.message : "Không tải được khung giờ trống"); });
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [onClose]);
+  return <div className="modal-layer" onMouseDown={onClose}>
+    <div className="modal" onMouseDown={event => event.stopPropagation()} role="dialog" aria-label="Đổi lịch phỏng vấn">
+      <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+      <span className="eyebrow">ĐỔI LỊCH PHỎNG VẤN</span>
+      <h2>Chọn giờ mới</h2>
+      <p>Lịch hiện tại: {dateLabel(interview.start_at)} · đã đổi {interview.reschedule_count || 0} lần.</p>
+      {error && <p className="operations-message">{error}</p>}
+      {!slots && !error && <InlineProgress label="Đang tải khung giờ trống"/>}
+      {slots && !slots.length && <p className="operations-message">Chưa có khung giờ trống — kiểm tra lại tab Lịch làm việc.</p>}
+      <div className="slots">
+        {slots?.map(slot => <button key={slot.start_at} disabled={busy} onClick={() => onPick(slot.start_at)}>
+          {busy ? "Đang lưu..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}
+      </div>
+    </div>
+  </div>;
+}
+
+function InterviewCard({ row, expanded, onToggle, ops, opsLoading, busyKey, parentBusy,
+                        onConfirm, onNoShow, onCancel, onReschedule, onSubmitScorecard, onResolveEscalation }: {
+  row: InterviewRow; expanded: boolean; onToggle: () => void;
+  ops?: InterviewOps; opsLoading: boolean; busyKey: string; parentBusy: boolean;
+  onConfirm: (interview: Interview) => void;
+  onNoShow: (interview: Interview) => void;
+  onCancel: (interview: Interview) => void;
+  onReschedule: (interview: Interview) => void;
+  onSubmitScorecard: (interview: Interview, rubric: { criterion: string; weight: number }[]) => (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onResolveEscalation: (approval: Approval) => void;
+}) {
+  const { interview, candidate, job, escalations } = row;
+  const info = interviewStatusInfo(interview.status);
+  const kit = candidate?.screening.interview_kit;
+  const busy = (key: string) => busyKey === key || parentBusy;
+  const canReschedule = ["PENDING_CONFIRMATION", "SCHEDULED", "PENDING_EXTERNAL"].includes(interview.status)
+    && (interview.reschedule_count || 0) < (ops?.policy?.max_reschedules ?? 2);
+  const canCancel = !["CANCELLED", "CANCELLING", "NO_SHOW"].includes(interview.status);
+  const canNoShow = interview.status !== "NO_SHOW" && !["CANCELLED", "CANCELLING"].includes(interview.status);
+  const iconTone = row.isDone ? "archived" : info.tone === "interview" ? "green" : info.tone === "review" ? "amber" : "blue";
+
+  return <article className={`interview-row${expanded ? " interview-row-open" : ""}`}>
+    <button className="interview-row-main" onClick={onToggle}>
+      <div className={`metric-icon ${iconTone}`}><Icon name="calendar"/></div>
+      <div className="interview-row-who">
+        <b>{candidate?.candidate.name || "Ứng viên"}</b>
+        <small>{job?.title || "—"}{candidate ? ` · ${Math.round(candidate.screening.final_score)}% phù hợp` : ""}</small>
+      </div>
+      <div className="interview-row-when">
+        <b>{dateLabel(interview.start_at)}</b>
+        {(interview.reschedule_count || 0) > 0 && <small>Đã đổi lịch {interview.reschedule_count} lần</small>}
+      </div>
+      <span className={`status ${info.tone}`}>{info.short}</span>
+      {escalations.length > 0 && <span className="status rejected">{escalations.length} cần xử lý</span>}
+      <Icon name="arrow"/>
+    </button>
+
+    {interview.status === "PENDING_CONFIRMATION" && <div className="interview-row-cta">
+      <button className="primary compact" disabled={busy(`confirm-${interview.id}`)} onClick={() => onConfirm(interview)}>
+        {busy(`confirm-${interview.id}`) ? "Đang xác nhận..." : "Xác nhận lịch"}</button>
+    </div>}
+
+    {expanded && <div className="interview-detail">
+      {isStuckTransient(interview) && <div className="interview-escalation">
+        <b>Có vẻ bị kẹt:</b>
+        <ul><li><span>Giờ hẹn đã qua nhưng hệ thống vẫn đang ở trạng thái &quot;{info.short}&quot; — calendar có thể chưa đồng bộ được. Huỷ và đặt lại lịch nếu ứng viên chưa nhận được lời mời.</span></li></ul>
+      </div>}
+      {escalations.length > 0 && <div className="interview-escalation">
+        <b>Cần bạn xử lý:</b>
+        <ul>{escalations.map(item => <li key={item.id}>
+          <span>{item.summary || item.title}</span>
+          <button className="why-button mini" disabled={busy(`escalation-${item.id}`)} onClick={() => onResolveEscalation(item)}>Đã xử lý</button>
+        </li>)}</ul>
+      </div>}
+
+      <div className="job-detail-grid">
+        <div className="job-detail-block wide">
+          <h4>Bộ câu hỏi &amp; rubric phỏng vấn</h4>
+          {kit ? <>
+            <p className="interview-kit-summary">{kit.summary}</p>
+            <div className="interview-kit-questions">
+              {kit.questions.map((question, index) => <div key={index} className="interview-kit-question">
+                <span className="interview-kit-type">{question.type}</span>
+                <p>{question.question}</p>
+                <small>Tín hiệu cần quan sát: {question.signal}</small>
+              </div>)}
+            </div>
+            {!!kit.rubric?.length && <div className="approval-chips">
+              {kit.rubric.map(item => <i key={item.criterion}>{item.criterion} · trọng số {item.weight}</i>)}
+            </div>}
+          </> : <small>Chưa có bộ câu hỏi cho ứng viên này.</small>}
+        </div>
+
+        <div className="job-detail-block">
+          <h4>Lịch hẹn</h4>
+          <p>Bắt đầu: <b>{fullDateLabel(interview.start_at)}</b></p>
+          {interview.end_at && <p>Kết thúc: <b>{fullDateLabel(interview.end_at)}</b></p>}
+          <p>Múi giờ: <b>{interview.timezone || "—"}</b></p>
+          {interview.meeting_url
+            ? <p><a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp ↗</a></p>
+            : <small>Chưa có link phòng họp.</small>}
+          <p>Số lần đổi lịch: <b>{interview.reschedule_count || 0}/{ops?.policy?.max_reschedules ?? "—"}</b></p>
+        </div>
+
+        <div className="job-detail-block">
+          <h4>Hành động</h4>
+          <div className="job-actions interview-actions">
+            {canReschedule && <button className="secondary compact" disabled={parentBusy} onClick={() => onReschedule(interview)}>Đổi lịch</button>}
+            {canNoShow && <button className="secondary compact" disabled={busy(`noshow-${interview.id}`)} onClick={() => onNoShow(interview)}>Đánh dấu no-show</button>}
+            {canCancel && <button className="danger-link" disabled={busy(`cancel-${interview.id}`)} onClick={() => onCancel(interview)}>Huỷ lịch</button>}
+            {!canReschedule && !canNoShow && !canCancel && <small>Lịch này đã kết thúc, không còn thao tác nào.</small>}
+          </div>
+        </div>
+
+        <div className="job-detail-block">
+          <h4>Nhắc lịch</h4>
+          {opsLoading ? <small>Đang tải...</small>
+            : ops?.reminders.length ? ops.reminders.map(item => <p key={item.id}><b>{dateLabel(item.due_at)}</b><span>{item.status}</span></p>)
+            : <small>Chưa có nhắc lịch.</small>}
+        </div>
+
+        <div className="job-detail-block">
+          <h4>Scorecard đã nhận ({ops?.scorecards.length || 0})</h4>
+          {opsLoading ? <small>Đang tải...</small>
+            : ops?.scorecards.length ? ops.scorecards.map(item => <p key={item.id}><b>{item.interviewer_email}</b><span>{RECOMMENDATION_LABEL[item.recommendation] || item.recommendation}</span></p>)
+            : <small>Chưa có phản hồi.</small>}
+        </div>
+
+        {ops?.feedback_summary && <div className={`job-detail-block wide feedback-summary${ops.feedback_summary.conflicts.length ? " has-conflict" : ""}`}>
+          <h4>Tổng hợp feedback (AI)</h4>
+          <p>{ops.feedback_summary.summary}</p>
+          {!!ops.feedback_summary.strengths.length && <p><b>Điểm mạnh:</b> {ops.feedback_summary.strengths.join(", ")}</p>}
+          {!!ops.feedback_summary.concerns.length && <p><b>Điểm cần lưu ý:</b> {ops.feedback_summary.concerns.join(", ")}</p>}
+          {!!ops.feedback_summary.conflicts.length && <p className="interview-conflict">⚠ Người phỏng vấn chưa thống nhất ý kiến — xem lại từng scorecard trước khi quyết định</p>}
+        </div>}
+
+        <div className="job-detail-block wide">
+          <h4>Nộp scorecard mới</h4>
+          <form className="scorecard-form" onSubmit={onSubmitScorecard(interview, kit?.rubric || [])}>
+            <input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/>
+            <select name="recommendation" defaultValue="MIXED">
+              <option value="STRONG_YES">Rất nên nhận</option>
+              <option value="YES">Nên nhận</option>
+              <option value="MIXED">Cân nhắc thêm</option>
+              <option value="NO">Không nên nhận</option>
+              <option value="STRONG_NO">Chắc chắn từ chối</option>
+            </select>
+            {(kit?.rubric?.length ? kit.rubric : [{ criterion: "Năng lực chuyên môn", weight: 0 }]).map(item => <fieldset key={item.criterion} className="scorecard-criterion">
+              <legend>{item.criterion}</legend>
+              <select name={`rating:${item.criterion}`} defaultValue="3">
+                <option value="1">1 — Không đạt</option>
+                <option value="2">2</option>
+                <option value="3">3 — Trung bình</option>
+                <option value="4">4</option>
+                <option value="5">5 — Xuất sắc</option>
+              </select>
+              <textarea name={`evidence:${item.criterion}`} required placeholder="Evidence quan sát được"/>
+            </fieldset>)}
+            <textarea name="note" placeholder="Ghi chú bổ sung (không bắt buộc)"/>
+            <button className="primary compact" disabled={busy(`scorecard-${interview.id}`)}>
+              {busy(`scorecard-${interview.id}`) ? "Đang lưu..." : "Lưu scorecard"}</button>
+          </form>
+        </div>
+      </div>
+    </div>}
+  </article>;
+}
+
+function InterviewsView({ dashboard, approvals, actionBusy, onChanged, onResolveApproval }: {
+  dashboard: Dashboard; approvals: Approval[]; actionBusy: boolean;
+  onChanged: () => Promise<void>;
+  onResolveApproval: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
+}) {
+  type Segment = "action" | "today" | "upcoming" | "done" | "all";
+  const interviews = dashboard.interviews || [];
+  const escalationsFor = (interviewId: string) =>
+    approvals.filter(item => item.type === "ESCALATION" && item.status === "PENDING" && item.resource_id === interviewId);
+
+  const [segment, setSegment] = useState<Segment>(() => {
+    const today = new Date().toDateString();
+    if (interviews.some(iv => interviewNeedsAction(iv, escalationsFor(iv.id).length))) return "action";
+    if (interviews.some(iv => new Date(iv.start_at).toDateString() === today)) return "today";
+    if (interviews.some(iv => new Date(iv.start_at).getTime() >= Date.now())) return "upcoming";
+    return "all";
+  });
+  const [query, setQuery] = useState("");
+  const [expandedId, setExpandedId] = useState("");
+  const [opsById, setOpsById] = useState<Record<string, InterviewOps>>({});
+  const [opsLoadingId, setOpsLoadingId] = useState("");
+  const [busyKey, setBusyKey] = useState("");
   const [message, setMessage] = useState("");
-  const selectedInterview = dashboard.interviews?.find(item => item.id === selectedId);
-  const person = selectedInterview ? dashboard.applications.find(item => item.id === selectedInterview.application_id) : undefined;
-  const loadOps = async (id: string) => { setBusy(true); setMessage(""); try { setSelectedId(id); setOps(await request<Ops>(`/api/interviews/${id}/operations`)); } catch (error) { setMessage(error instanceof Error ? error.message : "Không tải được operations"); } finally { setBusy(false); } };
-  const submitScorecard = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); if (!selectedInterview) return; setBusy(true); setMessage("");
-    const values = Object.fromEntries(new FormData(event.currentTarget));
-    try {
-      await request(`/api/interviews/${selectedInterview.id}/scorecards`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ interviewer_email: values.interviewer_email, recommendation: values.recommendation, note: values.note, answers: [{ criterion: values.criterion, rating: Number(values.rating), evidence: values.evidence }] }) });
-      event.currentTarget.reset(); await loadOps(selectedInterview.id); setMessage("Đã lưu scorecard và tạo feedback summary có nguồn.");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Không lưu được scorecard"); setBusy(false); }
+  const [rescheduling, setRescheduling] = useState<Interview | null>(null);
+
+  const todayKey = new Date().toDateString();
+  const rows: InterviewRow[] = useMemo(() => interviews.map(interview => {
+    const candidate = dashboard.applications.find(item => item.id === interview.application_id);
+    const job = candidate ? dashboard.jobs.find(item => item.id === candidate.job_id) : undefined;
+    const escalations = escalationsFor(interview.id);
+    const isDone = ["CANCELLED", "CANCELLING", "NO_SHOW"].includes(interview.status);
+    const isToday = new Date(interview.start_at).toDateString() === todayKey;
+    const needsAction = interviewNeedsAction(interview, escalations.length);
+    const isUpcoming = !isDone && new Date(interview.start_at).getTime() >= Date.now();
+    return { interview, candidate, job, escalations, isToday, isDone, needsAction, isUpcoming };
+  }), [interviews, dashboard.applications, dashboard.jobs, approvals]);
+
+  const counts = {
+    action: rows.filter(row => row.needsAction).length,
+    today: rows.filter(row => row.isToday).length,
+    upcoming: rows.filter(row => row.isUpcoming && !row.isToday).length,
+    done: rows.filter(row => row.isDone).length,
+    all: rows.length,
   };
-  const markNoShow = async () => { if (!selectedInterview) return; setBusy(true); try { await request(`/api/interviews/${selectedInterview.id}/no-show`, { method: "POST" }); setMessage("Đã chuyển no-show vào approval inbox."); await loadOps(selectedInterview.id); } catch (error) { setMessage(error instanceof Error ? error.message : "Không cập nhật được"); setBusy(false); } };
-  const confirmInterview = async (id: string) => {
-    setBusy(true); setMessage("");
-    try {
-      await request(`/api/interviews/${id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: "HR confirmed candidate-selected slot" }) });
-      await onChanged(); setMessage("Đã xác nhận lịch và gửi email phản hồi cho ứng viên.");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Không xác nhận được lịch"); }
-    finally { setBusy(false); }
+  const pendingConfirmCount = rows.filter(row => row.interview.status === "PENDING_CONFIRMATION").length;
+
+  const matches = (row: InterviewRow) => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return (row.candidate?.candidate.name || "").toLowerCase().includes(q) || (row.job?.title || "").toLowerCase().includes(q);
   };
-  const rubric = person?.screening.interview_kit?.rubric || [];
-  return <section className="panel jobs-view interview-ops"><div className="panel-head"><div><h2>Interview operations</h2><p>Ứng viên giữ slot trước; HR xác nhận để tạo lịch và gửi email.</p></div><span className="bounded-badge">Human-gated</span></div>{message && <p className="operations-message interview-message">{message}</p>}{dashboard.interviews?.length ? dashboard.interviews.map(interview => { const candidate = dashboard.applications.find(item => item.id === interview.application_id); return <article className="job-row" key={interview.id}><div className="metric-icon green"><Icon name="calendar"/></div><div><h3>{dateLabel(interview.start_at)}</h3><p>{candidate?.candidate.name || "Ứng viên"} · đổi lịch {interview.reschedule_count || 0} lần</p></div>{interview.meeting_url && <a href={interview.meeting_url} target="_blank" rel="noreferrer">Mở phòng họp</a>}<i className={`status ${interview.status === "NO_SHOW" ? "rejected" : interview.status === "SCHEDULED" ? "interview" : "review"}`}>{interview.status === "PENDING_CONFIRMATION" ? "Chờ HR xác nhận" : interview.status}</i>{interview.status === "PENDING_CONFIRMATION" ? <button className="primary compact" disabled={busy} onClick={() => void confirmInterview(interview.id)}>{busy ? "Đang xác nhận..." : "Xác nhận lịch"}</button> : <button className="secondary compact" disabled={busy} onClick={() => void loadOps(interview.id)}>Operations</button>}</article>; }) : <div className="empty-state">Chưa có lịch phỏng vấn. Duyệt Top 5 để tự động gửi link chọn lịch.</div>}
-    {selectedInterview && <div className="operations-detail"><div className="panel-head"><div><span className="eyebrow">FOLLOW-UP AGENT</span><h3>{person?.candidate.name || "Ứng viên"}</h3></div><button className="danger-link" disabled={busy || selectedInterview.status === "NO_SHOW"} onClick={() => void markNoShow()}>Đánh dấu no-show</button></div>{busy && <InlineProgress label="Đang đồng bộ interview operations"/>}{message && <p className="operations-message">{message}</p>}<div className="operations-grid"><div><h4>Reminder</h4>{ops?.reminders.length ? ops.reminders.map(item => <p key={item.id}><b>{dateLabel(item.due_at)}</b><span>{item.status}</span></p>) : <small>Chưa có reminder.</small>}</div><div><h4>Scorecard</h4>{ops?.scorecards.length ? ops.scorecards.map(item => <p key={item.id}><b>{item.interviewer_email}</b><span>{item.recommendation}</span></p>) : <small>Đang chờ feedback.</small>}</div></div>{ops?.feedback_summary && <article className="feedback-summary"><h4>Feedback summary</h4><p>{ops.feedback_summary.summary}</p><small>Nguồn: {ops.feedback_summary.sources.length} scorecard · Mâu thuẫn: {ops.feedback_summary.conflicts.length}</small></article>}<form className="scorecard-form" onSubmit={submitScorecard}><h4>Nộp scorecard có cấu trúc</h4><input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/><select name="criterion" required defaultValue={rubric[0]?.criterion || "Technical capability"}>{rubric.map(item => <option key={item.criterion}>{item.criterion}</option>)}{!rubric.length && <option>Technical capability</option>}</select><select name="rating" defaultValue="3"><option value="1">1 — Không đạt</option><option value="2">2</option><option value="3">3 — Trung bình</option><option value="4">4</option><option value="5">5 — Xuất sắc</option></select><select name="recommendation" defaultValue="MIXED"><option value="STRONG_YES">Strong yes</option><option value="YES">Yes</option><option value="MIXED">Mixed</option><option value="NO">No</option><option value="STRONG_NO">Strong no</option></select><textarea name="evidence" required placeholder="Evidence quan sát được trong buổi phỏng vấn"/><textarea name="note" placeholder="Ghi chú bổ sung"/><button className="primary compact" disabled={busy}>Lưu scorecard</button></form></div>}
+  const visible = useMemo(() => {
+    const list = rows.filter(matches).filter(row => {
+      if (segment === "action") return row.needsAction;
+      if (segment === "today") return row.isToday;
+      if (segment === "upcoming") return row.isUpcoming && !row.isToday;
+      if (segment === "done") return row.isDone;
+      return true;
+    });
+    return [...list].sort(segment === "done" ? byStartDesc : byStart);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, segment, query]);
+
+  const loadOps = async (id: string) => {
+    setOpsLoadingId(id);
+    try {
+      const data = await request<InterviewOps>(`/api/interviews/${id}/operations`);
+      setOpsById(current => ({ ...current, [id]: data }));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không tải được chi tiết phỏng vấn");
+    } finally {
+      setOpsLoadingId("");
+    }
+  };
+  const toggleExpand = async (id: string) => {
+    if (expandedId === id) { setExpandedId(""); return; }
+    setExpandedId(id); setMessage("");
+    if (!opsById[id]) await loadOps(id);
+  };
+  const forgetOps = (id: string) => setOpsById(current => { const next = { ...current }; delete next[id]; return next; });
+
+  const run = async (key: string, task: () => Promise<void>) => {
+    if (busyKey) return;
+    setBusyKey(key); setMessage("");
+    try { await task(); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Thao tác thất bại"); }
+    finally { setBusyKey(""); }
+  };
+
+  const confirmInterview = (interview: Interview) => void run(`confirm-${interview.id}`, async () => {
+    await request(`/api/interviews/${interview.id}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: "HR xác nhận lịch ứng viên đã chọn" }) });
+    await onChanged();
+    setMessage("Đã xác nhận lịch và gửi email cho ứng viên.");
+  });
+  const markNoShow = (interview: Interview) => void run(`noshow-${interview.id}`, async () => {
+    await request(`/api/interviews/${interview.id}/no-show`, { method: "POST" });
+    forgetOps(interview.id);
+    await onChanged();
+    setMessage("Đã đánh dấu no-show và tạo đề xuất trong Phê duyệt.");
+  });
+  const cancelInterview = (interview: Interview) => {
+    if (!window.confirm("Huỷ lịch phỏng vấn này? Ứng viên sẽ được đưa về trạng thái chờ đặt lịch lại.")) return;
+    void run(`cancel-${interview.id}`, async () => {
+      await request(`/api/interviews/${interview.id}`, { method: "DELETE" });
+      forgetOps(interview.id);
+      await onChanged();
+      setMessage("Đã huỷ lịch phỏng vấn.");
+    });
+  };
+  const rescheduleInterview = (interview: Interview, slot: string) => void run(`reschedule-${interview.id}`, async () => {
+    await request(`/api/interviews/${interview.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slot, timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Ho_Chi_Minh" }) });
+    setRescheduling(null);
+    forgetOps(interview.id);
+    await onChanged();
+    setMessage(`Đã đổi lịch sang ${dateLabel(slot)}.`);
+  });
+  const resolveEscalation = (approval: Approval) => void run(`escalation-${approval.id}`, async () => {
+    await onResolveApproval(approval, "APPROVE");
+    setMessage("Đã đánh dấu xử lý xong.");
+  });
+  const submitScorecard = (interview: Interview, rubric: { criterion: string; weight: number }[]) =>
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      const interviewer_email = String(form.get("interviewer_email") || "");
+      const recommendation = String(form.get("recommendation") || "MIXED");
+      const note = String(form.get("note") || "");
+      const criteria = rubric.length ? rubric.map(item => item.criterion) : ["Năng lực chuyên môn"];
+      const answers = criteria.map(criterion => ({
+        criterion,
+        rating: Number(form.get(`rating:${criterion}`) || 3),
+        evidence: String(form.get(`evidence:${criterion}`) || ""),
+      }));
+      const target = event.currentTarget;
+      await run(`scorecard-${interview.id}`, async () => {
+        await request(`/api/interviews/${interview.id}/scorecards`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ interviewer_email, recommendation, note, answers }) });
+        target.reset();
+        forgetOps(interview.id);
+        await Promise.all([loadOps(interview.id), onChanged()]);
+        setMessage("Đã lưu scorecard và cập nhật feedback summary.");
+      });
+    };
+
+  const segments: [Segment, string, number][] = [
+    ["action", "Cần xử lý", counts.action], ["today", "Hôm nay", counts.today],
+    ["upcoming", "Sắp tới", counts.upcoming], ["done", "Đã xong", counts.done], ["all", "Tất cả", counts.all],
+  ];
+  const emptyHint = segment === "action" ? "Không có gì cần bạn xử lý ngay — thảnh thơi rồi đó."
+    : segment === "today" ? "Hôm nay chưa có lịch phỏng vấn nào."
+    : segment === "upcoming" ? "Chưa có lịch phỏng vấn sắp tới."
+    : segment === "done" ? "Chưa có lịch phỏng vấn nào kết thúc."
+    : "Chưa có lịch phỏng vấn. Duyệt shortlist để tự động gửi link chọn lịch cho ứng viên.";
+
+  return <section className="panel jobs-view interview-view">
+    <div className="panel-head">
+      <div><h2>Phỏng vấn</h2><p>Từ lúc ứng viên chọn giờ tới khi có feedback — theo dõi và xử lý ngay tại đây.</p></div>
+      <span className="bounded-badge">Human-gated</span>
+    </div>
+
+    <div className="metrics interview-stats">
+      <article className="metric"><div className="metric-icon blue"><Icon name="calendar"/></div><div><p>Hôm nay</p><strong>{counts.today}</strong></div></article>
+      <article className="metric"><div className="metric-icon purple"><Icon name="clock"/></div><div><p>Sắp tới</p><strong>{counts.upcoming}</strong></div></article>
+      <article className="metric"><div className="metric-icon amber"><Icon name="bell"/></div><div><p>Chờ xác nhận</p><strong>{pendingConfirmCount}</strong></div></article>
+      <article className="metric"><div className={`metric-icon ${counts.action ? "amber" : "green"}`}><Icon name="spark"/></div><div><p>Cần xử lý</p><strong>{counts.action}</strong></div></article>
+    </div>
+
+    <div className="candidate-tabs">
+      {segments.map(([key, label, count]) => <button key={key} className={segment === key ? "active" : ""} onClick={() => setSegment(key)}>{label}<span>{count}</span></button>)}
+    </div>
+
+    <div className="interview-search"><Icon name="search"/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Tìm theo tên ứng viên hoặc vị trí..."/></div>
+
+    {message && <p className="operations-message interview-message">{message}</p>}
+
+    {visible.length ? <div className="interview-list">{visible.map(row =>
+      <InterviewCard key={row.interview.id} row={row}
+                     expanded={expandedId === row.interview.id} onToggle={() => void toggleExpand(row.interview.id)}
+                     ops={opsById[row.interview.id]} opsLoading={opsLoadingId === row.interview.id}
+                     busyKey={busyKey} parentBusy={Boolean(busyKey) || actionBusy}
+                     onConfirm={confirmInterview} onNoShow={markNoShow} onCancel={cancelInterview}
+                     onReschedule={interview => setRescheduling(interview)}
+                     onSubmitScorecard={submitScorecard} onResolveEscalation={resolveEscalation}/>)}
+    </div> : <div className="empty-state">{emptyHint}</div>}
+
+    {rescheduling && <RescheduleModal interview={rescheduling} busy={busyKey === `reschedule-${rescheduling.id}`}
+                                      onClose={() => setRescheduling(null)}
+                                      onPick={slot => rescheduleInterview(rescheduling, slot)}/>}
   </section>;
 }
 

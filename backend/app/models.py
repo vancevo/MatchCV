@@ -619,6 +619,13 @@ class TenantPolicy(Base):
     mail_sandbox_max_alias: Mapped[int] = mapped_column(Integer, default=100)
     # Addresses cleared for real delivery beyond the base mailbox and its plus aliases.
     mail_sandbox_allowed_emails: Mapped[list] = mapped_column(JSON, default=list)
+    # Score routing bands: score >= auto_approve_threshold fast-tracks into the shortlist queue,
+    # score < auto_reject_threshold is auto-rejected with no human step, everything between is the
+    # "needs review" band that also lands in the shortlist queue for the recruiter to look over.
+    auto_approve_threshold: Mapped[float] = mapped_column(Float, default=80.0)
+    auto_reject_threshold: Mapped[float] = mapped_column(Float, default=40.0)
+    # Below this, the AI isn't sure its own evidence read is right (separate from match score) — flag for a human.
+    min_confidence_threshold: Mapped[float] = mapped_column(Float, default=65.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

@@ -6,7 +6,7 @@ from time import perf_counter
 
 from sqlalchemy import select
 
-from .agentic import calibrate_screening, maybe_create_shortlist, record_screening_artifact
+from .agentic import calibrate_screening, maybe_create_shortlist, record_screening_artifact, route_scored_application
 from .database import session_scope
 from .llm import generate_interview_kit_ai, screen_candidate_ai
 from .candidate_profiles import resume_extraction_snapshot
@@ -14,7 +14,7 @@ from .resume_comparison import refresh_resume_comparisons_around
 from .models import AgentRun, AgentStep, AgentTask, Application, AuditLog, BatchItem, CandidateResumeVersion, CriteriaVersion, Job, UploadBatch
 from .statuses import ApplicationStatus, BatchItemStatus, BatchStatus, RunStatus, TaskStatus
 from .workflow import screening_pipeline
-from .governance import enforce_screening_budget, record_screening_usage, select_model_variant
+from .governance import enforce_screening_budget, policy_for, record_screening_usage, select_model_variant
 
 
 def sync_batch_status(db, batch_id: str) -> None:
@@ -115,13 +115,14 @@ async def _execute(task_id: str) -> None:
             run = db.get(AgentRun, payload["run_id"])
             if run:
                 run.current_node = "generate_interview_kit"
+            low_confidence_threshold = policy_for(db, payload["owner_id"]).min_confidence_threshold
 
         kit_started = perf_counter()
         result["interview_kit"] = await generate_interview_kit_ai(
             payload["resume_text"], payload["requirements"], result, payload["job_title"],
             payload["candidate_name"], payload["candidate_email"],
         )
-        result, embedding = calibrate_screening(result, payload["resume_text"], payload["requirements"])
+        result, embedding = calibrate_screening(result, payload["resume_text"], payload["requirements"], low_confidence_threshold)
         finished = datetime.now(timezone.utc)
         with session_scope() as db:
             task = db.get(AgentTask, task_id)
@@ -147,7 +148,7 @@ async def _execute(task_id: str) -> None:
                 refresh_resume_comparisons_around(db, version)
                 from .semantic_index import index_resume_version
                 index_resume_version(db, version)
-            application.status = ApplicationStatus.WAITING_REVIEW.value
+            route_scored_application(db, application, payload["owner_id"])
             application.pipeline = screening_pipeline("Interview Kit Generated")
             if item:
                 item.status = BatchItemStatus.COMPLETED.value

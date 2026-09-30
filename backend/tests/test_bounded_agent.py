@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from app.database import session_scope
 from app.main import app
-from app.models import AgentRun, CriteriaVersion, ScreeningArtifact, ShortlistProposal
+from app.models import AgentRun, CriteriaVersion, ScreeningArtifact
 
 
 client = TestClient(app)
@@ -82,12 +82,8 @@ def test_criteria_inbox_rescreen_lineage_and_trace():
     assert trace["usage"]["cost_micros"] == 0
 
 
-def test_low_confidence_routes_to_inbox_and_shortlist_is_only_a_proposal():
+def test_low_confidence_routes_to_inbox_and_clear_pass_skips_shortlist():
     job = _job("Phase Two Bounded")
-    configured = client.put(f"/api/jobs/{job['id']}/shortlist-trigger", json={
-        "enabled": True, "min_completed": 2, "top_n": 1, "min_score": 65,
-    })
-    assert configured.status_code == 200
     criteria_request = next(item for item in client.get("/api/approvals?request_type=CRITERIA").json()
                             if item["job_id"] == job["id"])
     client.post(f"/api/approvals/{criteria_request['id']}/resolve", json={"decision": "APPROVE"})
@@ -99,18 +95,16 @@ def test_low_confidence_routes_to_inbox_and_shortlist_is_only_a_proposal():
     assert evidence
     assert "LOW_CONFIDENCE" in evidence[0]["payload"]["reasons"]
 
+    # A CV that clears both the score and confidence bar is a clear yes: it stays WAITING_REVIEW
+    # like everyone else, but it never enters the shortlist/Phê duyệt queue — that queue is only
+    # for CVs that still need a closer human look.
+    assert strong["status"] == "WAITING_REVIEW"
     shortlist = [item for item in client.get("/api/approvals?request_type=SHORTLIST").json()
                  if item["job_id"] == job["id"]]
-    assert len(shortlist) == 1
-    assert shortlist[0]["payload"]["application_ids"][0] == strong["id"]
-    assert strong["status"] == "WAITING_REVIEW"
-    with session_scope() as db:
-        proposal = db.get(ShortlistProposal, shortlist[0]["resource_id"])
-        assert proposal.status == "PENDING"
+    assert not any(strong["id"] in item["payload"].get("application_ids", []) for item in shortlist)
 
-    resolved = client.post(f"/api/approvals/{shortlist[0]['id']}/resolve", json={
-        "decision": "APPROVE", "note": "Human approved",
+    reviewed = client.post(f"/api/applications/{strong['id']}/review", json={
+        "decision": "INTERVIEW", "note": "Clear match, no committee review needed",
     })
-    assert resolved.status_code == 200
-    applications = client.get(f"/api/applications?job_id={job['id']}").json()
-    assert next(item for item in applications if item["id"] == strong["id"])["status"] == "INTERVIEW_PENDING"
+    assert reviewed.status_code == 200
+    assert reviewed.json()["status"] == "INTERVIEW_PENDING"
