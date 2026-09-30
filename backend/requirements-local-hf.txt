@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Optional dependencies for running the 3B model on a local machine.
+transformers==4.57.1
+torch==2.8.0
+accelerate==1.10.1
+protobuf==6.32.1

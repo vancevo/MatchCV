@@ -38,6 +38,8 @@ Tạo JD
 - Screening có điểm rule, kinh nghiệm, semantic proxy, kỹ năng ưu tiên và evidence theo yêu cầu.
 - Criteria được version hóa; khi duyệt bản mới, toàn bộ hồ sơ được rescreen bằng durable task có parent-run lineage.
 - Embedding hashing 96 chiều chạy offline; PostgreSQL lưu bằng pgvector và HNSW cosine index, SQLite test lưu JSON.
+- Kho ứng viên có Semantic Search đa ngôn ngữ bằng BGE-M3 chạy local, xếp hạng theo từng CV version và gộp một kết quả cho mỗi candidate.
+- Mỗi cặp CV liền kề có bản phân tích khác biệt trung lập: thêm, bỏ, sửa, giữ nguyên và dữ liệu mâu thuẫn; không phán đoán ứng viên tốt lên hay kém đi.
 - Score được calibration theo eval baseline; confidence, borderline và score/evidence mismatch được route sang manual review.
 - Approval inbox hợp nhất tiêu chí, evidence yếu/anomaly và shortlist proposal.
 - Agent run trace model, prompt version, tool, token/cost và fallback; quyết định recruiter được audit riêng.
@@ -72,7 +74,7 @@ Tạo JD
 
 Các điểm sau **chưa phải tích hợp production**:
 
-- Embedding hiện dùng feature hashing xác định để chạy offline, chưa phải neural embedding đa ngôn ngữ.
+- Screening vẫn giữ feature hashing 96 chiều để calibration; riêng tìm kiếm kho ứng viên dùng neural embedding BGE-M3 1024 chiều.
 - Calibration hiện dùng bộ eval nhỏ; cần dữ liệu recruiter đã ẩn danh trước khi chọn threshold production.
 - Chưa dùng LangGraph/agent runtime; workflow được điều phối trực tiếp trong FastAPI.
 - Profile `local` dùng slot theo working hours và `meet.example`; chọn `INTEGRATION_PROVIDER=google|microsoft` cùng OAuth credentials để gọi provider thật.
@@ -119,6 +121,22 @@ cp .env.example .env
 
 Mặc định backend dùng `backend/talentflow.db`, tự seed dữ liệu demo và không yêu cầu đăng nhập. API chạy tại [http://localhost:8000](http://localhost:8000), Swagger tại [http://localhost:8000/docs](http://localhost:8000/docs).
 
+Để chạy model TalentFlow 3B trực tiếp trên máy local, cài thêm các dependency nặng bằng
+`.venv/bin/pip install -r requirements-local-hf.txt` và giữ `TALENTFLOW_MODEL_BACKEND=local`.
+Trên Render, dùng `TALENTFLOW_MODEL_BACKEND=remote`, đặt `HF_TOKEN` và
+`TALENTFLOW_INFERENCE_ENDPOINT_URL` thành URL của Hugging Face Inference Endpoint đã deploy.
+Backend production chỉ gọi API từ xa, không tải PyTorch hoặc model 3B vào Render.
+
+Semantic Search dùng model BGE-M3 riêng và không gọi Hugging Face khi người dùng tìm kiếm. Cài model một lần trước khi bật:
+
+```bash
+cd backend
+.venv/bin/python scripts/download_embedding_model.py
+# sau đó đặt EMBEDDING_ENABLED=true trong .env
+```
+
+Nếu model chưa được cài hoặc bị tắt, API vẫn hoạt động bằng keyword fallback và trả rõ `mode=KEYWORD_FALLBACK`.
+
 ### 2. Frontend
 
 ```bash
@@ -153,6 +171,12 @@ INTEGRATION_TOKEN_SECRET=replace-with-a-long-random-secret
 OAUTH_STATE_SECRET=replace-with-another-long-random-secret
 PROVIDER_WEBHOOK_SECRET=replace-with-a-webhook-secret
 OPERATIONAL_SWEEP_INTERVAL_MINUTES=15
+EMBEDDING_ENABLED=false
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_MODEL_PATH=models/bge-m3
+EMBEDDING_MODEL_REVISION=5617a9f61b028005a4858fdac845db406aefb181
+EMBEDDING_DIMENSION=1024
+EMBEDDING_DEVICE=cpu
 # GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
 # MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET / MICROSOFT_REDIRECT_URI
 ```
@@ -258,6 +282,10 @@ Không commit `.env`, API key hoặc service-role key vào repository.
 | `POST` | `/api/operations/release-gates/{id}/promote` | Enforce readiness/canary/critical-alert gate và ghi nhận promotion |
 | `GET/PUT` | `/api/mail-sandbox` | Xem hoặc cấu hình inbox chính và whitelist `+number` |
 | `POST` | `/api/mail-sandbox/test` | Gửi email test tới alias được chọn và trả recipient đã lưu |
+| `POST` | `/api/candidate-profiles/search` | Semantic Search trực tiếp trên toàn bộ CV version trong kho ứng viên |
+| `GET` | `/api/candidate-profiles/search/status` | Trạng thái model local và số bản ghi index theo trạng thái |
+| `POST` | `/api/candidate-profiles/search/reindex` | Tạo lại semantic index cho tenant (`OWNER`/`ADMIN`) |
+| `GET` | `/api/candidate-profiles/{id}/resume-comparisons` | Danh sách phân tích thay đổi trung lập giữa các CV version |
 
 CI/CD có thể gọi gate fail-closed trước khi chuyển traffic:
 

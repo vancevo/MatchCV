@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from app.talentflow_model import (
+    TalentFlowResumeExtractor,
     build_jd_messages,
     build_messages,
     candidate_profile_from_schema,
@@ -10,6 +12,7 @@ from app.talentflow_model import (
     normalize_resume_schema,
     parse_json_object,
 )
+from app.config import get_settings
 
 
 def test_talentflow_prompt_matches_training_shape():
@@ -102,3 +105,64 @@ def test_screen_candidate_prefers_talentflow_schema(monkeypatch):
     assert result["screening_source"] == "talentflow_hf_with_rules_evidence"
     assert result["candidate_profile"]["extraction_source"] == "talentflow_hf"
     assert result["candidate_profile"]["skills"] == ["Python"]
+
+
+def test_remote_endpoint_uses_hugging_face_chat_completion(monkeypatch):
+    monkeypatch.setenv("TALENTFLOW_MODEL_BACKEND", "remote")
+    monkeypatch.setenv("TALENTFLOW_INFERENCE_ENDPOINT_URL", "https://example.endpoints.huggingface.cloud")
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setenv("TALENTFLOW_MAX_NEW_TOKENS", "321")
+    get_settings.cache_clear()
+
+    calls = {}
+
+    class FakeInferenceClient:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+
+        def chat_completion(self, **kwargs):
+            calls["chat"] = kwargs
+            content = '{"required_skills":["Python"],"preferred_skills":[],"minimum_experience":2}'
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    monkeypatch.setattr("huggingface_hub.InferenceClient", FakeInferenceClient)
+    extractor = TalentFlowResumeExtractor()
+    result = extractor.extract_requirements("2 years Python")
+
+    assert result["required_skills"] == ["Python"]
+    assert result["minimum_experience"] == 2
+    assert calls["client"] == {
+        "model": "https://example.endpoints.huggingface.cloud",
+        "token": "test-token",
+        "timeout": 120,
+    }
+    assert calls["chat"]["max_tokens"] == 321
+    assert calls["chat"]["temperature"] == 0
+    get_settings.cache_clear()
+
+
+def test_remote_endpoint_is_not_configured_without_url(monkeypatch):
+    monkeypatch.setenv("TALENTFLOW_MODEL_BACKEND", "remote")
+    monkeypatch.setenv("TALENTFLOW_INFERENCE_ENDPOINT_URL", "")
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    get_settings.cache_clear()
+
+    from app.talentflow_model import talentflow_config
+
+    config = talentflow_config()
+
+    assert config["backend"] == "remote"
+    assert config["configured"] is False
+    assert config["endpoint_configured"] is False
+    get_settings.cache_clear()
+
+
+def test_production_defaults_to_remote_backend(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("TALENTFLOW_MODEL_BACKEND", raising=False)
+    get_settings.cache_clear()
+
+    assert get_settings().talentflow_model_backend == "remote"
+    get_settings.cache_clear()

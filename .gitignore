@@ -13,5 +13,6 @@ frontend/.next/
 frontend/out/
 backend/uploads/
 backend/backups/
+backend/models/
 artifacts/
 *.safetensors

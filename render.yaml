@@ -25,10 +25,18 @@ services:
       - { key: CORS_ORIGINS, sync: false }
       - { key: OPENROUTER_API_KEY, sync: false }
       - { key: OPENROUTER_MODEL, value: google/gemini-2.5-flash-lite }
+      - { key: HF_TOKEN, sync: false }
+      - { key: TALENTFLOW_MODEL_BACKEND, value: remote }
+      - { key: TALENTFLOW_MODEL_REPO_ID, value: vancevo/talentflow-resume-qwen25-3b }
+      - { key: TALENTFLOW_INFERENCE_ENDPOINT_URL, sync: false }
+      - { key: TALENTFLOW_INFERENCE_TIMEOUT_SECONDS, value: 120 }
+      - { key: TALENTFLOW_MODEL_ENABLED, value: "true" }
+      - { key: TALENTFLOW_MAX_INPUT_TOKENS, value: 8192 }
+      - { key: TALENTFLOW_MAX_NEW_TOKENS, value: 2048 }
       - { key: MAX_UPLOAD_MB, value: 10 }
       - { key: QUEUE_EAGER, value: "true" }
       - { key: ALLOW_EAGER_REAL_INTEGRATIONS, value: "true" }
-      - { key: INTEGRATION_PROVIDER, value: google }
+      - { key: INTEGRATION_PROVIDER, value: local }
       - { key: PUBLIC_APP_URL, value: "https://talentflow-frontend-yifc.onrender.com" }
       - { key: GOOGLE_CLIENT_ID, sync: false }
       - { key: GOOGLE_CLIENT_SECRET, sync: false }

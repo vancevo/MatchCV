@@ -50,8 +50,11 @@ class Settings:
     openrouter_site_url: str
     openrouter_app_title: str
     hf_token: str
+    talentflow_model_backend: str
     talentflow_model_repo_id: str
     talentflow_model_dir: str
+    talentflow_inference_endpoint_url: str
+    talentflow_inference_timeout_seconds: int
     talentflow_model_enabled: bool
     talentflow_max_input_tokens: int
     talentflow_max_new_tokens: int
@@ -126,6 +129,13 @@ class Settings:
                     "or ALLOW_EAGER_REAL_INTEGRATIONS=true for free/demo deployments"
                 )
 
+        default_talentflow_backend = "remote" if environment in {"staging", "production"} else "local"
+        talentflow_model_backend = os.getenv(
+            "TALENTFLOW_MODEL_BACKEND", default_talentflow_backend
+        ).strip().lower()
+        if talentflow_model_backend not in {"local", "remote"}:
+            raise RuntimeError("TALENTFLOW_MODEL_BACKEND must be local or remote")
+
         return cls(
             environment=environment,
             database_url=os.getenv("DATABASE_URL", "").strip(),
@@ -141,8 +151,13 @@ class Settings:
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
             openrouter_app_title=os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot").strip(),
             hf_token=os.getenv("HF_TOKEN", "").strip(),
+            talentflow_model_backend=talentflow_model_backend,
             talentflow_model_repo_id=os.getenv("TALENTFLOW_MODEL_REPO_ID", "").strip(),
             talentflow_model_dir=os.getenv("TALENTFLOW_MODEL_DIR", "artifacts/phase3-export/merged_model").strip(),
+            talentflow_inference_endpoint_url=os.getenv("TALENTFLOW_INFERENCE_ENDPOINT_URL", "").strip().rstrip("/"),
+            talentflow_inference_timeout_seconds=_positive_int(
+                "TALENTFLOW_INFERENCE_TIMEOUT_SECONDS", 120, 600
+            ),
             talentflow_model_enabled=_boolean("TALENTFLOW_MODEL_ENABLED", True),
             talentflow_max_input_tokens=_positive_int("TALENTFLOW_MAX_INPUT_TOKENS", 8192, 32768),
             talentflow_max_new_tokens=_positive_int("TALENTFLOW_MAX_NEW_TOKENS", 2048, 8192),
