@@ -46,15 +46,29 @@ def _json_content(response: httpx.Response) -> dict[str, Any]:
     content = response.json()["choices"][0]["message"]["content"]
     if isinstance(content, dict):
         return content
+    if not isinstance(content, str):
+        # Some providers return content: null (e.g. a refusal, an internal error that still
+        # answers 200, or a model that only emitted tool calls) - treat it the same as any other
+        # malformed response rather than crashing with a raw AttributeError.
+        raise ValueError("empty or non-string content in provider response")
     content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
     return json.loads(content)
 
 
-async def _complete(system: str, user: str, model_override: str | None = None) -> dict[str, Any] | None:
+async def _complete(
+    system: str, user: str, model_override: str | None = None,
+    endpoint_url: str | None = None, endpoint_api_key: str | None = None,
+) -> dict[str, Any] | None:
+    """Posts to OpenRouter by default. `endpoint_url` points this at any other OpenAI-compatible
+    chat-completions endpoint instead - e.g. an Ollama server tunneled out of a free Colab GPU
+    runtime - reusing the exact same request/response shape and JSON parsing/fallback behavior."""
     settings = get_settings()
-    api_key = settings.openrouter_api_key
-    if not api_key:
-        return None
+    if endpoint_url:
+        url, api_key = endpoint_url, endpoint_api_key or ""
+    else:
+        url, api_key = OPENROUTER_URL, settings.openrouter_api_key
+        if not api_key:
+            return None
     payload = {
         "model": model_override or settings.openrouter_model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -62,18 +76,20 @@ async def _complete(system: str, user: str, model_override: str | None = None) -
         "temperature": 0,
         "max_tokens": 2500,
     }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if not endpoint_url:
+        headers["HTTP-Referer"] = settings.openrouter_site_url
+        headers["X-Title"] = settings.openrouter_app_title
+    # A self-hosted endpoint (e.g. Ollama on a single shared GPU) may need to swap a different
+    # model into VRAM before it can answer - when several "colab:" models are requested concurrently
+    # and don't all fit in VRAM at once, that swap-per-request easily exceeds OpenRouter's normal
+    # 45s budget, so self-hosted calls get a much longer allowance.
+    timeout = 240 if endpoint_url else 45
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": settings.openrouter_site_url,
-                    "X-Title": settings.openrouter_app_title,
-                },
-                json=payload,
-            )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, headers=headers, json=payload)
         return _json_content(response)
     except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -290,3 +306,214 @@ Do not ask about age, gender, marital status, address, religion, ethnicity, heal
         }, ensure_ascii=False),
     )
     return _interview_kit(result, fallback) if result else fallback
+
+
+def _qa_pairs(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, dict):
+        return []
+    pairs = value.get("qa_pairs")
+    if not isinstance(pairs, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in pairs:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        if not question and not answer:
+            continue
+        normalized.append({
+            "speaker_role": str(item.get("speaker_role", "")).strip()[:32],
+            "question": question[:2000],
+            "answer": answer[:4000],
+        })
+    return normalized
+
+
+async def segment_transcript_ai(
+    transcript_text: str, candidate_name: str = "", candidate_email: str = "",
+) -> list[dict[str, str]]:
+    """No deterministic fallback exists for segmenting free-form dialogue, so on failure this
+    returns the whole transcript as a single untagged pair rather than nothing at all.
+
+    Prefers the same Colab-hosted model used for the 3-model cross-analysis (Stage 2) over
+    OpenRouter's free tier when configured. OpenRouter's free-tier daily quota (e.g. 50 req/day) is
+    shared across every AI feature in this app and runs out easily - when it does, this call used
+    to silently fail and every transcript degraded to "no speaker labels, one giant blob" with no
+    visible error, which is confusing since Stage 2 itself keeps working fine via Colab."""
+    settings = get_settings()
+    endpoint_url = settings.colab_llm_endpoint_url or None
+    model_override = settings.colab_llm_model if endpoint_url else None
+    result = await _complete(
+        """You are segmenting a job interview transcript (an interviewer or two plus the candidate,
+no pre-existing speaker labels). Split it into an ordered list of interviewer-question /
+candidate-answer pairs, inferring who is speaking from context. Return JSON only:
+{"qa_pairs":[{"speaker_role":"Interviewer|Leader|HR|Candidate","question":"","answer":""}]}.
+Keep question/answer text verbatim from the transcript, do not paraphrase.""",
+        json.dumps({"transcript": _redact(transcript_text, candidate_name, candidate_email)}, ensure_ascii=False),
+        model_override=model_override, endpoint_url=endpoint_url,
+    )
+    pairs = _qa_pairs(result) if result else []
+    return pairs or [{"speaker_role": "", "question": "", "answer": transcript_text[:4000]}]
+
+
+def _overall_assessment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    try:
+        score = max(0, min(100, int(value.get("score", 0))))
+    except (TypeError, ValueError):
+        score = 0
+    recommendation = value.get("recommendation")
+    if recommendation not in {"STRONG_YES", "YES", "MIXED", "NO", "STRONG_NO"}:
+        recommendation = "MIXED"
+    return {"score": score, "recommendation": recommendation, "reasoning": str(value.get("reasoning", "")).strip()[:1000]}
+
+
+def _verified_cross_analysis(
+    value: Any, qa_pairs: list[dict[str, str]], known_claim_ids: set[str], known_requirements: set[str],
+) -> dict[str, Any]:
+    items = value.get("qa_analyses") if isinstance(value, dict) else None
+    overall = _overall_assessment(value.get("overall_assessment") if isinstance(value, dict) else None)
+    if not isinstance(items, list):
+        return {"overall": overall, "qa_analyses": []}
+    verified: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            qa_index = int(item.get("qa_index"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= qa_index < len(qa_pairs)):
+            continue
+        answer_text = qa_pairs[qa_index].get("answer", "")
+        quality = item.get("answer_quality") if isinstance(item.get("answer_quality"), dict) else {}
+
+        linked_claims: list[dict[str, Any]] = []
+        for claim in item.get("linked_claims", []) if isinstance(item.get("linked_claims"), list) else []:
+            if not isinstance(claim, dict) or claim.get("claim_id") not in known_claim_ids:
+                continue
+            relationship = claim.get("relationship")
+            if relationship not in {"VERIFIED", "NEW_INFO", "POTENTIAL_INCONSISTENCY", "NOT_ADDRESSED"}:
+                continue
+            quote = _exact_quote(answer_text, claim.get("evidence_quote"))
+            # NOT_ADDRESSED legitimately has nothing to quote; every other relationship is a claim
+            # about what was actually said, so it can't survive without a real quote backing it.
+            if relationship != "NOT_ADDRESSED" and not quote:
+                continue
+            try:
+                confidence = min(1.0, max(0.0, float(claim.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            linked_claims.append({
+                "claim_id": claim["claim_id"], "relationship": relationship,
+                "evidence_quote": quote or "", "confidence": confidence,
+            })
+
+        linked_requirements: list[dict[str, Any]] = []
+        for req in item.get("linked_requirements", []) if isinstance(item.get("linked_requirements"), list) else []:
+            if not isinstance(req, dict) or req.get("requirement") not in known_requirements:
+                continue
+            strength = req.get("evidence_strength")
+            if strength not in {"STRONG", "WEAK", "NONE"}:
+                continue
+            quote = _exact_quote(answer_text, req.get("evidence_quote"))
+            if strength != "NONE" and not quote:
+                continue
+            linked_requirements.append({
+                "requirement": req["requirement"], "evidence_strength": strength,
+                "evidence_quote": quote or "",
+            })
+
+        verified.append({
+            "qa_index": qa_index,
+            "answer_quality": {
+                "relevance": str(quality.get("relevance", "")).strip()[:16],
+                "completeness": str(quality.get("completeness", "")).strip()[:16],
+                "specificity": str(quality.get("specificity", "")).strip()[:16],
+                "has_example": bool(quality.get("has_example", False)),
+            },
+            "linked_claims": linked_claims,
+            "linked_requirements": linked_requirements,
+        })
+    return {"overall": overall, "qa_analyses": verified}
+
+
+async def cross_analyze_interview_ai(
+    model: str, job_title: str, requirements: dict[str, Any],
+    claims: list[dict[str, str]], qa_pairs: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    """One specific model's cross-analysis of the whole interview in a single call. Returns None
+    when the call itself fails - there is no sensible rule-based fallback for analyzing a
+    free-form conversation, unlike CV screening's deterministic scorer.
+
+    A `model` of the form "colab:<model-name>" routes to settings.colab_llm_endpoint_url (e.g. an
+    Ollama server tunneled out of a free Colab GPU runtime) instead of OpenRouter - put one of
+    these in INTERVIEW_ANALYSIS_MODELS alongside the OpenRouter slugs to add it to the fan-out."""
+    known_claim_ids = {claim["id"] for claim in claims}
+    known_requirements = {
+        *requirements.get("required_skills", []), *requirements.get("preferred_skills", []),
+    }
+    endpoint_url: str | None = None
+    actual_model = model
+    if model.startswith("colab:"):
+        settings = get_settings()
+        endpoint_url = settings.colab_llm_endpoint_url
+        if not endpoint_url:
+            return None
+        actual_model = model.split(":", 1)[1] or settings.colab_llm_model
+    result = await _complete(
+        """You are analyzing a job interview conversation (interviewer(s) + candidate). You are given
+the candidate's CV claims (already verified against their CV) and the job's requirements.
+For EACH question/answer pair, assess the answer's quality and link it to the CV claims and job
+requirements it relates to, if any. A claim not supported by this answer is NOT evidence of lying -
+use NEW_INFO (new, CV-unsupported info) or POTENTIAL_INCONSISTENCY (contradicts the CV), never a
+truthfulness verdict.
+Then form your own overall assessment of this candidate for this specific role: reason from how
+they actually performed in the conversation - depth and specificity of answers, how much of the CV
+and the job's requirements they verified or demonstrated firsthand, and your judgment of their
+professional competence from how they explain their own work - not a mechanical average of the
+per-answer labels above. Be decisive: a candidate with deep, specific, verified answers across the
+requirements deserves a high score even if a couple of requirements went unasked.
+Return JSON only:
+{"overall_assessment":{"score":0,"recommendation":"STRONG_YES|YES|MIXED|NO|STRONG_NO","reasoning":""},
+"qa_analyses":[{"qa_index":0,
+"answer_quality":{"relevance":"high|medium|low","completeness":"high|medium|low","specificity":"high|medium|low","has_example":true},
+"linked_claims":[{"claim_id":"","relationship":"VERIFIED|NEW_INFO|POTENTIAL_INCONSISTENCY|NOT_ADDRESSED","evidence_quote":"","confidence":0.0}],
+"linked_requirements":[{"requirement":"","evidence_strength":"STRONG|WEAK|NONE","evidence_quote":""}]
+}]}
+score is 0-100, reasoning is 1-3 sentences in Vietnamese explaining the score.
+evidence_quote must be an exact verbatim substring of that pair's answer text.""",
+        json.dumps({
+            "job_title": job_title, "requirements": requirements,
+            "claims": claims, "qa_pairs": qa_pairs,
+        }, ensure_ascii=False),
+        model_override=actual_model, endpoint_url=endpoint_url,
+    )
+    if not result:
+        return None
+    return _verified_cross_analysis(result, qa_pairs, known_claim_ids, known_requirements)
+
+
+async def transcribe_audio_ai(file_path: str) -> str | None:
+    """Sends a recorded interview audio file to the Colab-hosted faster-whisper endpoint (a
+    separate server/tunnel from the LLM one above - see colab_stt_endpoint_url) and returns the
+    transcribed text. Returns None on any failure (not configured, network error, timeout,
+    malformed response) - the caller turns that into a clear 503 asking for the manual-paste
+    fallback instead, rather than ever crashing the request."""
+    settings = get_settings()
+    endpoint_url = settings.colab_stt_endpoint_url
+    if not endpoint_url:
+        return None
+    try:
+        with open(file_path, "rb") as audio_file:
+            # Interview recordings can run long and a shared Colab GPU may need to warm up the
+            # model first - a much longer budget than the LLM calls' own timeouts.
+            async with httpx.AsyncClient(timeout=300) as client:
+                response = await client.post(endpoint_url, files={"audio": audio_file})
+            response.raise_for_status()
+            text = response.json().get("text")
+        return text.strip() if isinstance(text, str) and text.strip() else None
+    except (httpx.HTTPError, OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None

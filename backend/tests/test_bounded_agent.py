@@ -3,12 +3,14 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.auth import LEADER_USER_ID
 from app.database import session_scope
 from app.main import app
 from app.models import AgentRun, CriteriaVersion, ScreeningArtifact
 
 
 client = TestClient(app)
+HR_HEADERS = {"X-Local-Actor": "hr", "X-Tenant-ID": LEADER_USER_ID}
 
 
 def _job(title: str) -> dict:
@@ -33,13 +35,32 @@ def _application(job_id: str, name: str, text: str) -> dict:
     return response.json()
 
 
+def test_leader_cannot_self_approve_criteria_only_hr_can():
+    job = _job("Phase Two Maker Checker")
+    request = next(item for item in client.get("/api/approvals?request_type=CRITERIA").json()
+                   if item["job_id"] == job["id"])
+
+    # The Leader created the job (and thus the criteria request) — they can review it, but the
+    # default actor (no X-Local-Actor header) is the Leader, so self-approval must be refused.
+    blocked = client.post(f"/api/approvals/{request['id']}/resolve", json={"decision": "APPROVE"})
+    assert blocked.status_code == 403
+
+    still_pending = next(item for item in client.get("/api/approvals?request_type=CRITERIA").json()
+                         if item["id"] == request["id"])
+    assert still_pending["status"] == "PENDING"
+
+    approved = client.post(f"/api/approvals/{request['id']}/resolve", json={"decision": "APPROVE"}, headers=HR_HEADERS)
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+
+
 def test_criteria_inbox_rescreen_lineage_and_trace():
     job = _job("Phase Two Lineage")
     pending = client.get("/api/approvals?request_type=CRITERIA").json()
     request = next(item for item in pending if item["job_id"] == job["id"])
     approved = client.post(f"/api/approvals/{request['id']}/resolve", json={
         "decision": "APPROVE", "note": "Initial criteria accepted",
-    })
+    }, headers=HR_HEADERS)
     assert approved.status_code == 200
 
     application = _application(
@@ -61,7 +82,7 @@ def test_criteria_inbox_rescreen_lineage_and_trace():
                    if item["job_id"] == job["id"])
     assert client.post(f"/api/approvals/{request['id']}/resolve", json={
         "decision": "APPROVE", "note": "Use v2",
-    }).status_code == 200
+    }, headers=HR_HEADERS).status_code == 200
 
     versions = client.get(f"/api/jobs/{job['id']}/criteria-versions").json()
     assert [item["version"] for item in versions] == [2, 1]
@@ -86,7 +107,8 @@ def test_low_confidence_routes_to_inbox_and_clear_pass_skips_shortlist():
     job = _job("Phase Two Bounded")
     criteria_request = next(item for item in client.get("/api/approvals?request_type=CRITERIA").json()
                             if item["job_id"] == job["id"])
-    client.post(f"/api/approvals/{criteria_request['id']}/resolve", json={"decision": "APPROVE"})
+    client.post(f"/api/approvals/{criteria_request['id']}/resolve", json={"decision": "APPROVE"},
+               headers=HR_HEADERS)
     strong = _application(job["id"], "Strong Bounded", "5 năm Python FastAPI PostgreSQL Docker REST API.")
     weak = _application(job["id"], "Weak Bounded", "2 năm hỗ trợ nội dung và chăm sóc khách hàng.")
 

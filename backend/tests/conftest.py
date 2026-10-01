@@ -22,12 +22,21 @@ os.environ["AUTH_REQUIRED"] = "false"
 os.environ["AUTO_SEED"] = "true"
 os.environ["APP_ENV"] = "test"
 os.environ["EMBEDDING_ENABLED"] = "false"
+# config.py's module-level load_dotenv() reads the developer's real backend/.env (override=False,
+# so it only fills in whatever isn't already pinned above) - without this, a real COLAB_LLM_ENDPOINT_URL
+# set there leaks into the test run and tests make real network calls to a developer's live tunnel.
+os.environ["INTERVIEW_ANALYSIS_MODELS"] = (
+    "test/model-a:free,test/model-b:free,test/model-c:free,test/model-d:free"
+)
+os.environ["COLAB_LLM_ENDPOINT_URL"] = ""
+os.environ["COLAB_LLM_MODEL"] = ""
 
 config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
 command.upgrade(config, "head")
 
-from app.main import seed  # noqa: E402
+from app.main import ensure_local_hr_membership, seed  # noqa: E402
 
+ensure_local_hr_membership()
 seed()
 
 

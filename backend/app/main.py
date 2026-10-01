@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 import secrets
+import tempfile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -32,17 +34,22 @@ from .agentic import (
     route_scored_application,
     utcnow,
 )
-from .auth import current_actor, current_tenant_id, current_user_id, require_tenant_role
+from .auth import (
+    HR_USER_ID, LEADER_USER_ID, current_actor, current_actor_role, current_tenant_id,
+    current_user_id, require_tenant_role,
+)
 from .config import get_settings
 from .database import SessionLocal, session_scope
-from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai
+from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai, transcribe_audio_ai
 from .master_seed import create_master_user, has_master_seed_config
 from .models import (
     AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
     CandidateProfile, CandidateResumeVersion, ResumeVersionComparison, ResumeVersionEmbedding,
     ResumeVersionSkill,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
-    InterviewPolicy, InterviewScorecard, Job, OutboxEvent, ProviderWebhookEvent,
+    InterviewClaim, InterviewCrossAnalysisRun, InterviewPolicy, InterviewQAClaimLink,
+    InterviewQAPair, InterviewQARequirementLink, InterviewScorecard, InterviewTranscriptSession,
+    Job, OutboxEvent, ProviderWebhookEvent,
     SchedulingInvitation, ScreeningArtifact, ShortlistProposal, SourceConnector, SourceIngestion, Tenant,
     TenantMembership, TenantPolicy, TenantUsage, ModelPolicy, OperationalAlert, OperationalSLOPolicy,
     ReleaseGate, UploadBatch,
@@ -86,7 +93,10 @@ from .scheduling import (
     mail_sandbox_alias, render_template, sandbox_allowlist, sandbox_allowlist_entries,
     save_connection,
 )
-from .interview_ops import escalation, get_policy, run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback
+from .interview_ops import (
+    aggregate_cross_analysis, escalation, get_policy, persist_cross_analysis, rule_based_assessment, run_cross_analysis_pipeline,
+    run_follow_up_cycle, schedule_follow_up_sweep, summarize_feedback,
+)
 from .governance import (
     EVAL_THRESHOLDS, enforce_screening_budget, evaluation_passes, policy_for,
     record_screening_usage, retention_cutoff, select_model_variant, usage_for,
@@ -98,8 +108,22 @@ from .operations import (
 
 
 @asynccontextmanager
+def ensure_local_hr_membership() -> None:
+    """Seed the HR (ADMIN) membership on the Leader's tenant so the local maker/checker demo
+    (X-Local-Actor: leader|hr) has someone besides the job's own creator able to approve it."""
+    with session_scope() as db:
+        existing = db.scalar(select(TenantMembership).where(
+            TenantMembership.tenant_id == LEADER_USER_ID, TenantMembership.user_id == HR_USER_ID,
+        ))
+        if existing:
+            return
+        db.add(TenantMembership(tenant_id=LEADER_USER_ID, user_id=HR_USER_ID, role="ADMIN", status="ACTIVE"))
+
+
 async def lifespan(_: FastAPI):
     ensure_resume_bucket()
+    if not settings.auth_required:
+        ensure_local_hr_membership()
     if settings.auto_seed:
         seed()
     if settings.master_seed_on_start and has_master_seed_config():
@@ -371,6 +395,10 @@ class ScorecardCreate(BaseModel):
         if normalized not in {"STRONG_YES", "YES", "MIXED", "NO", "STRONG_NO"}:
             raise ValueError("unsupported recommendation")
         return normalized
+
+
+class TranscriptSessionCreate(BaseModel):
+    transcript_text: str = Field(min_length=20, max_length=200_000)
 
 
 class TenantCreate(BaseModel):
@@ -939,6 +967,12 @@ def add_tenant_member(tenant_id: str, payload: TenantMemberCreate,
             member = TenantMembership(tenant_id=tenant_id, user_id=payload.user_id, role=payload.role)
             db.add(member); db.flush()
         return {"tenant_id": tenant_id, "user_id": member.user_id, "role": member.role, "status": member.status}
+
+
+@app.get("/api/me")
+def me(owner_id: str = Depends(current_tenant_id), role: str = Depends(current_actor_role),
+      actor: dict[str, str] = Depends(current_actor)) -> dict:
+    return {"user_id": actor["id"], "email": actor["email"], "tenant_id": owner_id, "role": role}
 
 
 @app.get("/api/tenant-policy")
@@ -1988,8 +2022,6 @@ def export_shortlist_report(job_id: str, limit: int = 5, owner_id: str = Depends
 def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = Depends(current_tenant_id),
                       actor: dict[str, str] = Depends(current_actor)) -> dict:
     selected = set(payload.application_ids)
-    invitations: list[dict] = []
-    outbox_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
         criteria = latest_criteria(db, job.id, approved_only=True)
@@ -2029,28 +2061,12 @@ def approve_shortlist(job_id: str, payload: ShortlistApproval, owner_id: str = D
                 request.status = "APPROVED"
                 request.resolution = {"note": payload.note, "application_ids": payload.application_ids, **decided_by(actor)}
                 request.decided_at = utcnow()
+        # Approving a shortlist is a hand-off into the normal review queue, not an interview
+        # invite — the candidate still needs a Leader to review their busy calendar and confirm
+        # before anything gets sent (see confirmInterviewInvite's "Mời PV" flow).
         ranked = sorted([item for item in apps if item.id in selected], key=lambda a: a.screening.get("final_score", 0), reverse=True)
-        invitation_payload = SchedulingInvitationCreate()
-        for item in ranked:
-            if not item.candidate_email:
-                continue
-            existing = db.scalar(select(SchedulingInvitation).where(
-                SchedulingInvitation.application_id == item.id,
-                SchedulingInvitation.owner_id == owner_id,
-                SchedulingInvitation.purpose == "SCHEDULE",
-                SchedulingInvitation.status == "ACTIVE",
-            ))
-            if existing:
-                continue
-            invitation, outbox_id = _create_scheduling_invitation(db, item, invitation_payload)
-            invitations.append(invitation)
-            outbox_ids.append(outbox_id)
         response = {"job": job_dict(job, len(apps)), "items": [application_dict(item) for item in ranked],
-                    "invitations": invitations}
-    for outbox_id in outbox_ids:
-        dispatch_outbox(outbox_id)
-    for invitation in invitations:
-        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
+                    "invitations": []}
     return response
 
 
@@ -2077,13 +2093,12 @@ def approval_inbox(
 @app.post("/api/approvals/{approval_id}/resolve")
 async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                            owner_id: str = Depends(current_tenant_id),
+                           role: str = Depends(current_actor_role),
                            actor: dict[str, str] = Depends(current_actor)) -> dict:
     decision = payload.decision.upper()
     if decision not in {"APPROVE", "REJECT"}:
         raise HTTPException(422, "decision must be APPROVE or REJECT")
     task_ids: list[str] = []
-    invitation_outbox_ids: list[str] = []
-    invitations: list[dict] = []
     with session_scope() as db:
         request = db.scalar(select(ApprovalRequest).where(
             ApprovalRequest.id == approval_id, ApprovalRequest.owner_id == owner_id
@@ -2092,6 +2107,10 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             raise HTTPException(404, "Approval request not found")
         if request.status != "PENDING":
             raise HTTPException(409, "Approval request is already resolved")
+        # Maker/checker: whoever submitted the job's criteria (the Leader/OWNER) can review and
+        # edit it, but only HR (ADMIN) gives the final sign-off — never the same person.
+        if request.request_type == "CRITERIA" and role != "ADMIN":
+            raise HTTPException(403, "Chỉ HR (Admin) mới được duyệt tiêu chí công việc")
         request.status = "APPROVED" if decision == "APPROVE" else "REJECTED"
         request.resolution = {"note": payload.note, "application_ids": payload.application_ids or [], **decided_by(actor)}
         request.decided_at = utcnow()
@@ -2125,6 +2144,9 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                 )))
                 if set(selected) - {item.id for item in apps}:
                     raise HTTPException(422, "Shortlist contains applications outside this job")
+                # Hand-off into the normal review queue - no auto-invite. A Leader still has to
+                # open the candidate and go through "Mời PV" (busy-calendar check + confirm) before
+                # any interview email goes out.
                 for item in apps:
                     if item.id in selected and item.status == ApplicationStatus.WAITING_REVIEW.value:
                         item.status = ApplicationStatus.SHORTLISTED.value
@@ -2133,21 +2155,6 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
                     "status": "APPROVED", "application_ids": selected, "note": payload.note,
                     "approved_at": utcnow().isoformat(), "proposal_id": proposal.id,
                 }}
-                invitation_payload = SchedulingInvitationCreate()
-                for item in apps:
-                    if item.id not in selected or not item.candidate_email:
-                        continue
-                    existing = db.scalar(select(SchedulingInvitation).where(
-                        SchedulingInvitation.application_id == item.id,
-                        SchedulingInvitation.owner_id == owner_id,
-                        SchedulingInvitation.purpose == "SCHEDULE",
-                        SchedulingInvitation.status == "ACTIVE",
-                    ))
-                    if existing:
-                        continue
-                    invitation, outbox_id = _create_scheduling_invitation(db, item, invitation_payload)
-                    invitations.append(invitation)
-                    invitation_outbox_ids.append(outbox_id)
         audit(db, owner_id, request.application_id, f"{request.request_type}_{request.status}",
               {"approval_id": request.id, "resource_id": request.resource_id, "note": payload.note}, actor=actor)
         response = approval_dict(request)
@@ -2156,10 +2163,6 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
             await enqueue_screening_async(task_id)
         except Exception as exc:
             mark_enqueue_failed(task_id, str(exc))
-    for outbox_id in invitation_outbox_ids:
-        dispatch_outbox(outbox_id)
-    for invitation in invitations:
-        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
     return response
 
 
@@ -2167,9 +2170,9 @@ async def resolve_approval(approval_id: str, payload: ApprovalResolution,
 def approve_shortlist_item(approval_id: str, application_id: str, owner_id: str = Depends(current_tenant_id),
                            actor: dict[str, str] = Depends(current_actor)) -> dict:
     """Pull one candidate out of a still-open shortlist proposal and shortlist just them,
-    leaving the rest of the proposal pending for the recruiter to keep deciding on."""
-    invitation: dict | None = None
-    outbox_id: str | None = None
+    leaving the rest of the proposal pending for the recruiter to keep deciding on. This only
+    hands them off into the normal review queue - no interview invite is sent here; a Leader
+    still has to open the candidate and go through "Mời PV" themselves."""
     with session_scope() as db:
         request = db.scalar(select(ApprovalRequest).where(
             ApprovalRequest.id == approval_id, ApprovalRequest.owner_id == owner_id,
@@ -2192,8 +2195,6 @@ def approve_shortlist_item(approval_id: str, application_id: str, owner_id: str 
         if application.status != ApplicationStatus.WAITING_REVIEW.value:
             raise HTTPException(409, "Candidate is no longer waiting for review")
         application.status = ApplicationStatus.SHORTLISTED.value
-        if application.candidate_email:
-            invitation, outbox_id = _create_scheduling_invitation(db, application, SchedulingInvitationCreate())
         remaining_ids = [item for item in proposal.application_ids if item != application_id]
         proposal.application_ids = remaining_ids
         proposal.ranking = [row for row in proposal.ranking if row.get("application_id") != application_id]
@@ -2219,10 +2220,6 @@ def approve_shortlist_item(approval_id: str, application_id: str, owner_id: str 
         audit(db, owner_id, application.id, "SHORTLIST_ITEM_APPROVED",
               {"approval_id": request.id, "proposal_id": proposal.id}, actor=actor)
         response = {"approval": approval_dict(request), "application": application_dict(application)}
-    if outbox_id:
-        dispatch_outbox(outbox_id)
-    if invitation:
-        schedule_follow_up_sweep(owner_id, datetime.fromisoformat(invitation["expires_at"]), f"invitation:{invitation['id']}")
     return response
 
 
@@ -2710,9 +2707,11 @@ def policy_dict(value: InterviewPolicy) -> dict:
             "working_end_hour": value.working_end_hour}
 
 
-def busy_block_dict(value: BusyBlock) -> dict:
+def busy_block_dict(value: BusyBlock, viewer_id: str | None = None) -> dict:
     return {"id": value.id, "note": value.note,
-            "start_at": utc_iso(value.start_at), "end_at": utc_iso(value.end_at)}
+            "start_at": utc_iso(value.start_at), "end_at": utc_iso(value.end_at),
+            "created_by_id": value.created_by_id, "created_by_email": value.created_by_email,
+            "is_mine": viewer_id is not None and (not value.created_by_id or value.created_by_id == viewer_id)}
 
 
 @app.get("/api/interview-policy")
@@ -2738,11 +2737,12 @@ def update_interview_policy(payload: InterviewPolicyUpdate, owner_id: str = Depe
 
 
 @app.get("/api/busy-blocks")
-def list_busy_blocks(owner_id: str = Depends(current_tenant_id)) -> list[dict]:
+def list_busy_blocks(owner_id: str = Depends(current_tenant_id),
+                     actor: dict[str, str] = Depends(current_actor)) -> list[dict]:
     with session_scope() as db:
         values = db.scalars(select(BusyBlock).where(BusyBlock.owner_id == owner_id)
                             .order_by(BusyBlock.start_at))
-        return [busy_block_dict(value) for value in values]
+        return [busy_block_dict(value, actor["id"]) for value in values]
 
 
 @app.post("/api/busy-blocks", status_code=201)
@@ -2750,10 +2750,10 @@ def create_busy_block(payload: BusyBlockCreate, owner_id: str = Depends(current_
                       actor: dict[str, str] = Depends(current_actor)) -> dict:
     with session_scope() as db:
         value = BusyBlock(owner_id=owner_id, start_at=payload.start_at, end_at=payload.end_at,
-                          note=payload.note.strip())
+                          note=payload.note.strip(), created_by_id=actor["id"], created_by_email=actor["email"])
         db.add(value); db.flush()
-        audit(db, owner_id, None, "BUSY_BLOCK_ADDED", busy_block_dict(value), actor=actor)
-        return busy_block_dict(value)
+        audit(db, owner_id, None, "BUSY_BLOCK_ADDED", busy_block_dict(value, actor["id"]), actor=actor)
+        return busy_block_dict(value, actor["id"])
 
 
 @app.delete("/api/busy-blocks/{block_id}")
@@ -2763,7 +2763,11 @@ def delete_busy_block(block_id: str, owner_id: str = Depends(current_tenant_id),
         value = db.scalar(select(BusyBlock).where(BusyBlock.id == block_id, BusyBlock.owner_id == owner_id))
         if not value:
             raise HTTPException(404, "Busy block not found")
-        audit(db, owner_id, None, "BUSY_BLOCK_REMOVED", busy_block_dict(value), actor=actor)
+        # Legacy blocks with no recorded creator stay deletable by anyone on the tenant; blocks
+        # created after this feature shipped can only be removed by whoever added them.
+        if value.created_by_id and value.created_by_id != actor["id"]:
+            raise HTTPException(403, "Chỉ người tạo mới xoá được lịch bận này")
+        audit(db, owner_id, None, "BUSY_BLOCK_REMOVED", busy_block_dict(value, actor["id"]), actor=actor)
         db.delete(value)
         return {"status": "deleted", "id": block_id}
 
@@ -2783,6 +2787,56 @@ def feedback_dict(value: FeedbackSummary | None) -> dict | None:
             "conflicts": value.conflicts, "sources": value.sources, "created_at": value.created_at.isoformat()}
 
 
+def transcript_session_dict(db, session: InterviewTranscriptSession, requirements: dict) -> dict:
+    """One entry per configured model, each carrying its own per-question breakdown + aggregation -
+    the 4 models are shown side by side, never merged into one answer (see plan: user explicitly
+    wants all 4 opinions, not a single picked "winner")."""
+    qa_pairs = list(db.scalars(select(InterviewQAPair).where(
+        InterviewQAPair.session_id == session.id,
+    ).order_by(InterviewQAPair.order_index)))
+    runs = list(db.scalars(select(InterviewCrossAnalysisRun).where(
+        InterviewCrossAnalysisRun.session_id == session.id,
+    ).order_by(InterviewCrossAnalysisRun.created_at)))
+    claims_by_id = {claim.id: claim.text for claim in db.scalars(
+        select(InterviewClaim).where(InterviewClaim.session_id == session.id))}
+    known_requirements = {*requirements.get("required_skills", []), *requirements.get("preferred_skills", [])}
+
+    def _qa_entry(qa: InterviewQAPair, model_name: str) -> dict:
+        claim_links = db.scalars(select(InterviewQAClaimLink).where(
+            InterviewQAClaimLink.qa_id == qa.id, InterviewQAClaimLink.model_name == model_name,
+        ))
+        requirement_links = db.scalars(select(InterviewQARequirementLink).where(
+            InterviewQARequirementLink.qa_id == qa.id, InterviewQARequirementLink.model_name == model_name,
+        ))
+        return {
+            "question": qa.question_text, "answer": qa.answer_text, "speaker_role": qa.speaker_role,
+            "linked_claims": [{"claim": claims_by_id.get(link.claim_id, ""), "relationship": link.relationship_type,
+                               "evidence_quote": link.evidence_quote, "confidence": link.confidence}
+                              for link in claim_links],
+            "linked_requirements": [{"requirement": link.requirement_text, "evidence_strength": link.evidence_strength,
+                                     "evidence_quote": link.evidence_quote} for link in requirement_links],
+        }
+
+    models_result = []
+    for run in runs:
+        entry: dict = {"model_name": run.model_name, "status": run.status, "error": run.error,
+                       "latency_ms": run.latency_ms, "score": run.score,
+                       "recommendation": run.recommendation, "summary": run.summary}
+        if run.status == "OK":
+            entry["qa_analyses"] = [_qa_entry(qa, run.model_name) for qa in qa_pairs]
+            entry["aggregation"] = aggregate_cross_analysis(db, session.id, run.model_name, known_requirements)
+            entry["rule_based"] = rule_based_assessment(entry["aggregation"])
+        models_result.append(entry)
+
+    return {
+        "id": session.id, "interview_id": session.interview_id, "transcript_text": session.transcript_text,
+        "status": session.status, "created_at": session.created_at.isoformat(),
+        "qa_pairs": [{"question": qa.question_text, "answer": qa.answer_text, "speaker_role": qa.speaker_role}
+                    for qa in qa_pairs],
+        "models": models_result,
+    }
+
+
 @app.get("/api/interviews/{interview_id}/operations")
 def interview_operations(interview_id: str, owner_id: str = Depends(current_tenant_id)) -> dict:
     with session_scope() as db:
@@ -2799,10 +2853,80 @@ def interview_operations(interview_id: str, owner_id: str = Depends(current_tena
             OutboxEvent.aggregate_id == interview.id,
             OutboxEvent.idempotency_key.like(f"interview-reminder:{interview.id}:%"),
         ).order_by(OutboxEvent.available_at)))
+        sessions = list(db.scalars(select(InterviewTranscriptSession).where(
+            InterviewTranscriptSession.interview_id == interview.id, InterviewTranscriptSession.owner_id == owner_id,
+        ).order_by(InterviewTranscriptSession.created_at)))
+        application = db.get(Application, interview.application_id)
+        job = db.get(Job, application.job_id) if application else None
+        requirements = (job.requirements if job else None) or {}
         return {"interview": interview_dict(interview), "policy": policy_dict(get_policy(db, owner_id)),
                 "scorecards": [scorecard_dict(card) for card in cards], "feedback_summary": feedback_dict(summary),
                 "reminders": [{"id": event.id, "status": event.status,
-                               "due_at": event.available_at.isoformat()} for event in reminders]}
+                               "due_at": event.available_at.isoformat()} for event in reminders],
+                "transcript_sessions": [transcript_session_dict(db, session, requirements) for session in sessions]}
+
+
+@app.post("/api/interviews/{interview_id}/transcript-sessions", status_code=201)
+async def create_transcript_session(interview_id: str, payload: TranscriptSessionCreate,
+                                    owner_id: str = Depends(current_tenant_id)) -> dict:
+    with session_scope() as db:
+        interview = db.scalar(select(Interview).where(Interview.id == interview_id, Interview.owner_id == owner_id))
+        if not interview:
+            raise HTTPException(404, "Interview not found")
+        application = db.get(Application, interview.application_id)
+        job = db.get(Job, application.job_id) if application else None
+        if not application or not job:
+            raise HTTPException(409, "Interview's application/job no longer exists")
+        job_title, requirements = job.title, job.requirements or {}
+        candidate_name, candidate_email = application.candidate_name, application.candidate_email
+        screening = application.screening or {}
+        interview_id_value, application_id = interview.id, application.id
+
+    # The AI pipeline (segmentation + up to N concurrent model calls, which can take tens of
+    # seconds) runs with no open DB transaction - see run_cross_analysis_pipeline's docstring for
+    # why (SQLite "database is locked" otherwise).
+    pipeline_result = await run_cross_analysis_pipeline(
+        payload.transcript_text, candidate_name, candidate_email, job_title, requirements, screening,
+    )
+
+    with session_scope() as db:
+        session = InterviewTranscriptSession(owner_id=owner_id, interview_id=interview_id_value,
+                                             transcript_text=payload.transcript_text)
+        db.add(session); db.flush()
+        persist_cross_analysis(db, session, pipeline_result)
+        audit(db, owner_id, application_id, "TRANSCRIPT_ANALYZED", {"session_id": session.id})
+        return transcript_session_dict(db, session, requirements)
+
+
+@app.post("/api/interviews/{interview_id}/transcribe-recording")
+async def transcribe_recording(interview_id: str, audio: UploadFile = File(...),
+                               owner_id: str = Depends(current_tenant_id)) -> dict:
+    """"Ghi âm phỏng vấn" flow, step 1 of 2: transcribe the recorded audio via the Colab-hosted
+    faster-whisper endpoint and hand the text straight back - no analysis session is created here.
+    The frontend shows this text immediately (so the user can check what was actually picked up),
+    then auto-submits it to POST .../transcript-sessions above to run the real analysis - kept as
+    two separate requests specifically so the UI has something to show the moment STT finishes,
+    instead of one opaque multi-minute call covering STT + all 3 models."""
+    with session_scope() as db:
+        interview = db.scalar(select(Interview).where(Interview.id == interview_id, Interview.owner_id == owner_id))
+        if not interview:
+            raise HTTPException(404, "Interview not found")
+
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        transcript_text = await transcribe_audio_ai(tmp_path)
+    finally:
+        os.remove(tmp_path)
+
+    if not transcript_text or len(transcript_text.strip()) < 20:
+        raise HTTPException(
+            503,
+            "Không trích xuất được giọng nói từ bản ghi âm (STT chưa cấu hình, lỗi kết nối tới Colab, "
+            "hoặc bản ghi quá ngắn/không có tiếng nói). Hãy thử dán transcript thủ công bên dưới.",
+        )
+    return {"transcript_text": transcript_text}
 
 
 @app.post("/api/interviews/{interview_id}/scorecards", status_code=201)

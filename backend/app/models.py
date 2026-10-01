@@ -337,6 +337,10 @@ class SchedulingInvitation(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     selected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Set once the invitation email itself is actually sent through a real provider (Gmail), so a
+    # later confirmation email can thread as a reply instead of starting a new conversation.
+    email_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class EmailTemplate(Base):
@@ -409,6 +413,10 @@ class BusyBlock(Base):
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     note: Mapped[str] = mapped_column(String(240), default="")
+    # A tenant can have more than one person on the calendar (e.g. Leader + HR) — only the person
+    # who added a block may remove it; everyone else just sees it as someone else's busy time.
+    created_by_id: Mapped[str] = mapped_column(String(128), default="")
+    created_by_email: Mapped[str] = mapped_column(String(320), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -439,6 +447,86 @@ class FeedbackSummary(Base):
     conflicts: Mapped[list] = mapped_column(JSON, default=list)
     sources: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InterviewTranscriptSession(Base):
+    """One uploaded interview transcript — text only, no video/audio handling here."""
+
+    __tablename__ = "interview_transcript_sessions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    interview_id: Mapped[str] = mapped_column(ForeignKey("interviews.id", ondelete="CASCADE"), index=True)
+    transcript_text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="COMPLETED")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InterviewQAPair(Base):
+    """One interviewer question + candidate answer, segmented out of the transcript."""
+
+    __tablename__ = "interview_qa_pairs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    session_id: Mapped[str] = mapped_column(ForeignKey("interview_transcript_sessions.id", ondelete="CASCADE"), index=True)
+    order_index: Mapped[int] = mapped_column(Integer)
+    speaker_role: Mapped[str] = mapped_column(String(32), default="")
+    question_text: Mapped[str] = mapped_column(Text, default="")
+    answer_text: Mapped[str] = mapped_column(Text, default="")
+
+
+class InterviewClaim(Base):
+    """An atomic, quote-verified claim pulled from the CV (skill, experience, matched requirement)."""
+
+    __tablename__ = "interview_claims"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    session_id: Mapped[str] = mapped_column(ForeignKey("interview_transcript_sessions.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(String(320))
+    source_quote: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(32), default="skill")
+
+
+class InterviewCrossAnalysisRun(Base):
+    """One row per (session, model) — tracks whether that model's analysis call succeeded,
+    independent of the per-question link rows it may or may not have produced."""
+
+    __tablename__ = "interview_cross_analysis_runs"
+    __table_args__ = (UniqueConstraint("session_id", "model_name", name="uq_cross_analysis_run_model"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    session_id: Mapped[str] = mapped_column(ForeignKey("interview_transcript_sessions.id", ondelete="CASCADE"), index=True)
+    model_name: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(16), default="OK")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # This model's own overall read on the candidate, reasoned from the conversation (not a tally
+    # of the per-question labels above) — null when the run wasn't OK.
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommendation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InterviewQAClaimLink(Base):
+    """One model's judgement on how a Q&A pair relates to one CV claim."""
+
+    __tablename__ = "interview_qa_claim_links"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    qa_id: Mapped[str] = mapped_column(ForeignKey("interview_qa_pairs.id", ondelete="CASCADE"), index=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("interview_claims.id", ondelete="CASCADE"), index=True)
+    model_name: Mapped[str] = mapped_column(String(120), index=True)
+    relationship_type: Mapped[str] = mapped_column(String(32))
+    evidence_quote: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+
+
+class InterviewQARequirementLink(Base):
+    """One model's judgement on how a Q&A pair demonstrates one JD requirement."""
+
+    __tablename__ = "interview_qa_requirement_links"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    qa_id: Mapped[str] = mapped_column(ForeignKey("interview_qa_pairs.id", ondelete="CASCADE"), index=True)
+    requirement_text: Mapped[str] = mapped_column(String(320))
+    model_name: Mapped[str] = mapped_column(String(120), index=True)
+    evidence_strength: Mapped[str] = mapped_column(String(16), default="NONE")
+    evidence_quote: Mapped[str] = mapped_column(Text, default="")
 
 
 class AuditLog(Base):

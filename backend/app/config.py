@@ -47,6 +47,10 @@ class Settings:
     supabase_service_role_key: str
     openrouter_api_key: str
     openrouter_model: str
+    interview_analysis_models: tuple[str, ...]
+    colab_llm_endpoint_url: str
+    colab_llm_model: str
+    colab_stt_endpoint_url: str
     openrouter_site_url: str
     openrouter_app_title: str
     hf_token: str
@@ -148,6 +152,25 @@ class Settings:
             supabase_service_role_key=service_role_key,
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
             openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite").strip(),
+            interview_analysis_models=tuple(
+                value.strip() for value in os.getenv(
+                    "INTERVIEW_ANALYSIS_MODELS",
+                    # Runs entirely on a free Colab GPU (via Ollama) instead of OpenRouter's
+                    # free tier, which rotates/rate-limits unpredictably - see COLAB_LLM_ENDPOINT_URL
+                    # below. Each "colab:<tag>" here is a strong, free, JSON/instruction-following
+                    # model well suited to text analysis; swap tags freely, Ollama pulls on demand.
+                    "colab:qwen2.5:14b,colab:llama3.1:8b,colab:gemma2:9b",
+                ).split(",") if value.strip()
+            ),
+            # A "colab:<model-name>" entry in INTERVIEW_ANALYSIS_MODELS above routes to this
+            # OpenAI-compatible endpoint instead of OpenRouter - e.g. an Ollama server tunneled out
+            # of a free Google Colab GPU runtime. Full URL including the /v1/chat/completions path.
+            colab_llm_endpoint_url=os.getenv("COLAB_LLM_ENDPOINT_URL", "").strip(),
+            colab_llm_model=os.getenv("COLAB_LLM_MODEL", "").strip(),
+            # Separate Colab tunnel running faster-whisper for the "ghi âm phỏng vấn" flow - full
+            # URL including the /transcribe path. Independent of colab_llm_endpoint_url above since
+            # STT and the 3 analysis LLMs run as separate servers on separate ports/tunnels.
+            colab_stt_endpoint_url=os.getenv("COLAB_STT_ENDPOINT_URL", "").strip(),
             openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000").strip(),
             openrouter_app_title=os.getenv("OPENROUTER_APP_TITLE", "TalentFlow Recruitment Copilot").strip(),
             hf_token=os.getenv("HF_TOKEN", "").strip(),

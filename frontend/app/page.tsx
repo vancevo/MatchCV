@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import AuthScreen from "./AuthScreen";
 import { accessToken, supabase } from "../lib/supabase";
@@ -184,10 +184,36 @@ function Icon({ name }: { name: string }) {
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
+/** Local maker/checker demo: no Supabase configured locally, so "who's logged in" is just a
+ * role picker stored in the browser, sent as a header the backend reads only when
+ * AUTH_REQUIRED=false. Real deployments ignore this entirely (Authorization takes over). */
+const LOCAL_ACTOR_STORAGE_KEY = "talentflow_local_actor";
+type LocalActor = "leader" | "hr";
+function getLocalActor(): LocalActor | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = window.localStorage.getItem(LOCAL_ACTOR_STORAGE_KEY);
+    return value === "leader" || value === "hr" ? value : null;
+  } catch { return null; }
+}
+function setLocalActor(actor: LocalActor | null) {
+  try {
+    if (actor) window.localStorage.setItem(LOCAL_ACTOR_STORAGE_KEY, actor);
+    else window.localStorage.removeItem(LOCAL_ACTOR_STORAGE_KEY);
+  } catch { /* private browsing etc. — the picker will just show again next time */ }
+}
+function applyLocalActorHeaders(headers: { set(key: string, value: string): void }) {
+  const actor = getLocalActor();
+  if (!actor) return;
+  headers.set("X-Local-Actor", actor);
+  if (actor === "hr") headers.set("X-Tenant-ID", LOCAL_ACTOR_ID);
+}
+
 async function request<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const token = await accessToken();
   const headers = new Headers(init?.headers);
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  else applyLocalActorHeaders(headers);
   const response = await fetch(`${API_URL}${path}`, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -200,6 +226,7 @@ async function download(path: string, filename: string) {
   const token = await accessToken();
   const headers = new Headers();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  else applyLocalActorHeaders(headers);
   const response = await fetch(`${API_URL}${path}`, { headers });
   if (!response.ok) throw new Error("Không thể tải báo cáo");
   const blob = await response.blob();
@@ -227,6 +254,9 @@ const statusTone = (status: string) => status === "WAITING_REVIEW" ? "review" : 
 /** "Chờ duyệt" means WAITING_REVIEW *and* clear of both bars — everything else in WAITING_REVIEW
  * is still being triaged through Phê duyệt/shortlist, so it doesn't belong in this count/list. */
 const isReadyForApproval = (item: Application, policy: TenantPolicy | null) => {
+  // SHORTLISTED = a Leader/HR already approved this candidate out of the shortlist queue — that
+  // approval IS the hand-off into "chờ duyệt", not a trigger to send an interview invite.
+  if (item.status === "SHORTLISTED") return true;
   if (item.status !== "WAITING_REVIEW" || !policy) return false;
   return item.screening.final_score >= policy.auto_approve_threshold
     && (item.screening.confidence ?? 0) * 100 >= policy.min_confidence_threshold;
@@ -356,6 +386,25 @@ export default function Home() {
   return scheduleToken ? <PublicScheduling token={scheduleToken}/> : <RecruiterApp/>;
 }
 
+function LocalRoleGate({ onPick }: { onPick: (actor: LocalActor) => void }) {
+  return <main className="auth-page"><div className="auth-card local-role-gate">
+    <div className="brand auth-brand"><div className="brandmark">✦</div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
+    <span className="eyebrow">LOCAL DEMO · CHỌN VAI TRÒ</span>
+    <h1>Bạn đăng nhập với vai trò nào?</h1>
+    <p>Môi trường local chưa cấu hình Supabase, đây là bộ chọn vai trò để test luồng duyệt 2 bước (Leader tạo &amp; xem lại, HR duyệt cuối) — không phải đăng nhập thật.</p>
+    <div className="role-options">
+      <button type="button" className="role-option" onClick={() => onPick("leader")}>
+        <b>Leader</b>
+        <span>Tạo việc làm, xem lại/chỉnh tiêu chí do AI trích xuất — không tự duyệt được</span>
+      </button>
+      <button type="button" className="role-option" onClick={() => onPick("hr")}>
+        <b>HR (Admin)</b>
+        <span>Duyệt cuối cùng tiêu chí công việc trước khi dùng để chấm điểm CV</span>
+      </button>
+    </div>
+  </div></main>;
+}
+
 function RecruiterApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(!supabase);
@@ -372,8 +421,10 @@ function RecruiterApp() {
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [modal, setModal] = useState<"job" | "upload" | "schedule" | "criteria" | "thresholds" | null>(null);
+  const [modal, setModal] = useState<"job" | "upload" | "schedule" | "criteria" | "thresholds" | "invite-schedule" | null>(null);
   const [policy, setPolicy] = useState<TenantPolicy | null>(null);
+  const [localActor, setLocalActorState] = useState<LocalActor | null>(() => getLocalActor());
+  const [me, setMe] = useState<{ role: string } | null>(null);
   const [criteriaJob, setCriteriaJob] = useState<Job | null>(null);
   const [candidateTab, setCandidateTab] = useState("all");
   const [slots, setSlots] = useState<{ start_at: string; duration_minutes: number }[]>([]);
@@ -383,8 +434,15 @@ function RecruiterApp() {
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [lastBatch, setLastBatch] = useState<BatchResult | null>(null);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [notifOpen, setNotifOpen] = useState(false);
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 3000); };
+  const upcomingInterviews = useMemo(() => {
+    const now = Date.now();
+    return (dashboard.interviews || [])
+      .filter(iv => iv.status === "SCHEDULED" && new Date(iv.start_at).getTime() >= now)
+      .sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime());
+  }, [dashboard.interviews]);
   const actionBusy = submitting || Boolean(pendingAction);
   const runAction = async (key: string, label: string, task: () => Promise<void>) => {
     if (actionBusy) return;
@@ -395,13 +453,18 @@ function RecruiterApp() {
   };
   const loadDashboard = async () => {
     try {
-      const [nextDashboard, nextApprovals, nextPolicy] = await Promise.all([
+      const [nextDashboard, nextApprovals, nextPolicy, nextMe] = await Promise.all([
         request<Dashboard>("/api/dashboard"), request<Approval[]>("/api/approvals"), request<TenantPolicy>("/api/tenant-policy"),
+        request<{ role: string }>("/api/me"),
       ]);
-      setDashboard(nextDashboard); setApprovals(nextApprovals); setPolicy(nextPolicy); setError("");
+      setDashboard(nextDashboard); setApprovals(nextApprovals); setPolicy(nextPolicy); setMe(nextMe); setError("");
     }
     catch (err) { setError(err instanceof Error ? err.message : "Không thể tải dữ liệu"); }
     finally { setLoading(false); }
+  };
+  const chooseLocalActor = (actor: LocalActor) => {
+    setLocalActor(actor); setLocalActorState(actor);
+    setLoading(true); void loadDashboard();
   };
   useEffect(() => {
     if (!supabase) { void loadDashboard(); return; }
@@ -470,7 +533,11 @@ function RecruiterApp() {
       let result = await new Promise<BatchResult>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `${API_URL}/api/application-batches`);
-        void accessToken().then(token => { if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`); xhr.send(formData); });
+        void accessToken().then(token => {
+          if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+          else applyLocalActorHeaders({ set: (key, value) => xhr.setRequestHeader(key, value) });
+          xhr.send(formData);
+        });
         xhr.upload.onprogress = progressEvent => {
           if (!progressEvent.lengthComputable) return;
           const value = Math.max(6, Math.min(38, Math.round(progressEvent.loaded / progressEvent.total * 38)));
@@ -525,29 +592,39 @@ function RecruiterApp() {
 
   const review = async (decision: ReviewDecision) => {
     if (!current) return;
+    if (decision === "INTERVIEW") { setModal("invite-schedule"); return; }
     await runAction(`review-${decision}-${current.id}`, {
-      INTERVIEW: "Đang chuẩn bị lịch phỏng vấn",
       MANUAL_REVIEW: "Đang lưu đánh giá",
       REJECT: "Đang từ chối ứng viên",
       ARCHIVE: "Đang lưu trữ hồ sơ",
     }[decision], async () => {
       const note = {
-        INTERVIEW: "Mời phỏng vấn từ dashboard",
         MANUAL_REVIEW: "Cần recruiter kiểm tra thêm",
         REJECT: "Recruiter từ chối ứng viên",
         ARCHIVE: "Recruiter lưu trữ hồ sơ",
       }[decision];
       const updated = await request<Application>(`/api/applications/${current.id}/review`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision, note }) });
       setSelected(updated); await loadDashboard();
-      if (decision === "INTERVIEW") {
-        const invitation = await request<{ public_url: string }>(`/api/applications/${current.id}/scheduling-invitations`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Ho_Chi_Minh" }),
-        });
-        if (navigator.clipboard) await navigator.clipboard.writeText(invitation.public_url).catch(() => undefined);
-        setSelected(null); await loadDashboard();
-        notify("Đã gửi link chọn lịch cho ứng viên và sao chép link");
-      } else { setSelected(null); notify(`Đã cập nhật: ${statusLabel(updated.status)}`); }
+      setSelected(null); notify(`Đã cập nhật: ${statusLabel(updated.status)}`);
+    });
+  };
+
+  // Mời phỏng vấn đi qua màn hình xem lịch bận (xem review ở trên) trước khi gửi lời mời thật sự.
+  const confirmInterviewInvite = async () => {
+    if (!current) return;
+    await runAction(`review-INTERVIEW-${current.id}`, "Đang chuẩn bị lịch phỏng vấn", async () => {
+      const updated = await request<Application>(`/api/applications/${current.id}/review`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "INTERVIEW", note: "Mời phỏng vấn từ dashboard" }),
+      });
+      setSelected(updated); await loadDashboard();
+      const invitation = await request<{ public_url: string }>(`/api/applications/${current.id}/scheduling-invitations`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Ho_Chi_Minh" }),
+      });
+      if (navigator.clipboard) await navigator.clipboard.writeText(invitation.public_url).catch(() => undefined);
+      setModal(null); setSelected(null); await loadDashboard();
+      notify("Đã gửi link chọn lịch cho ứng viên và sao chép link");
     });
   };
 
@@ -679,7 +756,7 @@ function RecruiterApp() {
 
   const signOut = async () => {
     await runAction("signout", "Đang đăng xuất", async () => {
-      if (!supabase) return;
+      if (!supabase) { setLocalActor(null); setLocalActorState(null); setMe(null); return; }
       const { error } = await supabase.auth.signOut();
       if (error) throw new Error(error.message);
     });
@@ -687,6 +764,12 @@ function RecruiterApp() {
   const selectView = (view: string) => {
     setActive(view);
     setMobileMenuOpen(false);
+  };
+  const goToAvailability = () => {
+    setExpandedGroup("calendar");
+    window.localStorage.setItem("talentflow.sidebar.group", "calendar");
+    setNotifOpen(false);
+    selectView("Lịch làm việc");
   };
   const toggleSidebarGroup = (groupId: string) => {
     setExpandedGroup(current => {
@@ -705,6 +788,7 @@ function RecruiterApp() {
 
   if (!authReady) return <main className="auth-page"><div className="auth-card">Đang kiểm tra phiên đăng nhập...</div></main>;
   if (supabase && !session) return <AuthScreen/>;
+  if (!supabase && !localActor) return <LocalRoleGate onPick={chooseLocalActor}/>;
   return <div className="shell">
     <aside className={mobileMenuOpen ? "sidebar mobile-open" : "sidebar"}>
       <div className="brand"><div className="brandmark"><Icon name="spark"/></div><div><b>TalentFlow</b><span>AI Recruitment</span></div></div>
@@ -731,12 +815,34 @@ function RecruiterApp() {
         })}
       </nav>
       <div className="agent-card"><div className="agent-icon"><Icon name="spark"/></div><b>Agent đang hoạt động</b><p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p><div className="agent-progress"><span/></div><small>Dữ liệu đồng bộ từ API</small></div>
-      <div className="profile"><div className="avatar dark">VN</div><div><b>{session?.user.email || LOCAL_ACTOR_NAME}</b><span>Recruiter</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
+      <div className="profile"><div className="avatar dark">{localActor === "hr" ? "HR" : "VN"}</div><div><b>{session?.user.email || (localActor === "hr" ? "HR Admin" : LOCAL_ACTOR_NAME)}</b><span>{me?.role === "ADMIN" ? "HR · Admin" : localActor === "leader" ? "Leader" : "Recruiter"}</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
     </aside>
     {mobileMenuOpen && <button className="mobile-nav-backdrop" aria-label="Đóng menu" onClick={() => setMobileMenuOpen(false)}/>}
 
     <main>
-      <header><button className="mobile-menu-button" aria-label="Mở menu" onClick={() => setMobileMenuOpen(true)}>☰</button><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div><button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button><button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
+      <header><button className="mobile-menu-button" aria-label="Mở menu" onClick={() => setMobileMenuOpen(true)}>☰</button><div className="mobile-brand"><b>TalentFlow</b></div><div className="search"><Icon name="search"/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm ứng viên, việc làm..."/><kbd>⌘ K</kbd></div>
+        {me?.role === "ADMIN" ? <div className="notification-bell">
+          <button className="icon-button" aria-label="Thông báo lịch phỏng vấn" disabled={actionBusy} onClick={() => setNotifOpen(current => !current)}><Icon name="bell"/>{upcomingInterviews.length > 0 && <i/>}</button>
+          {notifOpen && <>
+            <button className="notification-backdrop" aria-label="Đóng thông báo" onClick={() => setNotifOpen(false)}/>
+            <div className="notification-dropdown">
+              <div className="notification-head"><b>Lịch phỏng vấn</b><span>{upcomingInterviews.length > 0 ? `Bạn đã có ${upcomingInterviews.length} lịch phỏng vấn sắp tới` : "Chưa có lịch phỏng vấn nào"}</span></div>
+              {upcomingInterviews.length === 0 ? <p className="notification-empty">Leader chưa mời ứng viên nào phỏng vấn.</p> : <ul className="notification-list">
+                {upcomingInterviews.slice(0, 5).map(iv => {
+                  const application = dashboard.applications.find(item => item.id === iv.application_id);
+                  const job = application ? dashboard.jobs.find(item => item.id === application.job_id) : undefined;
+                  return <li key={iv.id}><button onClick={goToAvailability}>
+                    <b>{application?.candidate.name || "Ứng viên"}</b>
+                    <span>{job?.title || "—"}</span>
+                    <small>{dateLabel(iv.start_at)}</small>
+                  </button></li>;
+                })}
+              </ul>}
+              <button className="notification-view-all" onClick={goToAvailability}>Xem trên Lịch làm việc<Icon name="arrow"/></button>
+            </div>
+          </>}
+        </div> : <button className="icon-button" aria-label="Thông báo" disabled={actionBusy} onClick={() => notify("Bạn không có thông báo mới")}><Icon name="bell"/><i/></button>}
+        <button className="primary" disabled={actionBusy} onClick={() => setModal("job")}><Icon name="plus"/>Tạo việc làm</button></header>
       <div className="content">
         {pendingAction && <GlobalActionStatus label={pendingAction.label}/>}
         <section className="welcome"><div><span className="eyebrow">TALENTFLOW · LIVE DASHBOARD</span><h1>{active === "Tổng quan" ? "Chào buổi sáng, Vinh 👋" : activeTitle}</h1><p>Dữ liệu và hoạt động được cập nhật trực tiếp từ API.</p></div>
@@ -766,10 +872,11 @@ function RecruiterApp() {
                                                   resumeBusy={resumeBusy} onExplain={setExplained}
                                                   onViewResume={openResumeFor} onReject={setRejecting}
                                                   onApproveItem={approveShortlistItem}
-                                                  minConfidenceThreshold={policy?.min_confidence_threshold ?? 65}/>
+                                                  minConfidenceThreshold={policy?.min_confidence_threshold ?? 65}
+                                                  myRole={me?.role || "OWNER"}/>
         : active === "Phỏng vấn" ? <InterviewsView dashboard={dashboard} approvals={approvals} actionBusy={actionBusy}
                                                     onChanged={loadDashboard} onResolveApproval={resolveApproval}/>
-        : active === "Lịch làm việc" ? <AvailabilityView dashboard={dashboard}/>
+        : active === "Lịch làm việc" ? <AvailabilityView dashboard={dashboard} myRole={me?.role || "OWNER"}/>
         : active === "Lịch sử" ? <AuditLogView dashboard={dashboard}/>
         : active === "Mail Sandbox" ? <MailSandboxView/>
         : active === "Xoá dữ liệu" ? <ClearDataView dashboard={dashboard} onCleared={async () => { setSelected(null); setLastBatch(null); await loadDashboard(); }}/>
@@ -846,6 +953,8 @@ function RecruiterApp() {
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>}
     {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => saveCriteria(criteriaJob.id, criteria)}/>}
     {modal === "thresholds" && policy && <ScoreThresholdModal policy={policy} busy={actionBusy} onClose={() => setModal(null)} onSave={saveThresholds}/>}
+    {modal === "invite-schedule" && current && <InviteScheduleModal application={current} dashboard={dashboard} myRole={me?.role || "OWNER"}
+                                                                    actionBusy={actionBusy} onClose={() => setModal(null)} onConfirm={confirmInterviewInvite}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
@@ -1556,7 +1665,7 @@ function escalationReasons(payload: Record<string, unknown>, minConfidenceThresh
 }
 
 function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onResolve, onResolveMany,
-                         resumeBusy, onExplain, onViewResume, onReject, onApproveItem, minConfidenceThreshold }: {
+                         resumeBusy, onExplain, onViewResume, onReject, onApproveItem, minConfidenceThreshold, myRole }: {
   approvals: Approval[]; dashboard: Dashboard; actionBusy: boolean; pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
   onResolveMany: (items: Approval[], decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
@@ -1566,14 +1675,16 @@ function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onReso
   onReject: (application: Application) => void;
   onApproveItem: (approval: Approval, applicationId: string) => Promise<void>;
   minConfidenceThreshold: number;
+  myRole: string;
 }) {
   const [filter, setFilter] = useState<"ALL" | Approval["type"]>("ALL");
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [bulkReject, setBulkReject] = useState(false);
 
+  const canResolve = (item: Approval) => item.type !== "CRITERIA" || myRole === "ADMIN";
   const pending = approvals.filter(item => item.status === "PENDING");
   const shown = filter === "ALL" ? approvals : approvals.filter(item => item.type === filter);
-  const selectable = shown.filter(item => item.status === "PENDING");
+  const selectable = shown.filter(item => item.status === "PENDING" && canResolve(item));
   const chosen = selectable.filter(item => picked.has(item.id));
   const allChosen = selectable.length > 0 && chosen.length === selectable.length;
 
@@ -1637,7 +1748,7 @@ function ApprovalInbox({ approvals, dashboard, actionBusy, pendingAction, onReso
                     picked={picked.has(item.id)} onPick={() => toggle(item.id)}
                     resumeBusy={resumeBusy} onExplain={onExplain}
                     onViewResume={onViewResume} onReject={onReject} onApproveItem={onApproveItem}
-                    minConfidenceThreshold={minConfidenceThreshold}/>)
+                    minConfidenceThreshold={minConfidenceThreshold} myRole={myRole}/>)
       : <div className="empty-state">Không có đề xuất nào trong mục này.</div>}
 
     {bulkReject && <RejectDialog title={`Trả lại ${chosen.length} đề xuất`} busy={actionBusy}
@@ -1684,7 +1795,7 @@ function RejectDialog({ title, busy, onCancel, onConfirm }: {
 
 function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingAction, onResolve,
                        picked, onPick, resumeBusy, onExplain, onViewResume, onReject, onApproveItem,
-                       minConfidenceThreshold }: {
+                       minConfidenceThreshold, myRole }: {
   approval: Approval; typeLabel: string; dashboard: Dashboard; actionBusy: boolean;
   pendingAction: PendingAction | null;
   onResolve: (approval: Approval, decision: "APPROVE" | "REJECT", note?: string) => Promise<void>;
@@ -1694,7 +1805,9 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
   onReject: (application: Application) => void;
   onApproveItem: (approval: Approval, applicationId: string) => Promise<void>;
   minConfidenceThreshold: number;
+  myRole: string;
 }) {
+  const needsAdminForCriteria = approval.type === "CRITERIA" && myRole !== "ADMIN";
   const [history, setHistory] = useState<AuditLog[] | null>(null);
   const [rejecting, setRejecting] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -1775,33 +1888,41 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
         {candidate && <span>Ứng viên: <b>{candidate.candidate.name}</b></span>}
       </div>
 
-      {approval.type === "CRITERIA" && <div className="approval-detail">
-        <div className="approval-field">
-          <span>Kỹ năng bắt buộc</span>
-          <div className="approval-chips">
-            {criteria.required_skills?.length
-              ? criteria.required_skills.map(skill => <i key={skill}>{skill}</i>)
-              : <em className="approval-empty">AI không tách được kỹ năng nào — cần tự bổ sung trước khi duyệt</em>}
+      {approval.type === "CRITERIA" && (needsAdminForCriteria
+        ? <div className="approval-pending-note">
+            <Icon name="clock"/>
+            <div>
+              <b>Đang chờ HR (Admin) duyệt</b>
+              <span>Bạn đã đề xuất tiêu chí này cho vị trí — HR sẽ xem chi tiết yêu cầu và duyệt trước khi dùng để chấm điểm CV.</span>
+            </div>
           </div>
-        </div>
-        <div className="approval-field">
-          <span>Kỹ năng ưu tiên</span>
-          <div className="approval-chips">
-            {criteria.preferred_skills?.length
-              ? criteria.preferred_skills.map(skill => <i className="soft" key={skill}>{skill}</i>)
-              : <em className="approval-empty">Không có</em>}
-          </div>
-        </div>
-        <div className="approval-field">
-          <span>Kinh nghiệm tối thiểu</span>
-          <div className="approval-chips"><i>{criteria.minimum_experience || 0} năm</i></div>
-        </div>
-        <div className="approval-field">
-          <span>Phiên bản · Nguồn</span>
-          <div className="approval-chips"><i>v{String(payload.version ?? 1)}</i>
-            {typeof payload.change_note === "string" && payload.change_note && <i className="soft">{payload.change_note}</i>}</div>
-        </div>
-      </div>}
+        : <div className="approval-detail">
+            <div className="approval-field">
+              <span>Kỹ năng bắt buộc</span>
+              <div className="approval-chips">
+                {criteria.required_skills?.length
+                  ? criteria.required_skills.map(skill => <i key={skill}>{skill}</i>)
+                  : <em className="approval-empty">AI không tách được kỹ năng nào — cần tự bổ sung trước khi duyệt</em>}
+              </div>
+            </div>
+            <div className="approval-field">
+              <span>Kỹ năng ưu tiên</span>
+              <div className="approval-chips">
+                {criteria.preferred_skills?.length
+                  ? criteria.preferred_skills.map(skill => <i className="soft" key={skill}>{skill}</i>)
+                  : <em className="approval-empty">Không có</em>}
+              </div>
+            </div>
+            <div className="approval-field">
+              <span>Kinh nghiệm tối thiểu</span>
+              <div className="approval-chips"><i>{criteria.minimum_experience || 0} năm</i></div>
+            </div>
+            <div className="approval-field">
+              <span>Phiên bản · Nguồn</span>
+              <div className="approval-chips"><i>v{String(payload.version ?? 1)}</i>
+                {typeof payload.change_note === "string" && payload.change_note && <i className="soft">{payload.change_note}</i>}</div>
+            </div>
+          </div>)}
 
       {approval.type === "SHORTLIST" && <div className="approval-detail">
         <div className="approval-field wide">
@@ -1878,21 +1999,55 @@ function ApprovalCard({ approval, typeLabel, dashboard, actionBusy, pendingActio
       onCancel={() => setRejecting(false)}
       onConfirm={async note => { setRejecting(false); await onResolve(approval, "REJECT", note); }}/>}
 
-    <div className="approval-actions">
-      <button className="secondary compact" disabled={actionBusy} onClick={() => setRejecting(true)}>Trả lại</button>
-      <button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "APPROVE")}>
-        {pendingAction?.key === `approval-${approval.id}` ? "Đang xử lý..." : approval.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}
-      </button>
-    </div>
+    {!needsAdminForCriteria &&
+      <div className="approval-actions">
+          <button className="secondary compact" disabled={actionBusy} onClick={() => setRejecting(true)}>Trả lại</button>
+          <button className="primary compact" disabled={actionBusy} onClick={() => void onResolve(approval, "APPROVE")}>
+            {pendingAction?.key === `approval-${approval.id}` ? "Đang xử lý..." : approval.type === "EVIDENCE" ? "Đã kiểm tra" : "Phê duyệt"}
+          </button>
+        </div>}
   </article>;
 }
 
+type ScorecardAnswer = { criterion: string; rating: number; evidence: string };
+type Scorecard = {
+  id: string; interviewer_email: string; recommendation: string;
+  note?: string; answers?: ScorecardAnswer[]; submitted_at?: string;
+};
+type TranscriptClaimLink = { claim: string; relationship: string; evidence_quote: string; confidence: number };
+type TranscriptRequirementLink = { requirement: string; evidence_strength: string; evidence_quote: string };
+type TranscriptQAAnalysis = {
+  question: string; answer: string; speaker_role: string;
+  linked_claims: TranscriptClaimLink[]; linked_requirements: TranscriptRequirementLink[];
+};
+type TranscriptAggregation = {
+  claims_verified: string[]; claims_unverified: string[]; potential_inconsistencies: string[];
+  new_info_beyond_cv: string[]; requirements_covered: string[]; requirements_not_covered: string[];
+};
+type TranscriptRuleBased = {
+  score: number; recommendation: string;
+  requirements_ratio: number | null; claims_ratio: number | null; inconsistency_penalty: number;
+};
+type TranscriptModelResult = {
+  model_name: string; status: string; error?: string | null; latency_ms: number;
+  score?: number | null; recommendation?: string | null; summary?: string | null;
+  qa_analyses?: TranscriptQAAnalysis[]; aggregation?: TranscriptAggregation; rule_based?: TranscriptRuleBased | null;
+};
+type TranscriptSession = {
+  id: string; transcript_text: string; status: string; created_at: string;
+  qa_pairs: { question: string; answer: string; speaker_role: string }[];
+  models: TranscriptModelResult[];
+};
 type InterviewOps = {
   interview?: Interview;
   policy?: { max_reschedules: number; feedback_due_hours: number };
   reminders: { id: string; status: string; due_at: string }[];
-  scorecards: { id: string; interviewer_email: string; recommendation: string }[];
+  scorecards: Scorecard[];
+  transcript_sessions?: TranscriptSession[];
   feedback_summary?: { summary: string; strengths: string[]; concerns: string[]; conflicts: unknown[]; sources: unknown[] };
+};
+const RECOMMENDATION_TONE: Record<string, string> = {
+  STRONG_YES: "interview", YES: "interview", MIXED: "review", NO: "rejected", STRONG_NO: "rejected",
 };
 
 const INTERVIEW_STATUS: Record<string, { label: string; short: string; tone: string }> = {
@@ -1956,8 +2111,309 @@ function RescheduleModal({ interview, busy, onClose, onPick }: {
   </div>;
 }
 
+/** Collapsed: who + recommendation at a glance. Expanded: every criterion's rating/evidence plus
+ * the overall note — Leader and HR already both receive every scorecard from the API, this is
+ * the only thing standing between them and seeing each other's full write-up. */
+function ScorecardCard({ scorecard, expanded, onToggle }: { scorecard: Scorecard; expanded: boolean; onToggle: () => void }) {
+  const tone = RECOMMENDATION_TONE[scorecard.recommendation] || "manual";
+  const label = RECOMMENDATION_LABEL[scorecard.recommendation] || scorecard.recommendation;
+  return <div className={`scorecard-card${expanded ? " open" : ""}`}>
+    <button type="button" className="scorecard-card-head" onClick={onToggle}>
+      <div className="scorecard-who">
+        <b>{scorecard.interviewer_email}</b>
+        {scorecard.submitted_at && <small>{dateLabel(scorecard.submitted_at)}</small>}
+      </div>
+      <span className={`status ${tone}`}>{label}</span>
+      <Icon name="arrow"/>
+    </button>
+    {expanded && <div className="scorecard-card-body">
+      {scorecard.answers?.map(answer => <div key={answer.criterion} className="scorecard-answer">
+        <div className="scorecard-answer-head"><b>{answer.criterion}</b><span className="scorecard-rating">{answer.rating}/5</span></div>
+        {answer.evidence && <p>{answer.evidence}</p>}
+      </div>)}
+      {scorecard.note && <div className="scorecard-note"><b>Ghi chú thêm</b><p>{scorecard.note}</p></div>}
+      {!scorecard.answers?.length && !scorecard.note && <small>Không có ghi chú chi tiết.</small>}
+    </div>}
+  </div>;
+}
+
+const RELATIONSHIP_TONE: Record<string, string> = {
+  VERIFIED: "interview", NEW_INFO: "manual", POTENTIAL_INCONSISTENCY: "review", NOT_ADDRESSED: "archived",
+};
+const RELATIONSHIP_LABEL: Record<string, string> = {
+  VERIFIED: "Đã xác minh", NEW_INFO: "Thông tin mới", POTENTIAL_INCONSISTENCY: "Có thể không khớp", NOT_ADDRESSED: "Chưa đề cập",
+};
+const EVIDENCE_STRENGTH_TONE: Record<string, string> = { STRONG: "interview", WEAK: "review", NONE: "archived" };
+const EVIDENCE_STRENGTH_LABEL: Record<string, string> = {
+  STRONG: "Bằng chứng mạnh", WEAK: "Bằng chứng yếu", NONE: "Chưa có bằng chứng",
+};
+
+const shortModelName = (name: string) => name.replace(/^colab:/, "").replace(/:free$/, "");
+
+type ClaimVerdict = "VERIFIED" | "INCONSISTENT" | "UNVERIFIED" | "N/A";
+type ReqVerdict = "COVERED" | "NOT_COVERED" | "N/A";
+const CLAIM_VERDICT_STYLE: Record<ClaimVerdict, { icon: string; tone: string; label: string }> = {
+  VERIFIED: { icon: "✓", tone: "interview", label: "Đã xác minh" },
+  INCONSISTENT: { icon: "⚠", tone: "review", label: "Có thể không khớp" },
+  UNVERIFIED: { icon: "–", tone: "archived", label: "Chưa được hỏi tới" },
+  "N/A": { icon: "·", tone: "archived", label: "Không có dữ liệu" },
+};
+const REQ_VERDICT_STYLE: Record<ReqVerdict, { icon: string; tone: string; label: string }> = {
+  COVERED: { icon: "✓", tone: "interview", label: "Đã kiểm tra" },
+  NOT_COVERED: { icon: "–", tone: "archived", label: "Chưa kiểm tra" },
+  "N/A": { icon: "·", tone: "archived", label: "Không có dữ liệu" },
+};
+
+/** Union of every claim any OK model mentioned, each resolved to that SAME model's verdict — since
+ * every model evaluates the identical claim set (built once from screening data, not per-model),
+ * the table is a fair side-by-side comparison, not an apples-to-oranges list. */
+function buildClaimMatrix(models: TranscriptModelResult[]): { claim: string; byModel: Record<string, ClaimVerdict> }[] {
+  const okModels = models.filter(m => m.status === "OK" && m.aggregation);
+  const claims = new Set<string>();
+  okModels.forEach(m => {
+    m.aggregation!.claims_verified.forEach(c => claims.add(c));
+    m.aggregation!.claims_unverified.forEach(c => claims.add(c));
+    m.aggregation!.potential_inconsistencies.forEach(c => claims.add(c));
+  });
+  return Array.from(claims).sort().map(claim => {
+    const byModel: Record<string, ClaimVerdict> = {};
+    okModels.forEach(m => {
+      const agg = m.aggregation!;
+      byModel[m.model_name] = agg.potential_inconsistencies.includes(claim) ? "INCONSISTENT"
+        : agg.claims_verified.includes(claim) ? "VERIFIED"
+        : agg.claims_unverified.includes(claim) ? "UNVERIFIED" : "N/A";
+    });
+    return { claim, byModel };
+  });
+}
+
+function buildRequirementMatrix(models: TranscriptModelResult[]): { requirement: string; byModel: Record<string, ReqVerdict> }[] {
+  const okModels = models.filter(m => m.status === "OK" && m.aggregation);
+  const reqs = new Set<string>();
+  okModels.forEach(m => {
+    m.aggregation!.requirements_covered.forEach(r => reqs.add(r));
+    m.aggregation!.requirements_not_covered.forEach(r => reqs.add(r));
+  });
+  return Array.from(reqs).sort().map(requirement => {
+    const byModel: Record<string, ReqVerdict> = {};
+    okModels.forEach(m => {
+      const agg = m.aggregation!;
+      byModel[m.model_name] = agg.requirements_covered.includes(requirement) ? "COVERED"
+        : agg.requirements_not_covered.includes(requirement) ? "NOT_COVERED" : "N/A";
+    });
+    return { requirement, byModel };
+  });
+}
+
+/** What's worth reading without opening every model's card: claims every model agrees were
+ * verified, any claim at least one model flagged as inconsistent (worth a second look), and new
+ * info beyond the CV each model happened to notice. */
+function buildHighlights(models: TranscriptModelResult[]) {
+  const okModels = models.filter(m => m.status === "OK" && m.aggregation);
+  if (!okModels.length) return null;
+  const claimStats = new Map<string, { verified: number; inconsistent: number }>();
+  okModels.forEach(m => {
+    m.aggregation!.claims_verified.forEach(c => {
+      const entry = claimStats.get(c) || { verified: 0, inconsistent: 0 };
+      entry.verified += 1; claimStats.set(c, entry);
+    });
+    m.aggregation!.potential_inconsistencies.forEach(c => {
+      const entry = claimStats.get(c) || { verified: 0, inconsistent: 0 };
+      entry.inconsistent += 1; claimStats.set(c, entry);
+    });
+  });
+  const consensusVerified = Array.from(claimStats.entries())
+    .filter(([, v]) => v.verified === okModels.length).map(([c]) => c);
+  const anyInconsistent = Array.from(claimStats.entries())
+    .filter(([, v]) => v.inconsistent > 0).map(([claim, v]) => ({ claim, count: v.inconsistent }));
+  const newInfo = okModels.flatMap(m => (m.aggregation!.new_info_beyond_cv || []).map(quote => ({ model: m.model_name, quote })));
+  return { consensusVerified, anyInconsistent, newInfo, modelCount: okModels.length };
+}
+
+/** Primary view for a transcript analysis: side-by-side comparison first (highlights + two
+ * claim/JD matrices, one column per model), raw per-model write-ups tucked behind a toggle for
+ * whoever wants to read the full reasoning. */
+function TranscriptComparisonView({ session }: { session: TranscriptSession }) {
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [expandedModelKey, setExpandedModelKey] = useState("");
+  const okModels = useMemo(() => session.models.filter(m => m.status === "OK" && m.aggregation), [session.models]);
+  const claimRows = useMemo(() => buildClaimMatrix(session.models), [session.models]);
+  const reqRows = useMemo(() => buildRequirementMatrix(session.models), [session.models]);
+  const highlights = useMemo(() => buildHighlights(session.models), [session.models]);
+
+  return <div className="transcript-session">
+    <div className="transcript-session-head">
+      <small className="transcript-session-meta">{dateLabel(session.created_at)} · {session.qa_pairs.length} cặp hỏi-đáp</small>
+      <div className="transcript-model-pills">
+        {session.models.map(m => {
+          const tone = m.status === "OK" ? "interview" : m.status === "UNAVAILABLE" ? "manual" : "rejected";
+          return <span key={m.model_name} className={`status ${tone}`} title={m.error || ""}>
+            {shortModelName(m.model_name)}{m.status === "OK" ? ` · ${(m.latency_ms / 1000).toFixed(0)}s` : ""}
+          </span>;
+        })}
+      </div>
+    </div>
+
+    {!!session.qa_pairs?.length && <div className="recorded-transcript-preview">
+      <div className="recorded-transcript-head"><b>Transcript đã phân vai</b></div>
+      <div className="transcript-segmented">
+        {session.qa_pairs.map((pair, index) => <div key={index} className="transcript-segmented-pair">
+          {!!(pair.question || pair.speaker_role) && <p><b>{pair.speaker_role || "Người hỏi"}:</b> {pair.question}</p>}
+          <p><b>Ứng viên:</b> {pair.answer}</p>
+        </div>)}
+      </div>
+    </div>}
+
+    {!okModels.length
+      ? <p className="scorecard-empty">Chưa có model nào phân tích thành công cho transcript này — xem trạng thái từng model ở trên.</p>
+      : <>
+      <div className="transcript-recommendations">
+        {okModels.map(m => {
+          const tone = RECOMMENDATION_TONE[m.recommendation || ""] || "manual";
+          const label = RECOMMENDATION_LABEL[m.recommendation || ""] || m.recommendation || "—";
+          return <div key={m.model_name} className="transcript-recommendation-card">
+            <div className="transcript-recommendation-head">
+              <b>{shortModelName(m.model_name)}</b>
+              <span className={`status ${tone}`}>{label}</span>
+            </div>
+            <div className="transcript-score"><b>{m.score ?? "—"}</b><span>/100</span></div>
+            {m.summary && <p>{m.summary}</p>}
+            {m.rule_based && (() => {
+              const ruleTone = RECOMMENDATION_TONE[m.rule_based.recommendation] || "manual";
+              const ruleLabel = RECOMMENDATION_LABEL[m.rule_based.recommendation] || m.rule_based.recommendation;
+              const agrees = m.rule_based.recommendation === m.recommendation;
+              return <div className="rule-based-score" title="Tính hoàn toàn bằng công thức từ dữ liệu đã xác minh (không phải AI tự chấm) — xem để đối chiếu với điểm AI ở trên">
+                <div className="rule-based-score-row">
+                  <span>Điểm rule-based (từ bằng chứng)</span>
+                  <b>{m.rule_based.score}<i>/100</i></b>
+                </div>
+                <span className={`status ${ruleTone}`}>{ruleLabel} {agrees ? "· ✓ khớp AI" : "· ⚠ lệch AI"}</span>
+                <small>
+                  JD đã verify: {m.rule_based.requirements_ratio != null ? `${Math.round(m.rule_based.requirements_ratio * 100)}%` : "—"}
+                  {" · "}CV đã verify: {m.rule_based.claims_ratio != null ? `${Math.round(m.rule_based.claims_ratio * 100)}%` : "—"}
+                  {m.rule_based.inconsistency_penalty > 0 && ` · Phạt mâu thuẫn: -${m.rule_based.inconsistency_penalty}`}
+                </small>
+              </div>;
+            })()}
+          </div>;
+        })}
+      </div>
+
+      {highlights && (highlights.consensusVerified.length > 0 || highlights.anyInconsistent.length > 0 || highlights.newInfo.length > 0) &&
+        <div className="transcript-highlights">
+          {highlights.consensusVerified.length > 0 && <div className="transcript-highlight good">
+            <b>✓ Cả {highlights.modelCount} model đều xác minh</b>
+            <p>{highlights.consensusVerified.join(", ")}</p>
+          </div>}
+          {highlights.anyInconsistent.length > 0 && <div className="transcript-highlight warn">
+            <b>⚠ Cần lưu ý — nghi vấn không nhất quán</b>
+            <p>{highlights.anyInconsistent.map(h => `${h.claim} (${h.count}/${highlights.modelCount} model)`).join(", ")}</p>
+          </div>}
+          {highlights.newInfo.length > 0 && <div className="transcript-highlight info">
+            <b>+ Thông tin mới ngoài CV</b>
+            <ul>{highlights.newInfo.map((n, i) => <li key={i}><span className="transcript-highlight-model">{shortModelName(n.model)}</span> {n.quote}</li>)}</ul>
+          </div>}
+        </div>}
+
+      {!!claimRows.length && <div className="transcript-matrix-wrap">
+        <table className="transcript-matrix">
+          <thead><tr><th>Claim trong CV</th>{okModels.map(m => <th key={m.model_name}>{shortModelName(m.model_name)}</th>)}</tr></thead>
+          <tbody>{claimRows.map(row => <tr key={row.claim}>
+            <td>{row.claim}</td>
+            {okModels.map(m => {
+              const verdict = row.byModel[m.model_name] || "N/A";
+              const style = CLAIM_VERDICT_STYLE[verdict];
+              return <td key={m.model_name}><span className={`matrix-badge ${style.tone}`} title={style.label}>{style.icon}</span></td>;
+            })}
+          </tr>)}</tbody>
+        </table>
+      </div>}
+
+      {!!reqRows.length && <div className="transcript-matrix-wrap">
+        <table className="transcript-matrix">
+          <thead><tr><th>Yêu cầu JD</th>{okModels.map(m => <th key={m.model_name}>{shortModelName(m.model_name)}</th>)}</tr></thead>
+          <tbody>{reqRows.map(row => <tr key={row.requirement}>
+            <td>{row.requirement}</td>
+            {okModels.map(m => {
+              const verdict = row.byModel[m.model_name] || "N/A";
+              const style = REQ_VERDICT_STYLE[verdict];
+              return <td key={m.model_name}><span className={`matrix-badge ${style.tone}`} title={style.label}>{style.icon}</span></td>;
+            })}
+          </tr>)}</tbody>
+        </table>
+      </div>}
+    </>}
+
+    <details className="transcript-raw">
+      <summary>Xem transcript gốc</summary>
+      <pre>{session.transcript_text}</pre>
+    </details>
+
+    <button type="button" className="secondary compact transcript-detail-toggle" onClick={() => setDetailOpen(current => !current)}>
+      {detailOpen ? "Ẩn chi tiết từng model" : "Xem chi tiết từng model (câu hỏi, trích dẫn...)"}
+    </button>
+    {detailOpen && <div className="scorecard-list">
+      {session.models.map(result => {
+        const key = `${session.id}:${result.model_name}`;
+        return <TranscriptModelCard key={key} result={result} expanded={expandedModelKey === key}
+          onToggle={() => setExpandedModelKey(current => current === key ? "" : key)}/>;
+      })}
+    </div>}
+  </div>;
+}
+
+/** One model's full write-up for the interview: collapsed shows just pass/fail + latency, expanded
+ * shows the aggregation counters plus every Q&A with its claim/JD links. Tucked behind the
+ * comparison view's "Xem chi tiết" toggle — the matrix above is the thing people scan first. */
+function TranscriptModelCard({ result, expanded, onToggle }: {
+  result: TranscriptModelResult; expanded: boolean; onToggle: () => void;
+}) {
+  const ok = result.status === "OK";
+  const tone = ok ? "interview" : result.status === "UNAVAILABLE" ? "manual" : "rejected";
+  const label = ok ? "Đã phân tích" : result.status === "UNAVAILABLE" ? "Chưa khả dụng" : "Lỗi";
+  const totalRequirements = (result.aggregation?.requirements_covered.length || 0)
+    + (result.aggregation?.requirements_not_covered.length || 0);
+  return <div className={`scorecard-card${expanded ? " open" : ""}`}>
+    <button type="button" className="scorecard-card-head" onClick={onToggle}>
+      <div className="scorecard-who">
+        <b>{result.model_name}</b>
+        <small>{result.latency_ms ? `${(result.latency_ms / 1000).toFixed(1)}s` : ""}</small>
+      </div>
+      <span className={`status ${tone}`}>{label}</span>
+      <Icon name="arrow"/>
+    </button>
+    {expanded && <div className="scorecard-card-body">
+      {!ok && <small>{result.error || "Model này hiện không khả dụng."}</small>}
+      {ok && result.aggregation && <div className="transcript-aggregation">
+        <div><b>{result.aggregation.claims_verified.length}</b><span>claim đã xác minh</span></div>
+        <div><b>{result.aggregation.potential_inconsistencies.length}</b><span>nghi vấn không khớp</span></div>
+        <div><b>{result.aggregation.new_info_beyond_cv.length}</b><span>thông tin mới ngoài CV</span></div>
+        <div><b>{result.aggregation.requirements_covered.length}/{totalRequirements}</b><span>yêu cầu JD đã kiểm tra</span></div>
+      </div>}
+      {ok && !result.qa_analyses?.length && <small>Không có cặp hỏi-đáp nào để phân tích.</small>}
+      {ok && result.qa_analyses?.map((qa, index) => <div key={index} className="transcript-qa">
+        <p className="transcript-qa-line"><b>Hỏi:</b> {qa.question || "—"}</p>
+        <p className="transcript-qa-line"><b>Đáp:</b> {qa.answer || "—"}</p>
+        {!!qa.linked_claims.length && <div className="transcript-links">
+          {qa.linked_claims.map((link, i) => <span key={i} className={`status ${RELATIONSHIP_TONE[link.relationship] || "manual"}`}
+                                                    title={link.evidence_quote}>
+            {link.claim}: {RELATIONSHIP_LABEL[link.relationship] || link.relationship}
+          </span>)}
+        </div>}
+        {!!qa.linked_requirements.length && <div className="transcript-links">
+          {qa.linked_requirements.map((link, i) => <span key={i} className={`status ${EVIDENCE_STRENGTH_TONE[link.evidence_strength] || "manual"}`}
+                                                          title={link.evidence_quote}>
+            {link.requirement}: {EVIDENCE_STRENGTH_LABEL[link.evidence_strength] || link.evidence_strength}
+          </span>)}
+        </div>}
+      </div>)}
+    </div>}
+  </div>;
+}
+
 function InterviewCard({ row, expanded, onToggle, ops, opsLoading, busyKey, parentBusy,
-                        onConfirm, onNoShow, onCancel, onReschedule, onSubmitScorecard, onResolveEscalation }: {
+                        onConfirm, onNoShow, onCancel, onReschedule, onSubmitScorecard, onSubmitTranscript,
+                        onSubmitRecording, onResolveEscalation }: {
   row: InterviewRow; expanded: boolean; onToggle: () => void;
   ops?: InterviewOps; opsLoading: boolean; busyKey: string; parentBusy: boolean;
   onConfirm: (interview: Interview) => void;
@@ -1965,12 +2421,91 @@ function InterviewCard({ row, expanded, onToggle, ops, opsLoading, busyKey, pare
   onCancel: (interview: Interview) => void;
   onReschedule: (interview: Interview) => void;
   onSubmitScorecard: (interview: Interview, rubric: { criterion: string; weight: number }[]) => (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onSubmitTranscript: (interview: Interview, transcriptText: string) => Promise<void>;
+  onSubmitRecording: (interview: Interview, audioBlob: Blob, onTranscribed: (text: string) => void) => Promise<void>;
   onResolveEscalation: (approval: Approval) => void;
 }) {
   const { interview, candidate, job, escalations } = row;
   const info = interviewStatusInfo(interview.status);
   const kit = candidate?.screening.interview_kit;
   const busy = (key: string) => busyKey === key || parentBusy;
+  const [scorecardFormOpen, setScorecardFormOpen] = useState(false);
+  const [expandedScorecardId, setExpandedScorecardId] = useState("");
+  const [transcriptFormOpen, setTranscriptFormOpen] = useState(false);
+  const [transcriptText, setTranscriptText] = useState("");
+  const [recording, setRecording] = useState(false);
+  const [finalizingRecording, setFinalizingRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [recordingWarning, setRecordingWarning] = useState("");
+  const [recordedText, setRecordedText] = useState("");
+  const recordingUnsupported = typeof navigator !== "undefined" && !navigator.mediaDevices?.getDisplayMedia;
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const tracksRef = useRef<MediaStreamTrack[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    tracksRef.current.forEach(track => track.stop());
+  }, []);
+
+  const startRecording = async () => {
+    setRecordingWarning("");
+    setRecordedText("");
+    try {
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const tracks = [...mic.getTracks()];
+      let tabAudio: MediaStream | null = null;
+      try {
+        const tab = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        tab.getVideoTracks().forEach(track => track.stop());
+        const tabAudioTracks = tab.getAudioTracks();
+        if (tabAudioTracks.length) {
+          tabAudio = new MediaStream(tabAudioTracks);
+          tracks.push(...tabAudioTracks);
+        } else {
+          setRecordingWarning("Tab/màn hình bạn chọn không có âm thanh — chỉ ghi được giọng của bạn qua mic. Nhớ tick \"Chia sẻ âm thanh\" khi chọn tab, và đảm bảo cuộc gọi đang chạy trong 1 tab trình duyệt (Google Meet/Zoom web).");
+        }
+      } catch {
+        setRecordingWarning("Chưa chia sẻ tab/màn hình — chỉ ghi được giọng của bạn qua mic, không ghi được giọng ứng viên.");
+      }
+      const audioCtx = new AudioContext();
+      const dest = audioCtx.createMediaStreamDestination();
+      audioCtx.createMediaStreamSource(mic).connect(dest);
+      if (tabAudio) audioCtx.createMediaStreamSource(tabAudio).connect(dest);
+      const recorder = new MediaRecorder(dest.stream, { mimeType: "audio/webm;codecs=opus" });
+      chunksRef.current = [];
+      recorder.ondataavailable = event => { if (event.data.size) chunksRef.current.push(event.data); };
+      recorder.start();
+      recorderRef.current = recorder;
+      tracksRef.current = tracks;
+      setRecording(true);
+      setRecordingSeconds(0);
+      timerRef.current = setInterval(() => setRecordingSeconds(current => current + 1), 1000);
+    } catch (error) {
+      setRecordingWarning(error instanceof Error ? error.message : "Không xin được quyền ghi âm.");
+    }
+  };
+
+  const stopRecording = () => {
+    const recorder = recorderRef.current;
+    if (!recorder || finalizingRecording) return;
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    setFinalizingRecording(true);
+    recorder.onstop = async () => {
+      tracksRef.current.forEach(track => track.stop());
+      tracksRef.current = [];
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      chunksRef.current = [];
+      setRecording(false);
+      setFinalizingRecording(false);
+      await onSubmitRecording(interview, blob, text => setRecordedText(text));
+    };
+    // Vẫn ghi thêm ~1.2s sau khi bấm "Dừng" - người dùng thường bấm ngay lúc vừa dứt câu cuối,
+    // dừng ngay lập tức dễ cắt mất vài từ cuối cùng đang nói dở.
+    setTimeout(() => recorder.stop(), 1200);
+    recorderRef.current = null;
+  };
   const canReschedule = ["PENDING_CONFIRMATION", "SCHEDULED", "PENDING_EXTERNAL"].includes(interview.status)
     && (interview.reschedule_count || 0) < (ops?.policy?.max_reschedules ?? 2);
   const canCancel = !["CANCELLED", "CANCELLING", "NO_SHOW"].includes(interview.status);
@@ -2057,13 +2592,6 @@ function InterviewCard({ row, expanded, onToggle, ops, opsLoading, busyKey, pare
             : <small>Chưa có nhắc lịch.</small>}
         </div>
 
-        <div className="job-detail-block">
-          <h4>Scorecard đã nhận ({ops?.scorecards.length || 0})</h4>
-          {opsLoading ? <small>Đang tải...</small>
-            : ops?.scorecards.length ? ops.scorecards.map(item => <p key={item.id}><b>{item.interviewer_email}</b><span>{RECOMMENDATION_LABEL[item.recommendation] || item.recommendation}</span></p>)
-            : <small>Chưa có phản hồi.</small>}
-        </div>
-
         {ops?.feedback_summary && <div className={`job-detail-block wide feedback-summary${ops.feedback_summary.conflicts.length ? " has-conflict" : ""}`}>
           <h4>Tổng hợp feedback (AI)</h4>
           <p>{ops.feedback_summary.summary}</p>
@@ -2071,34 +2599,110 @@ function InterviewCard({ row, expanded, onToggle, ops, opsLoading, busyKey, pare
           {!!ops.feedback_summary.concerns.length && <p><b>Điểm cần lưu ý:</b> {ops.feedback_summary.concerns.join(", ")}</p>}
           {!!ops.feedback_summary.conflicts.length && <p className="interview-conflict">⚠ Người phỏng vấn chưa thống nhất ý kiến — xem lại từng scorecard trước khi quyết định</p>}
         </div>}
+      </div>
 
-        <div className="job-detail-block wide">
-          <h4>Nộp scorecard mới</h4>
-          <form className="scorecard-form" onSubmit={onSubmitScorecard(interview, kit?.rubric || [])}>
-            <input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/>
-            <select name="recommendation" defaultValue="MIXED">
-              <option value="STRONG_YES">Rất nên nhận</option>
-              <option value="YES">Nên nhận</option>
-              <option value="MIXED">Cân nhắc thêm</option>
-              <option value="NO">Không nên nhận</option>
-              <option value="STRONG_NO">Chắc chắn từ chối</option>
-            </select>
-            {(kit?.rubric?.length ? kit.rubric : [{ criterion: "Năng lực chuyên môn", weight: 0 }]).map(item => <fieldset key={item.criterion} className="scorecard-criterion">
-              <legend>{item.criterion}</legend>
-              <select name={`rating:${item.criterion}`} defaultValue="3">
-                <option value="1">1 — Không đạt</option>
-                <option value="2">2</option>
-                <option value="3">3 — Trung bình</option>
-                <option value="4">4</option>
-                <option value="5">5 — Xuất sắc</option>
-              </select>
-              <textarea name={`evidence:${item.criterion}`} required placeholder="Evidence quan sát được"/>
-            </fieldset>)}
-            <textarea name="note" placeholder="Ghi chú bổ sung (không bắt buộc)"/>
-            <button className="primary compact" disabled={busy(`scorecard-${interview.id}`)}>
-              {busy(`scorecard-${interview.id}`) ? "Đang lưu..." : "Lưu scorecard"}</button>
-          </form>
+      <div className="scorecard-block">
+        <div className="scorecard-block-head">
+          <h4>Scorecard phỏng vấn ({ops?.scorecards.length || 0})</h4>
+          <small>HR và Leader đều xem được toàn bộ nhận xét của nhau</small>
+          <button type="button" className="secondary compact" disabled={busy(`scorecard-${interview.id}`)}
+                  onClick={() => setScorecardFormOpen(current => !current)}>
+            {scorecardFormOpen ? "Đóng" : "+ Thêm scorecard"}
+          </button>
         </div>
+
+        {opsLoading ? <small>Đang tải...</small>
+          : ops?.scorecards.length ? <div className="scorecard-list">
+              {ops.scorecards.map(item => <ScorecardCard key={item.id} scorecard={item}
+                expanded={expandedScorecardId === item.id}
+                onToggle={() => setExpandedScorecardId(current => current === item.id ? "" : item.id)}/>)}
+            </div>
+          : <p className="scorecard-empty">Chưa có phản hồi nào — mời người phỏng vấn nộp scorecard bên dưới.</p>}
+
+        {scorecardFormOpen && <form className="scorecard-form" onSubmit={onSubmitScorecard(interview, kit?.rubric || [])}>
+          <input name="interviewer_email" type="email" required placeholder="interviewer@company.com"/>
+          <select name="recommendation" defaultValue="MIXED">
+            <option value="STRONG_YES">Rất nên nhận</option>
+            <option value="YES">Nên nhận</option>
+            <option value="MIXED">Cân nhắc thêm</option>
+            <option value="NO">Không nên nhận</option>
+            <option value="STRONG_NO">Chắc chắn từ chối</option>
+          </select>
+          {(kit?.rubric?.length ? kit.rubric : [{ criterion: "Năng lực chuyên môn", weight: 0 }]).map(item => <fieldset key={item.criterion} className="scorecard-criterion">
+            <legend>{item.criterion}</legend>
+            <select name={`rating:${item.criterion}`} defaultValue="3">
+              <option value="1">1 — Không đạt</option>
+              <option value="2">2</option>
+              <option value="3">3 — Trung bình</option>
+              <option value="4">4</option>
+              <option value="5">5 — Xuất sắc</option>
+            </select>
+            <textarea name={`evidence:${item.criterion}`} required placeholder="Evidence quan sát được"/>
+          </fieldset>)}
+          <textarea name="note" placeholder="Ghi chú bổ sung (không bắt buộc)"/>
+          <button className="primary compact" disabled={busy(`scorecard-${interview.id}`)}>
+            {busy(`scorecard-${interview.id}`) ? "Đang lưu..." : "Lưu scorecard"}</button>
+        </form>}
+      </div>
+
+      <div className="scorecard-block">
+        <div className="scorecard-block-head">
+          <h4>Phân tích hội thoại phỏng vấn (AI)</h4>
+          <small>Chạy trên nhiều model AI free song song, hiển thị đủ cả — không gộp thành 1 kết quả</small>
+          <div className="scorecard-block-actions">
+            {recording
+              ? <div className="recording-indicator">
+                  <i className="recording-dot"/>
+                  <span>{String(Math.floor(recordingSeconds / 60)).padStart(2, "0")}:{String(recordingSeconds % 60).padStart(2, "0")}</span>
+                  <button type="button" className="danger compact" disabled={finalizingRecording} onClick={stopRecording}>
+                    {finalizingRecording ? "Đang hoàn tất..." : "Dừng & Phân tích"}</button>
+                </div>
+              : <button type="button" className="secondary compact"
+                        disabled={busy(`transcript-${interview.id}`) || recordingUnsupported}
+                        title={recordingUnsupported ? "Trình duyệt này không hỗ trợ ghi âm tab — dùng Chrome/Edge, hoặc dán transcript thủ công." : undefined}
+                        onClick={() => void startRecording()}>
+                  🎙 Ghi âm phỏng vấn
+                </button>}
+            <button type="button" className="secondary compact" disabled={busy(`transcript-${interview.id}`) || recording}
+                    onClick={() => setTranscriptFormOpen(current => !current)}>
+              {transcriptFormOpen ? "Đóng" : "+ Phân tích transcript mới"}
+            </button>
+          </div>
+        </div>
+        {recordingWarning && <p className="recording-warning">{recordingWarning}</p>}
+        {busy(`transcript-${interview.id}`) && !recording && !transcriptFormOpen && !recordedText &&
+          <p className="scorecard-empty">Đang trích xuất giọng nói... (có thể mất đến vài phút)</p>}
+
+        {recordedText && <div className="recorded-transcript-preview">
+          <div className="recorded-transcript-head">
+            <b>Văn bản ghi âm được (Whisper trích xuất)</b>
+            {busy(`transcript-${interview.id}`) && <span className="processing-indicator"><i/>3 model AI đang phân tích...</span>}
+          </div>
+          <pre>{recordedText}</pre>
+        </div>}
+
+        {opsLoading ? <small>Đang tải...</small>
+          : ops?.transcript_sessions?.length ? ops.transcript_sessions.map(session =>
+              <TranscriptComparisonView key={session.id} session={session}/>)
+          : <p className="scorecard-empty">Chưa có transcript nào được phân tích — dán transcript bên dưới để bắt đầu.</p>}
+
+        {transcriptFormOpen && <form className="scorecard-form" onSubmit={async event => {
+          event.preventDefault();
+          await onSubmitTranscript(interview, transcriptText);
+          setTranscriptText("");
+        }}>
+          <textarea className="full-width" value={transcriptText} onChange={event => setTranscriptText(event.target.value)}
+                    required placeholder="Dán nguyên văn transcript cuộc phỏng vấn vào đây..."/>
+          <label className="full-width transcript-file-pick">
+            hoặc chọn file .txt
+            <input type="file" accept=".txt" onChange={async event => {
+              const file = event.target.files?.[0];
+              if (file) setTranscriptText(await file.text());
+            }}/>
+          </label>
+          <button className="primary compact" disabled={busy(`transcript-${interview.id}`) || !transcriptText.trim()}>
+            {busy(`transcript-${interview.id}`) ? "Đang phân tích..." : "Phân tích bằng AI"}</button>
+        </form>}
       </div>
     </div>}
   </article>;
@@ -2247,6 +2851,38 @@ function InterviewsView({ dashboard, approvals, actionBusy, onChanged, onResolve
       });
     };
 
+  const analyzeTranscript = async (interview: Interview, transcriptText: string) => {
+    await request(`/api/interviews/${interview.id}/transcript-sessions`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcript_text: transcriptText }),
+    });
+    forgetOps(interview.id);
+    await Promise.all([loadOps(interview.id), onChanged()]);
+  };
+
+  const submitTranscript = async (interview: Interview, transcriptText: string) => {
+    await run(`transcript-${interview.id}`, async () => {
+      await analyzeTranscript(interview, transcriptText);
+      setMessage("Đã phân tích transcript bằng AI.");
+    });
+  };
+
+  // Two steps, one busy-key: STT first so the UI can show the raw text the moment it's ready
+  // (onTranscribed), then straight into the same analysis as a pasted transcript - still fully
+  // automatic, no review-and-confirm step, per the earlier "tự động phân tích luôn" choice.
+  const submitRecording = async (interview: Interview, audioBlob: Blob, onTranscribed: (text: string) => void) => {
+    await run(`transcript-${interview.id}`, async () => {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.webm");
+      const { transcript_text } = await request<{ transcript_text: string }>(
+        `/api/interviews/${interview.id}/transcribe-recording`, { method: "POST", body: formData },
+      );
+      onTranscribed(transcript_text);
+      await analyzeTranscript(interview, transcript_text);
+      setMessage("Đã ghi âm, trích xuất giọng nói và phân tích xong.");
+    });
+  };
+
   const segments: [Segment, string, number][] = [
     ["action", "Cần xử lý", counts.action], ["today", "Hôm nay", counts.today],
     ["upcoming", "Sắp tới", counts.upcoming], ["done", "Đã xong", counts.done], ["all", "Tất cả", counts.all],
@@ -2285,7 +2921,9 @@ function InterviewsView({ dashboard, approvals, actionBusy, onChanged, onResolve
                      busyKey={busyKey} parentBusy={Boolean(busyKey) || actionBusy}
                      onConfirm={confirmInterview} onNoShow={markNoShow} onCancel={cancelInterview}
                      onReschedule={interview => setRescheduling(interview)}
-                     onSubmitScorecard={submitScorecard} onResolveEscalation={resolveEscalation}/>)}
+                     onSubmitScorecard={submitScorecard} onSubmitTranscript={submitTranscript}
+                     onSubmitRecording={submitRecording}
+                     onResolveEscalation={resolveEscalation}/>)}
     </div> : <div className="empty-state">{emptyHint}</div>}
 
     {rescheduling && <RescheduleModal interview={rescheduling} busy={busyKey === `reschedule-${rescheduling.id}`}
@@ -2377,7 +3015,10 @@ type InterviewPolicy = {
   reminder_minutes: number[]; max_reschedules: number; feedback_due_hours: number;
   timezone_name: string; working_days: number[]; working_start_hour: number; working_end_hour: number;
 };
-type BusyBlock = { id: string; start_at: string; end_at: string; note: string };
+type BusyBlock = {
+  id: string; start_at: string; end_at: string; note: string;
+  created_by_id?: string; created_by_email?: string; is_mine?: boolean;
+};
 
 const CRITERIA_STATUS: Record<string, { label: string; tone: string }> = {
   APPROVED: { label: "Đã duyệt", tone: "interview" },
@@ -2425,7 +3066,56 @@ function selectionToBlocks(selection: Set<string>): { start_at: string; end_at: 
   return blocks;
 }
 
-function AvailabilityView({ dashboard }: { dashboard: Dashboard }) {
+function InviteScheduleModal({ application, dashboard, myRole, actionBusy, onClose, onConfirm }: {
+  application: Application; dashboard: Dashboard; myRole: string; actionBusy: boolean;
+  onClose: () => void; onConfirm: () => Promise<void>;
+}) {
+  const [policy, setPolicy] = useState<InterviewPolicy | null>(null);
+  const [blocks, setBlocks] = useState<BusyBlock[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const colleagueLabel = myRole === "ADMIN" ? "Leader" : "HR";
+
+  const load = async () => {
+    const [nextPolicy, nextBlocks] = await Promise.all([
+      request<InterviewPolicy>("/api/interview-policy"),
+      request<BusyBlock[]>("/api/busy-blocks"),
+    ]);
+    setPolicy(nextPolicy); setBlocks(nextBlocks);
+  };
+  useEffect(() => {
+    void load().catch(err => setMessage(err instanceof Error ? err.message : "Không tải được lịch")).finally(() => setLoading(false));
+  }, []);
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape" && !actionBusy) onClose(); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [actionBusy, onClose]);
+
+  const handleConfirm = () => {
+    if (!window.confirm(`Mời ${application.candidate.name} phỏng vấn?\n\nHệ thống sẽ gửi link cho ứng viên tự chọn giờ còn trống và sao chép link vào clipboard.`)) return;
+    void onConfirm();
+  };
+
+  return <div className="modal-layer"><div className="modal invite-schedule-modal">
+    <button className="close" disabled={actionBusy} onClick={onClose}>×</button>
+    <span className="eyebrow">TRƯỚC KHI MỜI PHỎNG VẤN</span>
+    <h2>Kiểm tra lịch bận lần cuối</h2>
+    <p>Xem lịch bận của bạn và {colleagueLabel}, bổ sung thêm nếu cần, trước khi mời <b>{application.candidate.name}</b> phỏng vấn.</p>
+    {message && <p className="operations-message">{message}</p>}
+    {loading || !policy ? <InlineProgress label="Đang tải lịch làm việc"/> : <BusyBoard policy={policy} blocks={blocks} busy={busy} myRole={myRole}
+      interviews={dashboard.interviews || []} applications={dashboard.applications}
+      onSaved={async note => { setBlocks(await request<BusyBlock[]>("/api/busy-blocks")); setMessage(note); }}
+      setBusy={setBusy} onError={setMessage}/>}
+    <div className="invite-schedule-actions">
+      <button className="secondary" disabled={actionBusy} onClick={onClose}>Để sau</button>
+      <button className="primary" disabled={actionBusy || busy} onClick={handleConfirm}><Icon name="calendar"/>{actionBusy ? "Đang gửi lời mời..." : "Xác nhận mời phỏng vấn"}</button>
+    </div>
+  </div></div>;
+}
+
+function AvailabilityView({ dashboard, myRole }: { dashboard: Dashboard; myRole: string }) {
   const [policy, setPolicy] = useState<InterviewPolicy | null>(null);
   const [blocks, setBlocks] = useState<BusyBlock[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2507,7 +3197,7 @@ function AvailabilityView({ dashboard }: { dashboard: Dashboard }) {
       </div>
     </div>
 
-    <BusyBoard policy={policy} blocks={blocks} busy={busy}
+    <BusyBoard policy={policy} blocks={blocks} busy={busy} myRole={myRole}
                interviews={dashboard.interviews || []} applications={dashboard.applications}
                onSaved={async note => { setBlocks(await request<BusyBlock[]>("/api/busy-blocks")); setMessage(note); }}
                setBusy={setBusy} onError={setMessage}/>
@@ -2515,17 +3205,20 @@ function AvailabilityView({ dashboard }: { dashboard: Dashboard }) {
   </section>;
 }
 
-function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, onSaved, onError }: {
+function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, onSaved, onError, myRole }: {
   policy: InterviewPolicy; blocks: BusyBlock[]; interviews: Interview[]; applications: Application[];
   busy: boolean;
   setBusy: (value: boolean) => void;
   onSaved: (note: string) => Promise<void>;
   onError: (note: string) => void;
+  myRole: string;
 }) {
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [painting, setPainting] = useState<boolean | null>(null);
   const [dirty, setDirty] = useState(false);
   const today = dayKey(new Date());
+  const myLabel = myRole === "ADMIN" ? "HR" : "Leader";
+  const colleagueLabel = myRole === "ADMIN" ? "Leader" : "HR";
 
   useEffect(() => {
     const stop = () => setPainting(null);
@@ -2534,9 +3227,11 @@ function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, on
   }, []);
 
   // Saved blocks are the source of truth until the grid is edited, so a reload shows them again.
+  // Only MY OWN blocks are editable here — a colleague's busy time (e.g. Leader sees HR's, or
+  // vice versa) shows up read-only in colleagueCells below instead, so saving never wipes it out.
   useEffect(() => {
     const marked = new Set<string>();
-    blocks.forEach(block => {
+    blocks.filter(block => block.is_mine).forEach(block => {
       const end = new Date(block.end_at);
       const cursor = new Date(block.start_at);
       cursor.setMinutes(0, 0, 0);
@@ -2548,6 +3243,21 @@ function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, on
     setSelection(marked);
     setDirty(false);
   }, [blocks]);
+
+  const colleagueCells = useMemo(() => {
+    const map = new Map<string, string>();
+    blocks.filter(block => !block.is_mine).forEach(block => {
+      const label = block.created_by_email || colleagueLabel;
+      const end = new Date(block.end_at);
+      const cursor = new Date(block.start_at);
+      cursor.setMinutes(0, 0, 0);
+      while (cursor < end) {
+        map.set(cellKey(dayKey(cursor), cursor.getHours()), label);
+        cursor.setHours(cursor.getHours() + 1);
+      }
+    });
+    return map;
+  }, [blocks, colleagueLabel]);
 
   const hours = Array.from({ length: Math.max(0, policy.working_end_hour - policy.working_start_hour) },
                            (_, index) => policy.working_start_hour + index);
@@ -2595,17 +3305,18 @@ function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, on
   const save = async () => {
     setBusy(true);
     try {
-      const editable = blocks.filter(block => dayKey(new Date(block.start_at)) >= today);
+      // Only ever touch blocks I created — a colleague's busy time is reference-only here.
+      const editable = blocks.filter(block => block.is_mine && dayKey(new Date(block.start_at)) >= today);
       for (const block of editable) await request(`/api/busy-blocks/${block.id}`, { method: "DELETE" });
 
       const future = new Set(Array.from(selection).filter(key => key.split(":")[0] >= today));
       for (const block of selectionToBlocks(future)) {
         await request("/api/busy-blocks", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...block, note: "Lịch bận" }),
+          body: JSON.stringify({ ...block, note: `Lịch bận (${myLabel})` }),
         });
       }
-      await onSaved(`Đã lưu ${future.size} giờ bận. Ứng viên sẽ không thấy các giờ này.`);
+      await onSaved(`Đã lưu ${future.size} giờ bận của bạn. Ứng viên sẽ không thấy các giờ này.`);
     } catch (err) { onError(err instanceof Error ? err.message : "Không lưu được lịch bận"); }
     finally { setBusy(false); }
   };
@@ -2613,12 +3324,13 @@ function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, on
   return <div className="availability-block">
     <div className="board-head">
       <div>
-        <h3>Lịch 3 tuần</h3>
-        <p className="availability-hint">Kéo chuột để tô giờ bận. Ngày đã trôi qua bị đóng băng, chỉ xem lại được.</p>
+        <h3>Lịch 3 tuần <span className="board-who">— bạn đang xem với vai trò {myLabel}</span></h3>
+        <p className="availability-hint">Kéo chuột để tô giờ bận của bạn. Lịch bận của {colleagueLabel} hiện sẵn để bạn tránh trùng giờ trước khi mời phỏng vấn — không chỉnh được lịch của họ.</p>
       </div>
       <div className="board-legend">
         <span><i className="swatch free"/>Trống</span>
-        <span><i className="swatch busy"/>Bận</span>
+        <span><i className="swatch busy"/>Bận (bạn)</span>
+        <span><i className="swatch colleague"/>Bận ({colleagueLabel})</span>
         <span><i className="swatch interview"/>Có phỏng vấn</span>
         <span><i className="swatch frozen"/>Đã qua</span>
       </div>
@@ -2638,13 +3350,14 @@ function BusyBoard({ policy, blocks, interviews, applications, busy, setBusy, on
             const key = cellKey(day, hour);
             const frozen = day < today;
             const candidate = interviewCells.get(key);
+            const colleagueBusy = colleagueCells.get(key);
             const marked = selection.has(key);
-            const tone = candidate ? "interview" : marked ? "busy" : "free";
-            return <button key={key} type="button" disabled={busy || frozen || Boolean(candidate)}
+            const tone = candidate ? "interview" : colleagueBusy ? "colleague" : marked ? "busy" : "free";
+            return <button key={key} type="button" disabled={busy || frozen || Boolean(candidate) || Boolean(colleagueBusy)}
               className={`week-cell ${tone}${frozen ? " frozen" : ""}`}
               aria-pressed={marked}
-              title={candidate ? `Phỏng vấn: ${candidate}` : frozen ? "Ngày đã trôi qua" : undefined}
-              aria-label={`${shortDay(date)} ${String(hour).padStart(2, "0")}:00 — ${candidate ? `phỏng vấn ${candidate}` : marked ? "bận" : "trống"}`}
+              title={candidate ? `Phỏng vấn: ${candidate}` : colleagueBusy ? `${colleagueLabel} bận: ${colleagueBusy}` : frozen ? "Ngày đã trôi qua" : undefined}
+              aria-label={`${shortDay(date)} ${String(hour).padStart(2, "0")}:00 — ${candidate ? `phỏng vấn ${candidate}` : colleagueBusy ? `${colleagueLabel} bận` : marked ? "bận" : "trống"}`}
               onMouseDown={() => { setPainting(!marked); paint(key, !marked); }}
               onMouseEnter={() => { if (painting !== null) paint(key, painting); }}/>;
           })}

@@ -129,3 +129,95 @@ def test_unhandled_error_still_answers_with_json_and_cors_headers():
 def test_every_builtin_template_key_has_superseded_bodies_recorded():
     # A new built-in without its previous body listed would silently strand tenants on old copy.
     assert set(BUILTIN_TEMPLATES) == set(SUPERSEDED_BUILTIN_BODIES)
+
+
+def test_send_email_threads_as_a_reply_only_when_an_original_message_id_is_given(monkeypatch):
+    import base64
+
+    captured = []
+
+    def fake_request(_method, _url, _token, *, json_body=None, headers=None):
+        captured.append(json_body)
+        return {"id": "gmail-msg-2", "threadId": "gmail-thread-1"}
+
+    monkeypatch.setattr(scheduling, "_request", fake_request)
+
+    class FakeGoogleConnection:
+        provider = "google"
+
+    original = scheduling._send_email(FakeGoogleConnection(), "token", {
+        "to": "candidate@example.com",
+        "subject": "Thư mời phỏng vấn vị trí Backend Engineer",
+        "body": "Nội dung thư mời.",
+    })
+    assert original["rfc_message_id"]
+    # No thread to reply into yet, so this is a brand new message - no In-Reply-To/References.
+    raw = base64.urlsafe_b64decode(captured[-1]["raw"] + "===")
+    assert b"In-Reply-To" not in raw
+    assert "threadId" not in captured[-1]
+
+    reply = scheduling._send_email(FakeGoogleConnection(), "token", {
+        "to": "candidate@example.com",
+        "subject": "Xác nhận lịch phỏng vấn thành công — vị trí Backend Engineer",
+        "body": "Nội dung xác nhận.",
+        "in_reply_to_message_id": original["rfc_message_id"],
+        "thread_id": original["thread_id"],
+    })
+    assert reply["id"] == "gmail-msg-2"
+    sent_body = captured[-1]
+    assert sent_body["threadId"] == "gmail-thread-1"
+    raw = base64.urlsafe_b64decode(sent_body["raw"] + "===")
+    assert original["rfc_message_id"].encode() in raw  # In-Reply-To / References present
+
+    import email
+    import email.policy
+    parsed = email.message_from_bytes(raw, policy=email.policy.default)
+    assert parsed["In-Reply-To"] == original["rfc_message_id"]
+    assert str(parsed["Subject"]).startswith("Re: Xác nhận")
+
+
+def test_confirmation_email_replies_in_the_invitation_thread_when_one_was_actually_sent():
+    application = _application()
+    invitation = client.post(f"/api/applications/{application['id']}/scheduling-invitations",
+                             json={"timezone_name": "Asia/Ho_Chi_Minh"}).json()
+    token = invitation["public_url"].split("schedule=")[1]
+    slot = client.get(f"/api/public/scheduling/{token}").json()["slots"][0]["start_at"]
+    booked = client.post(f"/api/public/scheduling/{token}",
+                         json={"slot": slot, "timezone_name": "Asia/Ho_Chi_Minh"}).json()
+
+    # Simulate the invitation having actually gone out through Gmail - locally there is no real
+    # provider connection, so email_message_id/email_thread_id stay unset unless something sent it.
+    from app.models import SchedulingInvitation
+    with session_scope() as db:
+        row = db.get(SchedulingInvitation, invitation["id"])
+        row.email_message_id = "<original-invite@talentflow.local>"
+        row.email_thread_id = "gmail-thread-xyz"
+
+    confirmed = client.post(f"/api/interviews/{booked['id']}/confirm", json={"note": "Approved by Leader"})
+    assert confirmed.status_code == 200
+
+    from app.models import OutboxEvent
+    with session_scope() as db:
+        confirmation_event = db.scalar(select(OutboxEvent).where(
+            OutboxEvent.idempotency_key == f"interview-confirmation:{booked['id']}"))
+    assert confirmation_event is not None
+    assert confirmation_event.payload["in_reply_to_message_id"] == "<original-invite@talentflow.local>"
+    assert confirmation_event.payload["thread_id"] == "gmail-thread-xyz"
+    assert "thành công" in confirmation_event.payload["subject"]
+
+
+def test_confirmation_email_is_a_fresh_message_when_the_invitation_was_never_actually_emailed():
+    # Local/dev provider never produces a real message id, so no reply should be attempted - this
+    # is the common case and must behave exactly as before the threading feature was added.
+    application = _application()
+    slot = client.get("/api/interviewers/recruiter-1/available-slots").json()[0]["start_at"]
+    booked = client.post(f"/api/applications/{application['id']}/interview",
+                         json={"slot": slot, "timezone_name": "UTC"}).json()
+
+    from app.models import OutboxEvent
+    with session_scope() as db:
+        confirmation_event = db.scalar(select(OutboxEvent).where(
+            OutboxEvent.idempotency_key == f"interview-confirmation:{booked['id']}"))
+    assert confirmation_event is not None
+    assert "in_reply_to_message_id" not in confirmation_event.payload
+    assert "thread_id" not in confirmation_event.payload

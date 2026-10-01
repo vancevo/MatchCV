@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app import scheduling
 from app.database import Base
+from app.models import InterviewPolicy
 
 
 @pytest.fixture
@@ -44,6 +45,22 @@ def test_every_slot_finishes_within_working_hours(availability_db, duration_minu
         local_end = (slot + timedelta(minutes=duration_minutes)).astimezone(zone)
         closing_time = local_start.replace(hour=17, minute=0, second=0, microsecond=0)
         assert local_end <= closing_time
+
+
+def test_wide_working_hours_still_cover_the_full_three_week_window(availability_db):
+    # 6 working days x 9h/day = 54 slots/week; a flat "first 120 slots" cap used to run out partway
+    # through week 3, silently shrinking the public scheduling page's 21-day range to ~2 weeks.
+    availability_db.add(InterviewPolicy(
+        owner_id="wide-hours-test", working_days=[0, 1, 2, 3, 4, 5],
+        working_start_hour=9, working_end_hour=18,
+    ))
+    availability_db.flush()
+    slots = scheduling.available_slots_for_owner(
+        availability_db, "wide-hours-test", duration_minutes=60, days=21,
+    )
+    last_slot_day = max(slots).date()
+    window_start_day = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc).date()
+    assert (last_slot_day - window_start_day).days >= 18
 
 
 def test_three_hour_interview_is_not_offered_after_14_00(availability_db):

@@ -107,8 +107,21 @@ def test_criteria_and_shortlist_approval():
         "note": "Approve top candidate",
     })
     assert approved.status_code == 200
-    assert approved.json()["items"][0]["status"] == "INTERVIEW_PENDING"
-    assert len(approved.json()["invitations"]) == 1
+    # Approving out of the shortlist is a hand-off into the normal "chờ duyệt" review queue, not
+    # an interview invite - no email goes out here, a Leader still has to go through "Mời PV".
+    assert approved.json()["items"][0]["status"] == "SHORTLISTED"
+    assert approved.json()["invitations"] == []
+
+    from app.database import session_scope
+    from app.models import SchedulingInvitation
+    from sqlalchemy import select
+    with session_scope() as db:
+        assert db.scalar(select(SchedulingInvitation).where(
+            SchedulingInvitation.application_id == first["id"])) is None
+
+    invited = client.post(f"/api/applications/{first['id']}/review", json={"decision": "INTERVIEW"})
+    assert invited.status_code == 200
+    assert invited.json()["status"] == "INTERVIEW_PENDING"
 
     report = client.get(f"/api/jobs/{job['id']}/shortlist-report")
     assert report.status_code == 200

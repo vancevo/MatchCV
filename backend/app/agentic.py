@@ -230,8 +230,11 @@ def _band(item: Application, approve_at: float, min_confidence: float) -> str:
 
 
 def is_ready_for_approval(item: Application, policy) -> bool:
-    """The "Chờ duyệt" bucket: WAITING_REVIEW and clears both bars, so it never needed the
-    shortlist/Phê duyệt detour — everything else in WAITING_REVIEW is still being triaged there."""
+    """The "Chờ duyệt" bucket: either WAITING_REVIEW and clears both bars (never needed the
+    shortlist/Phê duyệt detour), or SHORTLISTED — a Leader/HR already approved it out of the
+    shortlist queue, which is itself the hand-off into "chờ duyệt" for the normal review flow."""
+    if item.status == ApplicationStatus.SHORTLISTED.value:
+        return True
     if item.status != ApplicationStatus.WAITING_REVIEW.value or "final_score" not in (item.screening or {}):
         return False
     return _band(item, policy.auto_approve_threshold, policy.min_confidence_threshold) == "APPROVE"

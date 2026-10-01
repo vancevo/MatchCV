@@ -6,7 +6,9 @@ import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
+from email.headerregistry import HeaderRegistry, MessageIDHeader
 from email.message import EmailMessage
+from email.policy import EmailPolicy
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 from urllib.parse import urlencode
@@ -35,6 +37,11 @@ from .models import (
 )
 
 
+# The connected Google account can send mail but isn't authorized for Calendar (403 on every
+# event create) — demo-only stand-in room so a confirmation still has somewhere real to point to
+# instead of the whole outbox event getting stuck retrying a call that will never succeed.
+DEMO_MEET_FALLBACK_URL = "https://meet.google.com/jxt-qydj-twg"
+
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 VN_WEEKDAYS = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
 
@@ -52,7 +59,7 @@ def local_datetime_label(value: datetime, timezone_name: str = DEFAULT_TIMEZONE)
 # Bump this whenever the wording below changes. render_template then replaces any tenant row that
 # still carries a superseded built-in body, while leaving copy someone wrote through
 # POST /api/email-templates alone.
-BUILTIN_TEMPLATE_VERSION = 2
+BUILTIN_TEMPLATE_VERSION = 3
 
 BUILTIN_TEMPLATES: dict[str, dict[str, str]] = {
     "scheduling_invitation": {
@@ -77,19 +84,23 @@ BUILTIN_TEMPLATES: dict[str, dict[str, str]] = {
         ),
     },
     "interview_confirmation": {
-        "subject": "Xác nhận lịch phỏng vấn vị trí {job_title}",
+        "subject": "Xác nhận lịch phỏng vấn thành công — vị trí {job_title}",
         "body": (
             "Kính gửi {candidate_name},\n\n"
-            "Lịch phỏng vấn của bạn đã được xác nhận. Bạn vui lòng lưu lại thông tin dưới đây:\n\n"
-            "- Vị trí:    {job_title}\n"
-            "- Thời gian: {start_at}\n"
-            "- Hình thức: Phỏng vấn trực tuyến\n"
-            "- Phòng họp: {meeting_url}\n\n"
-            "Bạn nên vào phòng họp trước giờ hẹn khoảng 5 phút và kiểm tra trước đường truyền, "
-            "micro cùng camera để buổi trao đổi diễn ra thuận lợi.\n\n"
-            "Trường hợp cần dời sang khung giờ khác, bạn có thể tự chọn lại tại đây:\n"
+            "Chúng tôi xin xác nhận lịch phỏng vấn của bạn cho vị trí {job_title} đã được chốt thành công. "
+            "Bạn vui lòng lưu lại thông tin chi tiết dưới đây:\n\n"
+            "THÔNG TIN BUỔI PHỎNG VẤN\n"
+            "- Vị trí:     {job_title}\n"
+            "- Thời gian:  {start_at}\n"
+            "- Hình thức:  Phỏng vấn trực tuyến\n"
+            "- Phòng họp:  {meeting_url}\n\n"
+            "Một vài lưu ý trước buổi phỏng vấn:\n"
+            "- Vào phòng họp trước giờ hẹn khoảng 5 phút.\n"
+            "- Kiểm tra trước đường truyền internet, micro và camera.\n"
+            "- Chuẩn bị sẵn các câu hỏi bạn muốn trao đổi thêm về vị trí hoặc đội ngũ.\n\n"
+            "Trường hợp có việc đột xuất cần dời sang khung giờ khác, bạn có thể tự chọn lại tại đây:\n"
             "{reschedule_url}\n\n"
-            "Chúng tôi rất mong được trò chuyện cùng bạn.\n\n"
+            "Chúng tôi rất mong được trò chuyện cùng bạn. Nếu cần hỗ trợ thêm, bạn chỉ cần phản hồi lại email này.\n\n"
             "Trân trọng,\n"
             "Bộ phận Tuyển dụng"
         ),
@@ -134,6 +145,19 @@ SUPERSEDED_BUILTIN_BODIES: dict[str, set[str]] = {
     "interview_confirmation": {
         "Chào {candidate_name},\n\nLịch phỏng vấn của bạn: {start_at} UTC.\n"
         "Tham gia: {meeting_url}\nĐổi lịch: {reschedule_url}",
+        "Kính gửi {candidate_name},\n\n"
+        "Lịch phỏng vấn của bạn đã được xác nhận. Bạn vui lòng lưu lại thông tin dưới đây:\n\n"
+        "- Vị trí:    {job_title}\n"
+        "- Thời gian: {start_at}\n"
+        "- Hình thức: Phỏng vấn trực tuyến\n"
+        "- Phòng họp: {meeting_url}\n\n"
+        "Bạn nên vào phòng họp trước giờ hẹn khoảng 5 phút và kiểm tra trước đường truyền, "
+        "micro cùng camera để buổi trao đổi diễn ra thuận lợi.\n\n"
+        "Trường hợp cần dời sang khung giờ khác, bạn có thể tự chọn lại tại đây:\n"
+        "{reschedule_url}\n\n"
+        "Chúng tôi rất mong được trò chuyện cùng bạn.\n\n"
+        "Trân trọng,\n"
+        "Bộ phận Tuyển dụng",
     },
     "interview_reminder": {
         "Chào {candidate_name},\n\nLịch phỏng vấn bắt đầu lúc {start_at}.\nTham gia: {meeting_url}",
@@ -464,7 +488,11 @@ def available_slots_for_owner(db, owner_id: str, duration_minutes: int = 60, day
     slots: list[datetime] = []
     cursor = start
     duration = timedelta(minutes=duration_minutes)
-    while cursor + duration <= end and len(slots) < 120:
+    # Bounded by `days * 24` (worst case: one slot per hour, every hour, every day in the window)
+    # rather than a flat count — a flat cap used to cut the offered range short whenever working
+    # hours/days were configured wider than the default 5x8, well before reaching `end`.
+    max_slots = days * 24
+    while cursor + duration <= end and len(slots) < max_slots:
         local = cursor.astimezone(local_zone)
         local_end = (cursor + duration).astimezone(local_zone)
         day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -533,9 +561,12 @@ def _create_event(connection: IntegrationConnection | None, token: str, intervie
         try:
             result = _request("POST", "https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=none", token, json_body=body)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 409:
+            if exc.response.status_code == 409:
+                result = _request("GET", f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}", token)
+            elif exc.response.status_code == 403:
+                return event_id, DEMO_MEET_FALLBACK_URL
+            else:
                 raise
-            result = _request("GET", f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}", token)
         return str(result["id"]), str(result.get("hangoutLink") or result.get("htmlLink") or "")
     body = {
         "subject": f"Phỏng vấn {job.title} — {application.candidate_name}",
@@ -548,24 +579,50 @@ def _create_event(connection: IntegrationConnection | None, token: str, intervie
     return str(result["id"]), str((result.get("onlineMeeting") or {}).get("joinUrl") or result.get("webLink") or "")
 
 
-def _send_email(connection: IntegrationConnection | None, token: str, payload: dict) -> str:
+# Python's default header registry only treats "Message-ID" as a message-id value (foldable
+# without RFC 2047 encoded-word mangling); "In-Reply-To"/"References" fall back to generic
+# unstructured text and get needlessly encoded once the id is too long to fold on whitespace.
+# Mapping them to the same header type keeps a reply's threading headers plain and readable.
+_EMAIL_HEADER_REGISTRY = HeaderRegistry()
+_EMAIL_HEADER_REGISTRY.map_to_type("in-reply-to", MessageIDHeader)
+_EMAIL_HEADER_REGISTRY.map_to_type("references", MessageIDHeader)
+_EMAIL_POLICY = EmailPolicy(header_factory=_EMAIL_HEADER_REGISTRY)
+
+
+def _send_email(connection: IntegrationConnection | None, token: str, payload: dict) -> dict:
+    """Returns {"id", "thread_id", "rfc_message_id"} — thread_id/rfc_message_id are None unless the
+    message was actually threaded (Gmail only). A later email can pass this call's "rfc_message_id"
+    back in as payload["in_reply_to_message_id"] (plus "thread_id") to reply in the same conversation
+    instead of starting a new one; absent those, every path below behaves exactly as before."""
     if not payload.get("to"):
-        return "skipped-no-recipient"
+        return {"id": "skipped-no-recipient", "thread_id": None, "rfc_message_id": None}
     if not connection:
-        return f"local-mail-{uuid4()}"
+        return {"id": f"local-mail-{uuid4()}", "thread_id": None, "rfc_message_id": None}
     if connection.provider == "google":
-        message = EmailMessage()
+        in_reply_to = payload.get("in_reply_to_message_id")
+        subject = payload["subject"]
+        if in_reply_to and not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+        message = EmailMessage(policy=_EMAIL_POLICY)
         message["To"] = payload["to"]
-        message["Subject"] = payload["subject"]
-        message["Message-ID"] = f"<{hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}@talentflow.local>"
+        message["Subject"] = subject
+        rfc_message_id = f"<{hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}@talentflow.local>"
+        message["Message-ID"] = rfc_message_id
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+            message["References"] = in_reply_to
         message.set_content(payload["body"])
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
-        result = _request("POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", token, json_body={"raw": raw})
-        return str(result["id"])
+        request_body: dict[str, Any] = {"raw": raw}
+        thread_id = payload.get("thread_id")
+        if thread_id:
+            request_body["threadId"] = thread_id
+        result = _request("POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", token, json_body=request_body)
+        return {"id": str(result["id"]), "thread_id": result.get("threadId"), "rfc_message_id": rfc_message_id}
     body = {"message": {"subject": payload["subject"], "body": {"contentType": "Text", "content": payload["body"]},
                         "toRecipients": [{"emailAddress": {"address": payload["to"]}}]}, "saveToSentItems": True}
     _request("POST", "https://graph.microsoft.com/v1.0/me/sendMail", token, json_body=body)
-    return f"microsoft-mail-{uuid4()}"
+    return {"id": f"microsoft-mail-{uuid4()}", "thread_id": None, "rfc_message_id": None}
 
 
 def _update_event(connection: IntegrationConnection | None, token: str, interview: Interview) -> str:
@@ -667,11 +724,20 @@ def process_outbox_event(event_id: str) -> None:
                      "meeting_url": meeting_url or "(sẽ gửi trước buổi phỏng vấn)",
                      "reschedule_url": f"{get_settings().public_app_url}/?schedule={reschedule_token}"},
                 )
+                email_payload = {"to": application.candidate_email, **rendered}
+                # Reply inside the original invitation thread when we actually sent it through a
+                # real provider (Gmail); otherwise this is just a fresh email, same as before.
+                original_invitation = db.scalar(select(SchedulingInvitation).where(
+                    SchedulingInvitation.application_id == application.id,
+                    SchedulingInvitation.purpose == "SCHEDULE",
+                ).order_by(SchedulingInvitation.created_at))
+                if original_invitation and original_invitation.email_message_id:
+                    email_payload["in_reply_to_message_id"] = original_invitation.email_message_id
+                    if original_invitation.email_thread_id:
+                        email_payload["thread_id"] = original_invitation.email_thread_id
                 child = add_outbox(db, owner_id=event.owner_id, aggregate_type="interview", aggregate_id=interview.id,
-                                   operation="EMAIL_SEND", idempotency_key=f"interview-confirmation:{interview.id}", payload={
-                               "to": application.candidate_email,
-                               **rendered,
-                           })
+                                   operation="EMAIL_SEND", idempotency_key=f"interview-confirmation:{interview.id}",
+                                   payload=email_payload)
                 child_event_ids.append(child.id)
                 from .interview_ops import get_policy, schedule_reminders, schedule_scorecard_reminder
                 child_event_ids.extend(schedule_reminders(db, interview))
@@ -698,7 +764,13 @@ def process_outbox_event(event_id: str) -> None:
                 if application:
                     application.status = "INTERVIEW_PENDING"
             elif event.operation == "EMAIL_SEND":
-                event.provider_message_id = _send_email(connection, token, event.payload or {})
+                sent = _send_email(connection, token, event.payload or {})
+                event.provider_message_id = sent["id"]
+                if event.aggregate_type == "scheduling_invitation" and sent.get("rfc_message_id"):
+                    invitation = db.get(SchedulingInvitation, event.aggregate_id)
+                    if invitation:
+                        invitation.email_message_id = sent["rfc_message_id"]
+                        invitation.email_thread_id = sent.get("thread_id")
             else:
                 raise RuntimeError(f"Unsupported outbox operation: {event.operation}")
             event.status = "COMPLETED"
