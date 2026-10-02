@@ -76,16 +76,27 @@ type CandidateSearchEvidence = {
   resume_version_id?: string; version?: number; source?: string;
 };
 type CandidateSearchResult = {
+  result_id?: string;
   candidate_profile: CandidateProfile;
   matched_version: { id: string; version: number; filename: string } | null;
   score: number;
+  ranking_score?: number;
+  score_version?: string;
+  score_interpretation?: "RANKING_ONLY";
+  confidence?: number | null;
   score_components?: Record<string, number>;
+  applied_weights?: Record<string, number>;
+  retrieval?: { method: string; dense_cosine?: number | null; lexical_overlap?: number | null; normalized_score: number };
+  business?: Record<string, number>;
   matched_skills?: string[];
   missing_skills?: string[];
   evidence?: CandidateSearchEvidence[];
   other_matching_versions?: { id: string; version: number; filename: string; score?: number }[];
 };
-type CandidateSearchResponse = { query: string; mode: string; semantic_available?: boolean; warning?: string; results: CandidateSearchResult[] };
+type CandidateSearchResponse = {
+  search_id?: string; query: string; mode: string; score_version?: string; score_interpretation?: "RANKING_ONLY";
+  semantic_available?: boolean; warning?: string; results: CandidateSearchResult[];
+};
 type Job = {
   id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
   requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string; version?: number }; shortlist_approval?: { status: string; application_ids?: string[] } };
@@ -3561,12 +3572,18 @@ function CandidateProfilesView({ query, onOpenApplication }: {
   const [comparisonBusy, setComparisonBusy] = useState(false);
   const [comparisonError, setComparisonError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [requiredSkills, setRequiredSkills] = useState("");
+  const [preferredSkills, setPreferredSkills] = useState("");
   const [minimumExperience, setMinimumExperience] = useState("");
+  const [minimumRankingScore, setMinimumRankingScore] = useState(0);
+  const [maximumRankingScore, setMaximumRankingScore] = useState(100);
   const [latestCvOnly, setLatestCvOnly] = useState(false);
   const [searchResponse, setSearchResponse] = useState<CandidateSearchResponse | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [fallbackQuery, setFallbackQuery] = useState("");
+  const [feedbackByResult, setFeedbackByResult] = useState<Record<string, number>>({});
+  const [feedbackBusy, setFeedbackBusy] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -3623,6 +3640,8 @@ function CandidateProfilesView({ query, onOpenApplication }: {
         body: JSON.stringify({
           query: semanticQuery,
           filters: {
+            required_skill_ids: requiredSkills.split(",").map(value => value.trim()).filter(Boolean),
+            preferred_skill_ids: preferredSkills.split(",").map(value => value.trim()).filter(Boolean),
             minimum_experience: minimumExperience ? Number(minimumExperience) : null,
             latest_cv_only: latestCvOnly,
           },
@@ -3630,6 +3649,7 @@ function CandidateProfilesView({ query, onOpenApplication }: {
         }),
       });
       setSearchResponse(response);
+      setFeedbackByResult({});
     } catch (error) {
       setSearchResponse(null); setFallbackQuery(semanticQuery);
       setSearchError(`${error instanceof Error ? error.message : "Semantic Search chưa sẵn sàng"}. Đang dùng tìm kiếm chính xác trong kho.`);
@@ -3637,12 +3657,30 @@ function CandidateProfilesView({ query, onOpenApplication }: {
   };
 
   const resetSearch = () => {
-    setSearchQuery(""); setMinimumExperience(""); setLatestCvOnly(false);
-    setSearchResponse(null); setFallbackQuery(""); setSearchError("");
+    setSearchQuery(""); setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience(""); setMinimumRankingScore(0); setMaximumRankingScore(100); setLatestCvOnly(false);
+    setSearchResponse(null); setFallbackQuery(""); setSearchError(""); setFeedbackByResult({});
+  };
+
+  const submitSearchFeedback = async (resultId: string, relevance: number) => {
+    setFeedbackBusy(resultId); setSearchError("");
+    try {
+      await request("/api/candidate-profiles/search/feedback", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ result_id: resultId, relevance, reason: "RECRUITER_SEARCH_REVIEW", note: "" }),
+      });
+      setFeedbackByResult(current => ({ ...current, [resultId]: relevance }));
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : "Không lưu được đánh giá kết quả");
+    } finally { setFeedbackBusy(""); }
   };
 
   const comparisonFor = (versionId: string) => comparisons.find(item => item.to_version.id === versionId);
-  const semanticResults = searchResponse?.results || [];
+  const allSemanticResults = searchResponse?.results || [];
+  const semanticResults = minimumRankingScore === 0 && maximumRankingScore === 100 ? allSemanticResults : allSemanticResults.filter(result => {
+    const value = result.ranking_score ?? result.score;
+    const score = value <= 1 ? value * 100 : value;
+    return score >= minimumRankingScore && score <= maximumRankingScore;
+  });
 
   return <>
     <section className="talent-pool-metrics">
@@ -3654,9 +3692,10 @@ function CandidateProfilesView({ query, onOpenApplication }: {
       <div className="panel-head"><div><h2>Kho ứng viên</h2><p>Mỗi người là một hồ sơ duy nhất, gom toàn bộ CV và lịch sử ứng tuyển.</p></div><span className="pool-count">{searchResponse ? semanticResults.length : visibleProfiles.length} hồ sơ</span></div>
       <form className="talent-search" onSubmit={runSemanticSearch}>
         <div className="talent-search-main"><Icon name="spark"/><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="Mô tả ứng viên cần tìm, ví dụ: Frontend có React, TypeScript và từng làm ERP..."/><button className="primary compact" disabled={searchBusy}>{searchBusy ? "Đang tìm..." : "Tìm bằng AI"}</button>{(searchQuery || searchResponse) && <button type="button" className="search-reset" onClick={resetSearch} aria-label="Xoá tìm kiếm">×</button>}</div>
-        <div className="talent-search-filters"><label>Kinh nghiệm tối thiểu <input type="number" min="0" max="50" value={minimumExperience} onChange={event => setMinimumExperience(event.target.value)} placeholder="Năm"/></label><label className="search-check"><input type="checkbox" checked={latestCvOnly} onChange={event => setLatestCvOnly(event.target.checked)}/> Chỉ CV mới nhất</label><span>Không dùng tên, email hoặc SĐT để xếp hạng semantic.</span></div>
+        <div className="talent-search-criteria"><label>Kỹ năng bắt buộc <input value={requiredSkills} onChange={event => setRequiredSkills(event.target.value)} placeholder="React, TypeScript"/></label><label>Kỹ năng ưu tiên <input value={preferredSkills} onChange={event => setPreferredSkills(event.target.value)} placeholder="ERP, Next.js"/></label></div>
+        <div className="talent-search-filters"><label>Kinh nghiệm tối thiểu <input type="number" min="0" max="50" value={minimumExperience} onChange={event => setMinimumExperience(event.target.value)} placeholder="Năm"/></label><label className="score-range-field"><span>Điểm xếp hạng <b>{minimumRankingScore}–{maximumRankingScore}</b></span><div className="score-range-control"><div className="score-range-track"><i style={{ left: `${minimumRankingScore}%`, right: `${100 - maximumRankingScore}%` }}/></div><input aria-label="Điểm tối thiểu" type="range" min="0" max="100" step="1" value={minimumRankingScore} onChange={event => setMinimumRankingScore(Math.min(Number(event.target.value), maximumRankingScore))}/><input aria-label="Điểm tối đa" type="range" min="0" max="100" step="1" value={maximumRankingScore} onChange={event => setMaximumRankingScore(Math.max(Number(event.target.value), minimumRankingScore))}/></div><small><i>0</i><i>100</i></small></label><label className="search-check"><input type="checkbox" checked={latestCvOnly} onChange={event => setLatestCvOnly(event.target.checked)}/> Chỉ CV mới nhất</label><span>Kỹ năng bắt buộc và kinh nghiệm tối thiểu là điều kiện loại.</span></div>
       </form>
-      {searchResponse && <div className="search-summary"><div><Icon name="spark"/><b>{semanticResults.length} kết quả</b><span>cho “{searchResponse.query}”</span></div><i>{searchResponse.mode === "SEMANTIC" ? "Semantic Search" : searchResponse.mode}</i></div>}
+      {searchResponse && <div className="search-summary"><div><Icon name="spark"/><b>{semanticResults.length} kết quả</b><span>cho “{searchResponse.query}”{minimumRankingScore > 0 || maximumRankingScore < 100 ? ` · điểm ${minimumRankingScore}–${maximumRankingScore}` : ""}</span></div><i>{searchResponse.mode === "SEMANTIC" ? "Semantic Search" : searchResponse.mode}</i></div>}
       {searchResponse?.warning && <div className="search-fallback"><Icon name="search"/>{searchResponse.warning}</div>}
       {searchError && <div className="search-fallback"><Icon name="search"/>{searchError}</div>}
       {profileError && !selectedProfile && <div className="error-banner"><b>Không tải được kho ứng viên.</b> {profileError}</div>}
@@ -3664,19 +3703,24 @@ function CandidateProfilesView({ query, onOpenApplication }: {
       : searchResponse ? <div className="semantic-results">
         {semanticResults.map((result, index) => {
           const profile = result.candidate_profile;
-          const score = result.score <= 1 ? result.score * 100 : result.score;
+          const scoreValue = result.ranking_score ?? result.score;
+          const score = scoreValue <= 1 ? scoreValue * 100 : scoreValue;
           return <article className="semantic-result" key={profile.id}>
             <div className="semantic-rank">#{index + 1}</div>
             <i className={`avatar ${["violet","blue","orange"][index % 3]}`}>{initials(profile.name)}</i>
-            <div className="semantic-result-main"><div className="semantic-result-title"><button onClick={() => void openProfile(profile)}>{profile.name}</button><span>{Math.round(score)}% phù hợp</span></div><p>{profile.email || "Chưa có email"}{profile.phone ? ` · ${profile.phone}` : ""}</p>
+            <div className="semantic-result-main"><div className="semantic-result-title"><button onClick={() => void openProfile(profile)}>{profile.name}</button><span>Điểm xếp hạng {Math.round(score)}/100</span></div><p>{profile.email || "Chưa có email"}{profile.phone ? ` · ${profile.phone}` : ""}</p>
               {!!result.matched_skills?.length && <div className="semantic-skills">{result.matched_skills.map(skill => <i key={skill}>{skill}</i>)}</div>}
               {result.matched_version && <small>Khớp tốt nhất từ <b>CV v{result.matched_version.version}</b> · {result.matched_version.filename}</small>}
               {!!result.evidence?.length && <blockquote>“{result.evidence[0].text || result.evidence[0].evidence || result.evidence[0].quote || "Có dữ liệu phù hợp trong CV đã lưu."}”</blockquote>}
               <details className="search-explanation"><summary>Vì sao xuất hiện?</summary><div>
-                {!!result.score_components && <div className="score-components">{Object.entries(result.score_components).map(([key, value]) => <span key={key}><small>{key.replaceAll("_", " ")}</small><b>{Math.round(value <= 1 ? value * 100 : value)}%</b></span>)}</div>}
+                <p className="ranking-disclaimer">Điểm dùng để sắp xếp kết quả, không phải xác suất tuyển dụng.</p>
+                {!!result.score_components && <div className="score-components">{Object.entries(result.score_components).map(([key, value]) => <span key={key}><small>{key.replaceAll("_", " ")}</small><b>{Math.round(value <= 1 ? value * 100 : value)}%</b>{result.applied_weights?.[key] != null && <em>Trọng số {Math.round(result.applied_weights[key])}%</em>}</span>)}</div>}
                 {!!result.evidence?.length && <ul>{result.evidence.map((item, evidenceIndex) => <li key={`${item.category || item.field || item.section}-${evidenceIndex}`}><b>{item.category || item.field || item.section || "Evidence"}</b><span>{item.text || item.evidence || item.quote}</span>{(item.version || item.source) && <small>{item.version ? `CV v${item.version}` : item.source}</small>}</li>)}</ul>}
                 {!!result.missing_skills?.length && <p className="missing-skills">Chưa tìm thấy: {result.missing_skills.join(", ")}</p>}
               </div></details>
+              {result.result_id && <div className="search-feedback"><span>Kết quả này phù hợp đến đâu?</span><div>{([
+                [0, "Không"], [1, "Một phần"], [2, "Phù hợp"], [3, "Rất phù hợp"],
+              ] as const).map(([grade, label]) => <button type="button" key={grade} disabled={feedbackBusy === result.result_id} className={feedbackByResult[result.result_id!] === grade ? "active" : ""} onClick={() => void submitSearchFeedback(result.result_id!, grade)}>{label}</button>)}</div>{feedbackByResult[result.result_id] != null && <small>Đã lưu đánh giá · mức 2–3 được tính là phù hợp.</small>}</div>}
             </div>
             <div className="semantic-actions"><button className="secondary compact" onClick={() => void openProfile(profile)}>Xem profile</button>{result.matched_version && <button className="secondary compact" disabled={versionBusy === result.matched_version.id} onClick={() => void openVersion(profile.id, result.matched_version!.id)}>{versionBusy === result.matched_version.id ? "Đang mở" : `Xem CV v${result.matched_version.version}`}</button>}</div>
           </article>;

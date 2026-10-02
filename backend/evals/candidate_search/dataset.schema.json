@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TalentFlow candidate search gold dataset",
+  "type": "object",
+  "required": ["dataset_version", "corpus", "queries"],
+  "properties": {
+    "dataset_version": {"type": "string", "minLength": 1},
+    "corpus": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "document", "skills", "experience_years"],
+        "properties": {
+          "id": {"type": "string"},
+          "document": {"type": "string", "minLength": 1},
+          "skills": {"type": "array", "items": {"type": "string"}},
+          "experience_years": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "language", "role_family", "relevance"],
+        "properties": {
+          "id": {"type": "string"},
+          "text": {"type": "string", "minLength": 2},
+          "language": {"type": "string"},
+          "role_family": {"type": "string"},
+          "required_skills": {"type": "array", "items": {"type": "string"}},
+          "preferred_skills": {"type": "array", "items": {"type": "string"}},
+          "minimum_experience": {"type": ["number", "null"], "minimum": 0},
+          "relevance": {
+            "type": "object",
+            "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 3}
+          }
+        }
+      }
+    }
+  }
+}

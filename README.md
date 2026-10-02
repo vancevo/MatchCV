@@ -132,10 +132,43 @@ Semantic Search dùng model BGE-M3 riêng và không gọi Hugging Face khi ngư
 ```bash
 cd backend
 .venv/bin/python scripts/download_embedding_model.py
-# sau đó đặt EMBEDDING_ENABLED=true trong .env
+.venv/bin/python scripts/download_reranker_model.py
+# sau đó đặt EMBEDDING_ENABLED=true và RERANKER_ENABLED=true trong .env
 ```
 
 Nếu model chưa được cài hoặc bị tắt, API vẫn hoạt động bằng keyword fallback và trả rõ `mode=KEYWORD_FALLBACK`.
+
+Candidate Search dùng scoring contract `candidate-search.v2`: top-K chunk từ BGE-M3/pgvector
+được hợp nhất với PostgreSQL full-text search, rồi rerank bounded top-N bằng
+`BAAI/bge-reranker-v2-m3`. SQLite dùng fallback tương đương để phát triển local. Kỹ năng/kinh
+nghiệm chỉ tham gia công thức khi người dùng thực sự cung cấp.
+`ranking_score` chỉ là điểm sắp xếp, không phải xác suất tuyển dụng; `confidence` để `null` cho
+đến khi có calibration trên dữ liệu được recruiter gán nhãn. Kỹ năng bắt buộc và kinh nghiệm tối
+thiểu là hard filter.
+
+Chạy smoke evaluation có nhãn tổng hợp để so sánh keyword, dense và hybrid:
+
+```bash
+cd backend
+.venv/bin/python -m evals.candidate_search.run_eval --mode keyword
+.venv/bin/python -m evals.candidate_search.run_eval --mode dense
+.venv/bin/python -m evals.candidate_search.run_eval --mode hybrid
+.venv/bin/python -m evals.candidate_search.run_eval --mode reranked
+```
+
+Dataset seed chỉ kiểm tra pipeline, không phải bằng chứng chất lượng production. Hãy thay hoặc mở
+rộng `evals/candidate_search/gold_queries.seed.json` bằng đánh giá mù của recruiter trước khi đặt
+release gate theo Precision@5, Recall@10/20, MRR hoặc nDCG@10.
+
+Xuất 24 CV hiện có thành pilot PII-free để recruiter chấm (output private đã bị Git ignore):
+
+```bash
+cd backend
+.venv/bin/python -m evals.candidate_search.export_pilot
+```
+
+Thang relevance là 0–3; mức 2 trở lên là relevant. Confidence chỉ được bật sau khi có ít nhất
+30 feedback gồm cả positive và negative rồi gọi endpoint rebuild calibration.
 
 ### 2. Frontend
 
@@ -284,6 +317,9 @@ Không commit `.env`, API key hoặc service-role key vào repository.
 | `POST` | `/api/mail-sandbox/test` | Gửi email test tới alias được chọn và trả recipient đã lưu |
 | `POST` | `/api/candidate-profiles/search` | Semantic Search trực tiếp trên toàn bộ CV version trong kho ứng viên |
 | `GET` | `/api/candidate-profiles/search/status` | Trạng thái model local và số bản ghi index theo trạng thái |
+| `POST` | `/api/candidate-profiles/search/feedback` | Lưu relevance 0–3 cho một kết quả search bất biến |
+| `GET` | `/api/candidate-profiles/search/metrics` | Latency, fallback, feedback distribution và trạng thái chunk index |
+| `POST` | `/api/candidate-profiles/search/calibration/rebuild` | Fit Platt calibration sau tối thiểu 30 đánh giá của recruiter |
 | `POST` | `/api/candidate-profiles/search/reindex` | Tạo lại semantic index cho tenant (`OWNER`/`ADMIN`) |
 | `GET` | `/api/candidate-profiles/{id}/resume-comparisons` | Danh sách phân tích thay đổi trung lập giữa các CV version |
 

@@ -60,3 +60,59 @@ def test_hard_filters_remove_candidates_that_do_not_satisfy_requirements():
 def test_weights_must_sum_to_one():
     with pytest.raises(ValueError):
         SearchWeights(semantic=0.9)
+
+
+def test_unused_business_signals_are_omitted_and_weights_are_renormalized():
+    result = rank_candidate_versions([
+        _match("candidate-a", "v1", 1, 0.8, {"react"}),
+    ], now=NOW)[0]
+
+    assert set(result.score_components) == {"semantic", "freshness"}
+    assert set(result.applied_weights) == {"semantic", "freshness"}
+    assert sum(result.applied_weights.values()) == pytest.approx(100, abs=0.01)
+    assert "required_skills" not in result.score_components
+    assert "preferred_skills" not in result.score_components
+    assert "experience" not in result.score_components
+
+
+def test_only_requested_business_signals_contribute_to_score():
+    result = rank_candidate_versions([
+        _match("candidate-a", "v1", 1, 0.8, {"react", "typescript"}, years=4),
+    ], required_skill_ids={"react"}, preferred_skill_ids={"typescript"},
+        minimum_experience=3, now=NOW)[0]
+
+    assert set(result.score_components) == {
+        "semantic", "required_skills", "preferred_skills", "experience", "freshness",
+    }
+    assert sum(result.applied_weights.values()) == pytest.approx(100, abs=0.01)
+
+
+def test_required_skills_can_be_enforced_as_a_hard_filter():
+    results = rank_candidate_versions([
+        _match("candidate-a", "v1", 1, 0.99, {"react"}),
+        _match("candidate-b", "v1", 1, 0.70, {"react", "typescript"}),
+    ], required_skill_ids={"react", "typescript"}, required_skills_are_hard_filter=True,
+        now=NOW)
+
+    assert [item.candidate_profile_id for item in results] == ["candidate-b"]
+
+
+def test_hybrid_retrieval_combines_dense_and_exact_term_signals():
+    result = rank_candidate_versions([
+        CandidateVersionMatch(
+            candidate_profile_id="candidate-a", resume_version_id="v1", version_number=1,
+            semantic_similarity=0.6, lexical_overlap=1.0, submitted_at=NOW,
+        ),
+    ], now=NOW)[0]
+
+    assert result.retrieval_components == {
+        "dense": 80.0,
+        "lexical": 100.0,
+        "hybrid": 84.0,
+    }
+    assert result.raw_lexical_overlap == 1.0
+
+
+def test_lexical_weight_is_bounded():
+    with pytest.raises(ValueError, match="lexical_weight"):
+        rank_candidate_versions([], lexical_weight=1.1)

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 import secrets
 import tempfile
@@ -44,8 +45,9 @@ from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config,
 from .master_seed import create_master_user, has_master_seed_config
 from .models import (
     AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
-    CandidateProfile, CandidateResumeVersion, ResumeVersionComparison, ResumeVersionEmbedding,
-    ResumeVersionSkill,
+    CandidateProfile, CandidateResumeVersion, CandidateSearchCalibration, CandidateSearchChunk,
+    CandidateSearchEvent, CandidateSearchFeedback, CandidateSearchResultEvent,
+    ResumeVersionComparison, ResumeVersionEmbedding, ResumeVersionSkill,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
     InterviewClaim, InterviewCrossAnalysisRun, InterviewPolicy, InterviewQAClaimLink,
     InterviewQAPair, InterviewQARequirementLink, InterviewScorecard, InterviewTranscriptSession,
@@ -59,8 +61,18 @@ from .candidate_profiles import (
     resume_extraction_snapshot,
 )
 from .resume_comparison import comparison_dict, ensure_resume_version_comparison, sync_resume_version_skills
-from .candidate_search import CandidateVersionMatch, cosine_similarity, rank_candidate_versions
+from .candidate_search import (
+    SEARCH_SCORE_VERSION,
+    CandidateVersionMatch,
+    apply_calibrated_confidence,
+    apply_reranker_scores,
+    cosine_similarity,
+    rank_candidate_versions,
+)
+from .candidate_search_repository import ChunkHit, retrieve_candidate_chunks
+from .candidate_search_calibration import CALIBRATION_METHOD, fit_platt_calibration
 from .embedding_service import EmbeddingUnavailable, get_embedding_service
+from .reranker_service import RerankerUnavailable, get_reranker_service
 from .semantic_index import index_resume_versions
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
 from .resume import (
@@ -251,6 +263,13 @@ class CandidateSearchRequest(BaseModel):
         if len(cleaned) < 2:
             raise ValueError("query must contain at least 2 visible characters")
         return cleaned
+
+
+class CandidateSearchFeedbackCreate(BaseModel):
+    result_id: str = Field(min_length=1, max_length=64)
+    relevance: int = Field(ge=0, le=3)
+    reason: str = Field(default="", max_length=80)
+    note: str = Field(default="", max_length=1000)
 
 
 class CriteriaUpdate(BaseModel):
@@ -900,6 +919,19 @@ def _erase_application(db, item: Application, reason: str) -> None:
     if version and not db.scalar(select(func.count()).select_from(Application).where(
         Application.resume_version_id == version.id
     )):
+        search_result_ids = list(db.scalars(select(CandidateSearchResultEvent.id).where(
+            CandidateSearchResultEvent.resume_version_id == version.id
+        )))
+        if search_result_ids:
+            db.execute(sql_delete(CandidateSearchFeedback).where(
+                CandidateSearchFeedback.result_event_id.in_(search_result_ids)
+            ))
+            db.execute(sql_delete(CandidateSearchResultEvent).where(
+                CandidateSearchResultEvent.id.in_(search_result_ids)
+            ))
+        db.execute(sql_delete(CandidateSearchChunk).where(
+            CandidateSearchChunk.resume_version_id == version.id
+        ))
         db.execute(sql_delete(ResumeVersionComparison).where(or_(
             ResumeVersionComparison.from_version_id == version.id,
             ResumeVersionComparison.to_version_id == version.id,
@@ -1537,6 +1569,8 @@ def clear_recruitment_data(
             ))
         # Delete in dependency order so the operation behaves consistently in SQLite and PostgreSQL.
         for model in (
+            CandidateSearchFeedback, CandidateSearchResultEvent, CandidateSearchEvent,
+            CandidateSearchChunk, CandidateSearchCalibration,
             FeedbackSummary, InterviewScorecard, OutboxEvent, SchedulingInvitation, Interview,
             ScreeningArtifact, AgentTask, AgentStep, AgentRun, BatchItem, ShortlistProposal,
             ApprovalRequest, CriteriaVersion, UploadBatch, ResumeVersionComparison, ResumeVersionEmbedding,
@@ -1613,7 +1647,9 @@ def list_candidate_profiles(
 
 def _search_result(db, ranked, profiles: dict[str, CandidateProfile],
                    versions: dict[str, CandidateResumeVersion],
-                   entries: dict[str, ResumeVersionEmbedding]) -> dict:
+                   entries: dict[str, ResumeVersionEmbedding], *, mode: str,
+                   result_event_id: str | None = None,
+                   calibration_version: str | None = None) -> dict:
     profile = profiles[ranked.candidate_profile_id]
     version = versions[ranked.matched_version_id]
     other_versions = [versions[value] for value in ranked.other_matching_version_ids if value in versions]
@@ -1621,8 +1657,32 @@ def _search_result(db, ranked, profiles: dict[str, CandidateProfile],
         "candidate_profile": candidate_profile_dict(db, profile),
         "matched_version": {"id": version.id, "version": version.version_number,
                             "filename": version.version_filename},
+        # Keep `score` during the API migration, but make its ranking-only meaning explicit.
         "score": ranked.score,
+        "ranking_score": ranked.score,
+        "result_id": result_event_id,
+        "score_version": SEARCH_SCORE_VERSION,
+        "score_interpretation": "RANKING_ONLY",
+        "confidence": ranked.confidence,
+        "confidence_interpretation": "P_RELEVANCE_GTE_2" if ranked.confidence is not None else None,
+        "calibration_version": calibration_version,
         "score_components": dict(ranked.score_components),
+        "applied_weights": dict(ranked.applied_weights),
+        "retrieval": {
+            "method": (
+                "HYBRID_BGE_M3_LEXICAL_RERANKED" if ranked.reranker_score is not None
+                else "HYBRID_BGE_M3_LEXICAL" if mode == "SEMANTIC" else "KEYWORD_OVERLAP"
+            ),
+            "dense_cosine": ranked.raw_semantic_similarity if mode == "SEMANTIC" else None,
+            "lexical_overlap": ranked.raw_lexical_overlap,
+            "normalized_score": ranked.score_components["semantic"],
+            "components": dict(ranked.retrieval_components),
+            "pre_rerank_score": ranked.pre_rerank_score,
+            "reranker_score": ranked.reranker_score,
+        },
+        "business": {
+            key: value for key, value in ranked.score_components.items() if key != "semantic"
+        },
         "matched_skills": list(ranked.matched_required_skills) or list(
             entries[version.id].canonical_skills or []
         ),
@@ -1641,28 +1701,63 @@ def _candidate_search_matches(
     *,
     query_vector: list[float] | None = None,
     query: str = "",
+    chunk_hits: list[ChunkHit] | None = None,
+    lexical_weight: float = 0.20,
 ) -> list[CandidateVersionMatch]:
     tokens = {token for token in re.findall(r"\w+", query.casefold(), flags=re.UNICODE) if len(token) > 1}
+    hits_by_version: dict[str, list[ChunkHit]] = {}
+    for hit in chunk_hits or []:
+        hits_by_version.setdefault(hit.resume_version_id, []).append(hit)
     matches = []
     for version in versions:
         entry = entries.get(version.id)
         if not entry:
             continue
-        if query_vector is not None and entry.status == "READY" and entry.embedding:
+        version_hits = hits_by_version.get(version.id, [])
+        best_hit = None
+        if chunk_hits:
+            if not version_hits:
+                continue
+            best_hit = max(version_hits, key=lambda value: (
+                ((value.dense_similarity + 1) / 2 if value.dense_similarity is not None else 0)
+                * (1 - lexical_weight) + value.lexical_score * lexical_weight
+            ))
+        if best_hit and best_hit.dense_similarity is not None:
+            similarity = best_hit.dense_similarity
+            lexical_overlap = best_hit.lexical_score
+        elif query_vector is not None and entry.status == "READY" and entry.embedding:
             similarity = cosine_similarity(query_vector, entry.embedding)
+            document_tokens = set(re.findall(r"\w+", entry.search_document.casefold(), flags=re.UNICODE))
+            lexical_overlap = len(tokens & document_tokens) / max(1, len(tokens))
         else:
             document_tokens = set(re.findall(r"\w+", entry.search_document.casefold(), flags=re.UNICODE))
-            similarity = len(tokens & document_tokens) / max(1, len(tokens))
+            overlap = len(tokens & document_tokens) / max(1, len(tokens))
+            # Keep semantic_similarity on the same [-1, 1] scale as cosine.
+            similarity = overlap * 2 - 1
+            lexical_overlap = overlap
         skills = frozenset(str(value).casefold() for value in (entry.canonical_skills or []))
-        evidence_text = next((line for line in entry.search_document.splitlines()
-                              if tokens & set(re.findall(r"\w+", line.casefold(), flags=re.UNICODE))), "")
-        evidence = ({"text": evidence_text or entry.search_document[:360], "category": "CV",
-                     "resume_version_id": version.id, "version": version.version_number},)
+        if best_hit:
+            evidence = ({
+                "text": best_hit.text,
+                "category": best_hit.section_type,
+                "section": best_hit.section_type,
+                "chunk_id": best_hit.chunk_id,
+                "match_method": "SEMANTIC_CHUNK" if best_hit.dense_similarity is not None else "LEXICAL_CHUNK",
+                "resume_version_id": version.id,
+                "version": version.version_number,
+            },)
+        else:
+            evidence_text = next((line for line in entry.search_document.splitlines()
+                                  if tokens & set(re.findall(r"\w+", line.casefold(), flags=re.UNICODE))), "")
+            evidence = ({"text": evidence_text or entry.search_document[:360], "category": "CV",
+                         "match_method": "LEXICAL_LINE" if evidence_text else "DOCUMENT_CONTEXT",
+                         "resume_version_id": version.id, "version": version.version_number},)
         matches.append(CandidateVersionMatch(
             candidate_profile_id=version.candidate_profile_id,
             resume_version_id=version.id,
             version_number=version.version_number,
             semantic_similarity=similarity,
+            lexical_overlap=lexical_overlap,
             skill_ids=skills,
             experience_years=entry.experience_years,
             submitted_at=version.submitted_at,
@@ -1675,7 +1770,9 @@ def _candidate_search_matches(
 def search_candidate_profiles(
     payload: CandidateSearchRequest,
     owner_id: str = Depends(current_tenant_id),
+    actor_id: str = Depends(current_user_id),
 ) -> dict:
+    started = time.perf_counter()
     query = payload.query.strip()
     with session_scope() as db:
         versions = list(db.scalars(select(CandidateResumeVersion).where(
@@ -1711,6 +1808,16 @@ def search_candidate_profiles(
         matches = _candidate_search_matches(
             versions, entries_by_version, query_vector=query_vector if mode == "SEMANTIC" else None,
             query=query,
+            chunk_hits=retrieve_candidate_chunks(
+                db,
+                owner_id=owner_id,
+                version_ids=[value.id for value in versions],
+                query=query,
+                query_vector=query_vector if mode == "SEMANTIC" else None,
+                config=runtime.config,
+                limit=max(100, payload.limit * 10),
+            ),
+            lexical_weight=get_settings().candidate_search_lexical_weight,
         )
         required = [value.strip().casefold() for value in payload.filters.required_skill_ids if value.strip()]
         preferred = [value.strip().casefold() for value in payload.filters.preferred_skill_ids if value.strip()]
@@ -1719,22 +1826,90 @@ def search_candidate_profiles(
             required_skill_ids=required,
             preferred_skill_ids=preferred,
             minimum_experience=payload.filters.minimum_experience,
+            required_skills_are_hard_filter=bool(required),
             minimum_experience_is_hard_filter=payload.filters.minimum_experience is not None,
-            limit=payload.limit,
+            lexical_weight=get_settings().candidate_search_lexical_weight,
+            limit=max(payload.limit, get_reranker_service().config.top_k),
         )
         if mode == "KEYWORD_FALLBACK":
             ranked = [value for value in ranked if value.score_components["semantic"] > 50]
+        reranker_warning = None
+        reranker = get_reranker_service()
+        if mode == "SEMANTIC" and reranker.config.enabled and ranked:
+            candidates = ranked[:reranker.config.top_k]
+            try:
+                reranker_scores = reranker.score_pairs(
+                    query,
+                    [str(value.evidence[0].get("text") or "") if value.evidence else ""
+                     for value in candidates],
+                )
+                reranked_head = apply_reranker_scores(
+                    candidates, reranker_scores, weight=reranker.config.weight,
+                )
+                ranked = [*reranked_head, *ranked[reranker.config.top_k:]]
+            except (RerankerUnavailable, RuntimeError) as exc:
+                reranker_warning = f"Reranker chưa sẵn sàng ({exc}); giữ nguyên xếp hạng hybrid."
+        ranked = ranked[:payload.limit]
+        calibration = db.scalar(select(CandidateSearchCalibration).where(
+            CandidateSearchCalibration.owner_id == owner_id,
+            CandidateSearchCalibration.score_version == SEARCH_SCORE_VERSION,
+            CandidateSearchCalibration.status == "ACTIVE",
+        ).order_by(CandidateSearchCalibration.fitted_at.desc()))
+        if calibration:
+            ranked = apply_calibrated_confidence(ranked, calibration.parameters or {})
         profiles = {value.id: value for value in db.scalars(select(CandidateProfile).where(
             CandidateProfile.owner_id == owner_id,
             CandidateProfile.id.in_([value.candidate_profile_id for value in ranked]),
         ))} if ranked else {}
         versions_by_id = {value.id: value for value in versions}
+        search_event = CandidateSearchEvent(
+            id=str(uuid4()), owner_id=owner_id, actor_id=actor_id,
+            query_hash=hashlib.sha256(query.casefold().encode("utf-8")).hexdigest(),
+            filters=payload.filters.model_dump(), mode=mode,
+            score_version=SEARCH_SCORE_VERSION,
+            embedding_model=runtime.config.model_name,
+            embedding_revision=runtime.config.model_revision,
+            reranker_model=(reranker.config.model_name if ranked and ranked[0].reranker_score is not None else ""),
+            result_count=len(ranked),
+            latency_ms=round((time.perf_counter() - started) * 1000, 3),
+            fallback_reason=warning or index_result.get("warning") or reranker_warning or "",
+        )
+        db.add(search_event)
+        result_events: dict[str, CandidateSearchResultEvent] = {}
+        for rank, value in enumerate(ranked, start=1):
+            evidence_chunk_id = None
+            if value.evidence:
+                raw_chunk_id = value.evidence[0].get("chunk_id")
+                evidence_chunk_id = str(raw_chunk_id) if raw_chunk_id else None
+            result_event = CandidateSearchResultEvent(
+                id=str(uuid4()), owner_id=owner_id, search_event_id=search_event.id,
+                candidate_profile_id=value.candidate_profile_id,
+                resume_version_id=value.matched_version_id,
+                evidence_chunk_id=evidence_chunk_id,
+                rank=rank, ranking_score=value.score,
+                dense_cosine=value.raw_semantic_similarity if mode == "SEMANTIC" else None,
+                lexical_score=value.raw_lexical_overlap,
+                reranker_score=value.reranker_score,
+                score_components=dict(value.score_components),
+            )
+            db.add(result_event)
+            result_events[value.candidate_profile_id] = result_event
+        db.flush()
         return {
+            "search_id": search_event.id,
             "query": query,
             "mode": mode,
+            "score_version": SEARCH_SCORE_VERSION,
+            "score_interpretation": "RANKING_ONLY",
             "semantic_available": mode == "SEMANTIC",
-            "warning": warning or index_result.get("warning"),
-            "results": [_search_result(db, value, profiles, versions_by_id, entries_by_version)
+            "confidence_calibrated": calibration is not None,
+            "calibration_version": calibration.version if calibration else None,
+            "warning": warning or index_result.get("warning") or reranker_warning,
+            "results": [_search_result(
+                db, value, profiles, versions_by_id, entries_by_version, mode=mode,
+                result_event_id=result_events[value.candidate_profile_id].id,
+                calibration_version=calibration.version if calibration else None,
+            )
                         for value in ranked],
         }
 
@@ -1745,7 +1920,162 @@ def candidate_search_status(owner_id: str = Depends(current_tenant_id)) -> dict:
         counts = dict(db.execute(select(
             ResumeVersionEmbedding.status, func.count(),
         ).where(ResumeVersionEmbedding.owner_id == owner_id).group_by(ResumeVersionEmbedding.status)).all())
-    return {"runtime": get_embedding_service().status(), "index": counts}
+        chunk_counts = dict(db.execute(select(
+            CandidateSearchChunk.status, func.count(),
+        ).where(CandidateSearchChunk.owner_id == owner_id).group_by(CandidateSearchChunk.status)).all())
+        calibration = db.scalar(select(CandidateSearchCalibration).where(
+            CandidateSearchCalibration.owner_id == owner_id,
+            CandidateSearchCalibration.score_version == SEARCH_SCORE_VERSION,
+            CandidateSearchCalibration.status == "ACTIVE",
+        ).order_by(CandidateSearchCalibration.fitted_at.desc()))
+    return {
+        "runtime": get_embedding_service().status(),
+        "reranker": get_reranker_service().status(),
+        "index": counts,
+        "chunk_index": chunk_counts,
+        "search": {
+            "score_version": SEARCH_SCORE_VERSION,
+            "score_interpretation": "RANKING_ONLY",
+            "retrieval": "HYBRID_BGE_M3_LEXICAL",
+            "lexical_weight": get_settings().candidate_search_lexical_weight,
+            "confidence_calibrated": calibration is not None,
+            "calibration_version": calibration.version if calibration else None,
+            "calibration_samples": calibration.sample_count if calibration else 0,
+        },
+    }
+
+
+@app.post("/api/candidate-profiles/search/feedback")
+def record_candidate_search_feedback(
+    payload: CandidateSearchFeedbackCreate,
+    owner_id: str = Depends(current_tenant_id),
+    actor_id: str = Depends(current_user_id),
+) -> dict:
+    with session_scope() as db:
+        result = db.scalar(select(CandidateSearchResultEvent).where(
+            CandidateSearchResultEvent.id == payload.result_id,
+            CandidateSearchResultEvent.owner_id == owner_id,
+        ))
+        if not result:
+            raise HTTPException(404, "Candidate search result not found")
+        value = db.scalar(select(CandidateSearchFeedback).where(
+            CandidateSearchFeedback.result_event_id == result.id,
+            CandidateSearchFeedback.actor_id == actor_id,
+        ))
+        if not value:
+            value = CandidateSearchFeedback(
+                id=str(uuid4()), owner_id=owner_id,
+                result_event_id=result.id, actor_id=actor_id,
+                relevance=payload.relevance,
+            )
+            db.add(value)
+        value.relevance = payload.relevance
+        value.reason = payload.reason.strip()
+        value.note = payload.note.strip()
+        value.updated_at = datetime.now(timezone.utc)
+        audit(db, owner_id, None, "CANDIDATE_SEARCH_FEEDBACK_RECORDED", {
+            "result_id": result.id, "relevance": value.relevance, "reason": value.reason,
+        }, actor={"id": actor_id})
+        db.flush()
+        return {
+            "id": value.id, "result_id": value.result_event_id,
+            "relevance": value.relevance, "reason": value.reason,
+            "updated_at": value.updated_at,
+        }
+
+
+@app.post("/api/candidate-profiles/search/calibration/rebuild")
+def rebuild_candidate_search_calibration(
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+    actor_id: str = Depends(current_user_id),
+) -> dict:
+    minimum_samples = 30
+    with session_scope() as db:
+        rows = list(db.execute(select(
+            CandidateSearchResultEvent.ranking_score,
+            CandidateSearchFeedback.relevance,
+        ).join(
+            CandidateSearchFeedback,
+            CandidateSearchFeedback.result_event_id == CandidateSearchResultEvent.id,
+        ).where(
+            CandidateSearchResultEvent.owner_id == owner_id,
+        )).all())
+        if len(rows) < minimum_samples:
+            raise HTTPException(
+                409,
+                f"Calibration requires at least {minimum_samples} human judgments; found {len(rows)}",
+            )
+        try:
+            fit = fit_platt_calibration(
+                [float(row.ranking_score) for row in rows],
+                [int(row.relevance) for row in rows],
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        for previous in db.scalars(select(CandidateSearchCalibration).where(
+            CandidateSearchCalibration.owner_id == owner_id,
+            CandidateSearchCalibration.status == "ACTIVE",
+        )):
+            previous.status = "SUPERSEDED"
+        version = f"candidate-search.calibration.{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        calibration = CandidateSearchCalibration(
+            id=str(uuid4()), owner_id=owner_id, version=version,
+            score_version=SEARCH_SCORE_VERSION, method=CALIBRATION_METHOD,
+            parameters=fit.parameters(), metrics=fit.metrics(),
+            sample_count=fit.sample_count, status="ACTIVE",
+            fitted_at=datetime.now(timezone.utc),
+        )
+        db.add(calibration)
+        audit(db, owner_id, None, "CANDIDATE_SEARCH_CALIBRATION_REBUILT", {
+            "version": version, "sample_count": fit.sample_count,
+            "metrics": fit.metrics(),
+        }, actor={"id": actor_id})
+        return {
+            "version": version, "method": CALIBRATION_METHOD,
+            "score_version": SEARCH_SCORE_VERSION,
+            "sample_count": fit.sample_count,
+            "parameters": fit.parameters(), "metrics": fit.metrics(),
+        }
+
+
+@app.get("/api/candidate-profiles/search/metrics")
+def candidate_search_quality_metrics(
+    days: int = Query(30, ge=1, le=365),
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as db:
+        events = list(db.scalars(select(CandidateSearchEvent).where(
+            CandidateSearchEvent.owner_id == owner_id,
+            CandidateSearchEvent.created_at >= since,
+        )))
+        feedback = list(db.scalars(select(CandidateSearchFeedback).where(
+            CandidateSearchFeedback.owner_id == owner_id,
+            CandidateSearchFeedback.created_at >= since,
+        )))
+        chunk_counts = dict(db.execute(select(
+            CandidateSearchChunk.status, func.count(),
+        ).where(CandidateSearchChunk.owner_id == owner_id).group_by(CandidateSearchChunk.status)).all())
+    latencies = sorted(float(value.latency_ms) for value in events)
+    p95_index = int((len(latencies) - 1) * 0.95) if latencies else 0
+    distribution = {str(grade): sum(value.relevance == grade for value in feedback) for grade in range(4)}
+    return {
+        "window_days": days,
+        "searches": len(events),
+        "results_returned": sum(value.result_count for value in events),
+        "fallback_rate": round(sum(bool(value.fallback_reason) for value in events) / len(events), 4) if events else 0.0,
+        "latency_ms": {
+            "average": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+            "p95": round(latencies[p95_index], 3) if latencies else 0.0,
+        },
+        "feedback": {
+            "count": len(feedback),
+            "distribution": distribution,
+            "positive_rate": round(sum(value.relevance >= 2 for value in feedback) / len(feedback), 4) if feedback else None,
+        },
+        "chunk_index": chunk_counts,
+        "privacy": {"raw_query_stored": False, "raw_cv_stored_in_telemetry": False},
+    }
 
 
 @app.post("/api/candidate-profiles/search/reindex")

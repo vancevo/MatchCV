@@ -250,6 +250,129 @@ class ResumeVersionEmbedding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class CandidateSearchChunk(Base):
+    """PII-free, section-level semantic evidence for one immutable CV version."""
+
+    __tablename__ = "candidate_search_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "resume_version_id", "section_type", "ordinal", "model_name", "model_revision",
+            "template_version", name="uq_candidate_search_chunk_version",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    candidate_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    resume_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    section_type: Mapped[str] = mapped_column(String(80), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list] = mapped_column(Vector1024(), default=list)
+    model_name: Mapped[str] = mapped_column(String(160))
+    model_revision: Mapped[str] = mapped_column(String(120), default="")
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    template_version: Mapped[str] = mapped_column(String(80))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class CandidateSearchEvent(Base):
+    """PII-minimized search telemetry; raw queries are deliberately not persisted."""
+
+    __tablename__ = "candidate_search_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    actor_id: Mapped[str] = mapped_column(String(320), default="", index=True)
+    query_hash: Mapped[str] = mapped_column(String(64), index=True)
+    filters: Mapped[dict] = mapped_column(JSON, default=dict)
+    mode: Mapped[str] = mapped_column(String(40))
+    score_version: Mapped[str] = mapped_column(String(80))
+    embedding_model: Mapped[str] = mapped_column(String(160), default="")
+    embedding_revision: Mapped[str] = mapped_column(String(120), default="")
+    reranker_model: Mapped[str] = mapped_column(String(160), default="")
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    fallback_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class CandidateSearchResultEvent(Base):
+    """Auditable score snapshot for one result returned by a search event."""
+
+    __tablename__ = "candidate_search_result_events"
+    __table_args__ = (
+        UniqueConstraint("search_event_id", "rank", name="uq_candidate_search_result_rank"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    search_event_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_search_events.id", ondelete="CASCADE"), index=True
+    )
+    candidate_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    resume_version_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_resume_versions.id", ondelete="CASCADE"), index=True
+    )
+    evidence_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("candidate_search_chunks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    rank: Mapped[int] = mapped_column(Integer)
+    ranking_score: Mapped[float] = mapped_column(Float)
+    dense_cosine: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lexical_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reranker_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_components: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class CandidateSearchFeedback(Base):
+    """Explicit human relevance judgment attached to an immutable search result snapshot."""
+
+    __tablename__ = "candidate_search_feedback"
+    __table_args__ = (
+        UniqueConstraint("result_event_id", "actor_id", name="uq_candidate_search_feedback_actor"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    result_event_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_search_result_events.id", ondelete="CASCADE"), index=True
+    )
+    actor_id: Mapped[str] = mapped_column(String(320), default="", index=True)
+    relevance: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(String(80), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class CandidateSearchCalibration(Base):
+    """Versioned score-to-probability mapping fitted from explicit recruiter judgments."""
+
+    __tablename__ = "candidate_search_calibrations"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "version", name="uq_candidate_search_calibration_version"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[str] = mapped_column(String(80))
+    score_version: Mapped[str] = mapped_column(String(80))
+    method: Mapped[str] = mapped_column(String(40), default="PLATT")
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="ACTIVE", index=True)
+    fitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Application(Base):
     __tablename__ = "applications"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))

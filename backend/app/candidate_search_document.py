@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 
 TEMPLATE_VERSION = "candidate-search.v1"
+CHUNK_TEMPLATE_VERSION = "candidate-search.chunk.v1"
 _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE = re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){8,15}(?!\w)")
 
@@ -22,6 +23,15 @@ class CandidateSearchDocument:
     template_version: str
     canonical_skills: tuple[str, ...]
     experience_years: float
+
+
+@dataclass(frozen=True)
+class CandidateSearchChunkDocument:
+    section_type: str
+    ordinal: int
+    text: str
+    content_hash: str
+    template_version: str = CHUNK_TEMPLATE_VERSION
 
 
 def redact_pii(text: str, pii_values: Iterable[str] = ()) -> str:
@@ -144,3 +154,52 @@ def build_candidate_search_document(
         canonical_skills=tuple(skills),
         experience_years=years,
     )
+
+
+def build_candidate_search_chunks(
+    document: CandidateSearchDocument,
+    *,
+    maximum_characters: int = 900,
+) -> tuple[CandidateSearchChunkDocument, ...]:
+    """Split a stable PII-free search document into section evidence chunks."""
+    if maximum_characters < 100:
+        raise ValueError("maximum_characters must be at least 100")
+    chunks: list[CandidateSearchChunkDocument] = []
+    section_ordinals: dict[str, int] = {}
+    for line in document.text.splitlines():
+        label, separator, value = line.partition(":")
+        section = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "other"
+        body = value.strip() if separator else line.strip()
+        if not body:
+            continue
+        values = [item.strip() for item in body.split(";") if item.strip()]
+        groups: list[list[str]] = []
+        current: list[str] = []
+        current_size = len(label) + 2
+        for item in values or [body]:
+            additional = len(item) + (2 if current else 0)
+            if current and current_size + additional > maximum_characters:
+                groups.append(current)
+                current = []
+                current_size = len(label) + 2
+            current.append(item)
+            current_size += additional
+        if current:
+            groups.append(current)
+        for group in groups:
+            ordinal = section_ordinals.get(section, 0)
+            text = f"{label.strip()}: {'; '.join(group)}"
+            payload = json.dumps(
+                {"template": CHUNK_TEMPLATE_VERSION, "section": section,
+                 "ordinal": ordinal, "text": text},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+            chunks.append(CandidateSearchChunkDocument(
+                section_type=section,
+                ordinal=ordinal,
+                text=text,
+                content_hash=hashlib.sha256(payload).hexdigest(),
+            ))
+            section_ordinals[section] = ordinal + 1
+    return tuple(chunks)

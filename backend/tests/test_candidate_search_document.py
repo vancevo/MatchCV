@@ -1,4 +1,8 @@
-from app.candidate_search_document import build_candidate_search_document, redact_pii
+from app.candidate_search_document import (
+    build_candidate_search_chunks,
+    build_candidate_search_document,
+    redact_pii,
+)
 
 
 def test_search_document_is_structured_and_removes_candidate_pii():
@@ -57,3 +61,22 @@ def test_search_document_flattens_structured_experience_project_and_education():
     assert "Backend Engineer - Acme - Built APIs" in document.text
     assert "ERP - Inventory platform" in document.text
     assert "BSc - Computer Science - HCMUT" in document.text
+
+
+def test_search_chunks_are_section_scoped_stable_and_keep_no_pii():
+    document = build_candidate_search_document({
+        "candidate": {"name": "Nguyễn Văn A", "email": "a@example.com"},
+        "profile": {
+            "skills": ["Python", "FastAPI", "PostgreSQL"],
+            "projects": ["Payment gateway", "Fraud detection"],
+            "summary": "Nguyễn Văn A built banking services. Contact a@example.com.",
+        },
+    })
+
+    first = build_candidate_search_chunks(document, maximum_characters=100)
+    second = build_candidate_search_chunks(document, maximum_characters=100)
+
+    assert first == second
+    assert {chunk.section_type for chunk in first} >= {"canonical_skills", "projects", "professional_summary"}
+    assert all(len(chunk.content_hash) == 64 for chunk in first)
+    assert all("Nguyễn Văn A" not in chunk.text and "a@example.com" not in chunk.text for chunk in first)

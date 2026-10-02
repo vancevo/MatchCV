@@ -34,6 +34,17 @@ def _positive_int(name: str, default: int, maximum: int) -> int:
     return value
 
 
+def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if value < minimum or value > maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str
@@ -62,6 +73,7 @@ class Settings:
     talentflow_model_enabled: bool
     talentflow_max_input_tokens: int
     talentflow_max_new_tokens: int
+    candidate_search_lexical_weight: float
     max_upload_mb: int
     resume_storage_dir: str
     resume_storage_backend: str
@@ -184,6 +196,9 @@ class Settings:
             talentflow_model_enabled=_boolean("TALENTFLOW_MODEL_ENABLED", True),
             talentflow_max_input_tokens=_positive_int("TALENTFLOW_MAX_INPUT_TOKENS", 8192, 32768),
             talentflow_max_new_tokens=_positive_int("TALENTFLOW_MAX_NEW_TOKENS", 2048, 8192),
+            candidate_search_lexical_weight=_bounded_float(
+                "CANDIDATE_SEARCH_LEXICAL_WEIGHT", 0.20, 0.0, 1.0
+            ),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
             resume_storage_dir=os.getenv("RESUME_STORAGE_DIR", "uploads").strip() or "uploads",
             resume_storage_backend=resume_storage_backend,

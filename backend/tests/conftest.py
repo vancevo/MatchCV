@@ -30,6 +30,7 @@ os.environ["INTERVIEW_ANALYSIS_MODELS"] = (
 )
 os.environ["COLAB_LLM_ENDPOINT_URL"] = ""
 os.environ["COLAB_LLM_MODEL"] = ""
+os.environ["RERANKER_ENABLED"] = "false"
 
 config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
 command.upgrade(config, "head")

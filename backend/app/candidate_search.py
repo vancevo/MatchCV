@@ -7,9 +7,13 @@ and pgvector repositories can share the same scoring contract.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Sequence
+
+
+SEARCH_SCORE_VERSION = "candidate-search.v2"
+DEFAULT_LEXICAL_WEIGHT = 0.20
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class CandidateVersionMatch:
     resume_version_id: str
     version_number: int
     semantic_similarity: float
+    lexical_overlap: float | None = None
     skill_ids: frozenset[str] = field(default_factory=frozenset)
     experience_years: float = 0.0
     submitted_at: datetime | None = None
@@ -44,11 +49,18 @@ class RankedCandidate:
     matched_version_id: str
     matched_version_number: int
     score: float
+    raw_semantic_similarity: float
+    raw_lexical_overlap: float | None
+    retrieval_components: Mapping[str, float]
     score_components: Mapping[str, float]
+    applied_weights: Mapping[str, float]
     matched_required_skills: tuple[str, ...]
     missing_required_skills: tuple[str, ...]
     other_matching_version_ids: tuple[str, ...]
     evidence: tuple[Mapping[str, object], ...]
+    pre_rerank_score: float | None = None
+    reranker_score: float | None = None
+    confidence: float | None = None
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -62,7 +74,9 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 def _coverage(actual: frozenset[str], expected: frozenset[str]) -> float:
-    return 1.0 if not expected else len(actual & expected) / len(expected)
+    if not expected:
+        raise ValueError("Coverage is undefined when no skills were requested")
+    return len(actual & expected) / len(expected)
 
 
 def _experience_score(actual: float, minimum: float | None) -> float:
@@ -88,12 +102,29 @@ def rank_candidate_versions(
     required_skills_are_hard_filter: bool = False,
     minimum_experience_is_hard_filter: bool = False,
     weights: SearchWeights = SearchWeights(),
+    lexical_weight: float = DEFAULT_LEXICAL_WEIGHT,
     now: datetime | None = None,
     limit: int = 20,
 ) -> list[RankedCandidate]:
+    if not 0 <= lexical_weight <= 1:
+        raise ValueError("lexical_weight must be between 0 and 1")
     required = frozenset(required_skill_ids)
     preferred = frozenset(preferred_skill_ids)
     current = now or datetime.now(timezone.utc)
+    active_weights = {
+        "semantic": weights.semantic,
+        "freshness": weights.freshness,
+    }
+    if required:
+        active_weights["required_skills"] = weights.required_skills
+    if preferred:
+        active_weights["preferred_skills"] = weights.preferred_skills
+    if minimum_experience is not None and minimum_experience > 0:
+        active_weights["experience"] = weights.experience
+    active_total = sum(active_weights.values())
+    normalized_weights = {
+        name: value / active_total for name, value in active_weights.items()
+    }
     scored: list[tuple[CandidateVersionMatch, float, dict[str, float]]] = []
     for item in matches:
         if required_skills_are_hard_filter and not required.issubset(item.skill_ids):
@@ -101,15 +132,21 @@ def rank_candidate_versions(
         if minimum_experience_is_hard_filter and minimum_experience is not None and item.experience_years < minimum_experience:
             continue
         # Cosine is [-1, 1]; ranking components use a stable [0, 1] range.
-        semantic = min(1.0, max(0.0, (item.semantic_similarity + 1.0) / 2.0))
-        components = {
+        dense = min(1.0, max(0.0, (item.semantic_similarity + 1.0) / 2.0))
+        lexical = None if item.lexical_overlap is None else min(1.0, max(0.0, item.lexical_overlap))
+        semantic = dense if lexical is None else dense * (1 - lexical_weight) + lexical * lexical_weight
+        all_components = {
             "semantic": semantic,
-            "required_skills": _coverage(item.skill_ids, required),
-            "preferred_skills": _coverage(item.skill_ids, preferred),
-            "experience": _experience_score(item.experience_years, minimum_experience),
             "freshness": _freshness_score(item.submitted_at, current),
         }
-        score = sum(components[name] * getattr(weights, name) for name in components)
+        if required:
+            all_components["required_skills"] = _coverage(item.skill_ids, required)
+        if preferred:
+            all_components["preferred_skills"] = _coverage(item.skill_ids, preferred)
+        if "experience" in normalized_weights:
+            all_components["experience"] = _experience_score(item.experience_years, minimum_experience)
+        components = {name: all_components[name] for name in normalized_weights}
+        score = sum(components[name] * normalized_weights[name] for name in components)
         scored.append((item, score, components))
 
     by_profile: dict[str, list[tuple[CandidateVersionMatch, float, dict[str, float]]]] = {}
@@ -125,7 +162,18 @@ def rank_candidate_versions(
             matched_version_id=best.resume_version_id,
             matched_version_number=best.version_number,
             score=round(score * 100, 2),
+            raw_semantic_similarity=round(best.semantic_similarity, 6),
+            raw_lexical_overlap=(
+                round(best.lexical_overlap, 6) if best.lexical_overlap is not None else None
+            ),
+            retrieval_components={
+                "dense": round(min(1.0, max(0.0, (best.semantic_similarity + 1.0) / 2.0)) * 100, 2),
+                **({"lexical": round(best.lexical_overlap * 100, 2)}
+                   if best.lexical_overlap is not None else {}),
+                "hybrid": round(components["semantic"] * 100, 2),
+            },
             score_components={key: round(value * 100, 2) for key, value in components.items()},
+            applied_weights={key: round(value * 100, 2) for key, value in normalized_weights.items()},
             matched_required_skills=tuple(sorted(best.skill_ids & required)),
             missing_required_skills=tuple(sorted(required - best.skill_ids)),
             other_matching_version_ids=tuple(value[0].resume_version_id for value in versions[1:]),
@@ -133,3 +181,35 @@ def rank_candidate_versions(
         ))
     results.sort(key=lambda item: (item.score, item.matched_version_number), reverse=True)
     return results[:max(0, limit)]
+
+
+def apply_reranker_scores(
+    ranked: Sequence[RankedCandidate],
+    scores: Sequence[float],
+    *,
+    weight: float,
+) -> list[RankedCandidate]:
+    if len(ranked) != len(scores):
+        raise ValueError("Reranker scores must align with ranked candidates")
+    if not 0 <= weight <= 1:
+        raise ValueError("reranker weight must be between 0 and 1")
+    values = [replace(
+        item,
+        pre_rerank_score=item.score,
+        reranker_score=round(min(1.0, max(0.0, float(score))) * 100, 2),
+        score=round(((item.score / 100) * (1 - weight) + min(1.0, max(0.0, float(score))) * weight) * 100, 2),
+    ) for item, score in zip(ranked, scores)]
+    values.sort(key=lambda item: (item.score, item.matched_version_number), reverse=True)
+    return values
+
+
+def apply_calibrated_confidence(
+    ranked: Sequence[RankedCandidate],
+    parameters: Mapping[str, float],
+) -> list[RankedCandidate]:
+    from .candidate_search_calibration import calibrated_probability
+
+    return [replace(
+        item,
+        confidence=round(calibrated_probability(item.score, dict(parameters)), 4),
+    ) for item in ranked]
