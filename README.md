@@ -100,6 +100,19 @@ Các điểm sau **chưa phải tích hợp production**:
 | Database | SQLite / PostgreSQL + pgvector | Versioned artifacts, embeddings, proposals, approvals và dữ liệu nghiệp vụ |
 | Deploy | Docker Compose, Render | Local stack và cloud services |
 
+### Kho CV IT và TalentFlow Search
+
+Repo có sub-project [`cv-warehouse`](./cv-warehouse) làm nguồn CV IT độc lập. Kho CV chịu trách nhiệm upload, extract metadata, BGE-M3 Hybrid Semantic Search và API key scoped. Trong màn hình Hồ sơ ứng viên, recruiter nhấn **Lấy CV từ kho** để TalentFlow đồng bộ các CV chưa có vào talent pool nội bộ.
+
+Phân chia trách nhiệm:
+
+- Kho CV IT lưu CV gốc, metadata, chunk và semantic index.
+- TalentFlow phân trang toàn bộ danh sách, so checksum trước khi tải và bỏ qua CV đã được nhập.
+- CV mới được chuẩn hoá thành hồ sơ ứng viên hoặc một CV version mới; bước đồng bộ không tự tạo application.
+- Tìm kiếm theo mô tả/JD chỉ chạy trên hồ sơ và CV version đã được đồng bộ vào TalentFlow.
+
+Chạy toàn bộ stack bằng `docker compose up --build`. Kho CV UI ở `http://localhost:3100`, API ở `http://localhost:8100`; TalentFlow UI vẫn ở `http://localhost:3000`.
+
 Evidence từ OpenRouter chỉ được chấp nhận khi là trích dẫn xuất hiện nguyên văn trong CV. Trước khi gửi CV đến provider, backend che tên đã nhận diện, email và số điện thoại phổ biến. Đây chưa phải cơ chế ẩn danh hóa toàn diện; không dùng dữ liệu thật trước khi hoàn tất đánh giá bảo mật và chính sách xử lý dữ liệu.
 
 ## Chạy local

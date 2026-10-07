@@ -33,6 +33,10 @@ services:
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
       EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
       CANDIDATE_SEARCH_LEXICAL_WEIGHT: ${CANDIDATE_SEARCH_LEXICAL_WEIGHT:-0.20}
+      CV_WAREHOUSE_ENABLED: ${CV_WAREHOUSE_ENABLED:-true}
+      CV_WAREHOUSE_API_URL: http://cv-warehouse-backend:8100
+      CV_WAREHOUSE_API_KEY: ${CV_WAREHOUSE_API_KEY:-local-cv-warehouse-key}
+      CV_WAREHOUSE_TIMEOUT_SECONDS: ${CV_WAREHOUSE_TIMEOUT_SECONDS:-20}
       RERANKER_ENABLED: ${RERANKER_ENABLED:-false}
       RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       RERANKER_MODEL_PATH: /app/models/bge-reranker-v2-m3
@@ -54,6 +58,50 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  cv-warehouse-frontend:
+    build: ./cv-warehouse/frontend
+    ports: ["3100:3100"]
+    environment:
+      NEXT_PUBLIC_CV_WAREHOUSE_API_URL: http://localhost:8100
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    depends_on: [cv-warehouse-backend]
+
+  cv-warehouse-backend:
+    build: ./cv-warehouse/backend
+    ports: ["8100:8100"]
+    environment:
+      DATABASE_URL: postgresql://cvwarehouse:cvwarehouse@cv-postgres:5432/cvwarehouse
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      CV_WAREHOUSE_API_KEY: ${CV_WAREHOUSE_API_KEY:-local-cv-warehouse-key}
+      DEFAULT_TENANT_ID: ${CV_WAREHOUSE_DEFAULT_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+      EMBEDDING_ENABLED: ${CV_WAREHOUSE_EMBEDDING_ENABLED:-true}
+      EMBEDDING_MODEL_PATH: /app/models/bge-m3
+      RERANKER_ENABLED: ${CV_WAREHOUSE_RERANKER_ENABLED:-false}
+      RERANKER_MODEL_PATH: /app/models/bge-reranker-v2-m3
+      CORS_ORIGINS: http://localhost:3100,http://localhost:3000
+    volumes:
+      - cv_warehouse_uploads:/app/uploads
+      - ./backend/models:/app/models:ro
+    depends_on:
+      cv-postgres:
+        condition: service_healthy
+
+  cv-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cvwarehouse
+      POSTGRES_USER: cvwarehouse
+      POSTGRES_PASSWORD: cvwarehouse
+    volumes: [cv_postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cvwarehouse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   worker:
     build: ./backend
@@ -122,3 +170,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  cv_postgres_data:
+  cv_warehouse_uploads:

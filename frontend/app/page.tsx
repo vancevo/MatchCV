@@ -97,10 +97,33 @@ type CandidateSearchResponse = {
   search_id?: string; query: string; mode: string; score_version?: string; score_interpretation?: "RANKING_ONLY";
   semantic_available?: boolean; warning?: string; results: CandidateSearchResult[];
 };
+type WarehouseImportReport = {
+  imported: { cv_id: string; filename?: string; profile_id: string; profile_name: string; resume_version_id: string; version: number; status: "NEW_PROFILE" | "NEW_VERSION"; warnings: { type: string; message: string }[] }[];
+  skipped: { cv_id: string; filename?: string; profile_id?: string; resume_version_id?: string; reason: string; message: string }[];
+  conflicts: { cv_id: string; filename?: string; type: string; blocking: boolean; message: string; profile_ids?: string[] }[];
+  failed: { cv_id: string; type: string; error: string }[];
+  summary: { requested: number; imported: number; new_profiles: number; new_versions: number; skipped: number; conflicts: number; failed: number };
+};
 type Job = {
   id: string; title: string; department: string; location: string; description: string; status: string; applications_count: number;
   requirements?: { required_skills?: string[]; preferred_skills?: string[]; minimum_experience?: number; approval?: { status: string; note?: string; version?: number }; shortlist_approval?: { status: string; application_ids?: string[] } };
 };
+type CandidateSearchMode = "TEXT" | "JOB";
+
+function candidateQueryFromJob(job: Job, criteria?: { requiredSkills: string[]; preferredSkills: string[]; minimumExperience: number | null }) {
+  const requirements = job.requirements || {};
+  const requiredSkills = criteria?.requiredSkills ?? requirements.required_skills ?? [];
+  const preferredSkills = criteria?.preferredSkills ?? requirements.preferred_skills ?? [];
+  const minimumExperience = criteria ? criteria.minimumExperience : requirements.minimum_experience;
+  const parts = [
+    `Vị trí: ${job.title}`,
+    requiredSkills.length ? `Kỹ năng bắt buộc: ${requiredSkills.join(", ")}` : "",
+    preferredSkills.length ? `Kỹ năng ưu tiên: ${preferredSkills.join(", ")}` : "",
+    minimumExperience != null ? `Kinh nghiệm tối thiểu: ${minimumExperience} năm` : "",
+    job.description?.trim() ? `Mô tả: ${job.description.trim().replace(/\s+/g, " ")}` : "",
+  ].filter(Boolean);
+  return parts.join(". ").slice(0, 500);
+}
 type Interview = { id: string; application_id: string; start_at: string; end_at?: string; status: string; meeting_url: string; provider?: string; timezone?: string; reschedule_count?: number; outcome?: string };
 type PublicSchedule = { candidate_name: string; job_title: string; timezone: string; duration_minutes: number; expires_at: string; mode: "schedule" | "reschedule"; interview?: Interview; slots: { start_at: string; duration_minutes: number }[] };
 type Dashboard = {
@@ -509,6 +532,7 @@ function RecruiterApp() {
   const latest = dashboard.applications[0];
   const chartScores = dashboard.applications.slice(0, 7).reverse().map(item => item.screening.final_score);
   const activeTitle = active === "Ứng viên" ? "Hồ sơ ứng tuyển"
+    : active === "Kho ứng viên" ? "Hồ sơ ứng viên"
     : active === "Lịch sử" ? "Lịch sử hoạt động"
     : active === "Xoá dữ liệu" ? "Quản lý dữ liệu"
     : active;
@@ -874,7 +898,7 @@ function RecruiterApp() {
         </section>}
 
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport} onJobChanged={loadDashboard}/>
-        : active === "Kho ứng viên" ? <CandidateProfilesView query={query} onOpenApplication={applicationId => {
+        : active === "Kho ứng viên" ? <CandidateProfilesView query={query} jobs={dashboard.jobs} onOpenApplication={applicationId => {
             const application = dashboard.applications.find(item => item.id === applicationId);
             if (application) { setSelected(application); setActive("Ứng viên"); }
           }}/>
@@ -3558,8 +3582,9 @@ function ComparisonGroup({ tone, title, items }: {
   )}</ul></section>;
 }
 
-function CandidateProfilesView({ query, onOpenApplication }: {
+function CandidateProfilesView({ query, jobs, onOpenApplication }: {
   query: string;
+  jobs: Job[];
   onOpenApplication: (applicationId: string) => void;
 }) {
   const [profiles, setProfiles] = useState<CandidateProfile[]>([]);
@@ -3571,6 +3596,10 @@ function CandidateProfilesView({ query, onOpenApplication }: {
   const [comparisons, setComparisons] = useState<ResumeComparison[]>([]);
   const [comparisonBusy, setComparisonBusy] = useState(false);
   const [comparisonError, setComparisonError] = useState("");
+  const [searchMode, setSearchMode] = useState<CandidateSearchMode>("TEXT");
+  const [selectedSearchJobId, setSelectedSearchJobId] = useState("");
+  const [reviewedSearchJobId, setReviewedSearchJobId] = useState("");
+  const [criteriaReviewJob, setCriteriaReviewJob] = useState<Job | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [requiredSkills, setRequiredSkills] = useState("");
   const [preferredSkills, setPreferredSkills] = useState("");
@@ -3579,9 +3608,13 @@ function CandidateProfilesView({ query, onOpenApplication }: {
   const [maximumRankingScore, setMaximumRankingScore] = useState(100);
   const [latestCvOnly, setLatestCvOnly] = useState(false);
   const [searchResponse, setSearchResponse] = useState<CandidateSearchResponse | null>(null);
+  const [crawlBusy, setCrawlBusy] = useState(false);
+  const [crawlMessage, setCrawlMessage] = useState("");
+  const [warehouseImportReport, setWarehouseImportReport] = useState<WarehouseImportReport | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [fallbackQuery, setFallbackQuery] = useState("");
+  const [lastSearchLabel, setLastSearchLabel] = useState("");
   const [feedbackByResult, setFeedbackByResult] = useState<Record<string, number>>({});
   const [feedbackBusy, setFeedbackBusy] = useState("");
 
@@ -3603,6 +3636,38 @@ function CandidateProfilesView({ query, onOpenApplication }: {
   }, [profiles, query, fallbackQuery]);
   const totalVersions = profiles.reduce((sum, profile) => sum + profile.resume_count, 0);
   const returningCandidates = profiles.filter(profile => profile.resume_count > 1).length;
+  const approvedJobs = useMemo(() => jobs.filter(job => job.requirements?.approval?.status === "APPROVED"), [jobs]);
+  const selectedSearchJob = approvedJobs.find(job => job.id === selectedSearchJobId);
+
+  const changeSearchMode = (mode: CandidateSearchMode) => {
+    setSearchMode(mode); setSearchResponse(null); setCrawlMessage(""); setFallbackQuery(""); setSearchError(""); setLastSearchLabel(""); setFeedbackByResult({});
+    setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience("");
+    setReviewedSearchJobId(""); setCriteriaReviewJob(null);
+    if (mode === "TEXT") setSelectedSearchJobId("");
+  };
+
+  const selectSearchJob = (jobId: string) => {
+    setSelectedSearchJobId(jobId); setSearchResponse(null); setCrawlMessage(""); setFallbackQuery(""); setSearchError(""); setLastSearchLabel("");
+    const job = approvedJobs.find(item => item.id === jobId);
+    setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience(""); setReviewedSearchJobId("");
+    setCriteriaReviewJob(job || null);
+  };
+
+  const confirmSearchCriteria = (criteria: { requiredSkills: string[]; preferredSkills: string[]; minimumExperience: number | null }) => {
+    if (!criteriaReviewJob) return;
+    setRequiredSkills(criteria.requiredSkills.join(", "));
+    setPreferredSkills(criteria.preferredSkills.join(", "));
+    setMinimumExperience(criteria.minimumExperience == null ? "" : String(criteria.minimumExperience));
+    setReviewedSearchJobId(criteriaReviewJob.id);
+    setCriteriaReviewJob(null);
+  };
+
+  const closeSearchCriteriaReview = () => {
+    if (criteriaReviewJob && reviewedSearchJobId !== criteriaReviewJob.id) {
+      setSelectedSearchJobId(""); setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience("");
+    }
+    setCriteriaReviewJob(null);
+  };
 
   const openProfile = async (profile: CandidateProfile) => {
     setSelectedProfile(profile); setProfileError(""); setComparisonError(""); setComparisons([]); setComparisonBusy(true);
@@ -3631,34 +3696,67 @@ function CandidateProfilesView({ query, onOpenApplication }: {
 
   const runSemanticSearch = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const semanticQuery = searchQuery.trim();
+    if (searchMode === "JOB" && !selectedSearchJob) {
+      setSearchResponse(null); setFallbackQuery(""); setSearchError("Hãy chọn một tin tuyển dụng đã duyệt."); return;
+    }
+    if (searchMode === "JOB" && selectedSearchJob && reviewedSearchJobId !== selectedSearchJob.id) {
+      setSearchResponse(null); setFallbackQuery(""); setSearchError("Hãy xác nhận tiêu chí bắt buộc và không bắt buộc trước khi tìm.");
+      setCriteriaReviewJob(selectedSearchJob); return;
+    }
+    const requiredSkillIds = requiredSkills.split(",").map(value => value.trim()).filter(Boolean);
+    const preferredSkillIds = preferredSkills.split(",").map(value => value.trim()).filter(Boolean);
+    const experienceFilter = minimumExperience ? Number(minimumExperience) : null;
+    const semanticQuery = searchMode === "JOB" && selectedSearchJob ? candidateQueryFromJob(selectedSearchJob, {
+      requiredSkills: requiredSkillIds, preferredSkills: preferredSkillIds, minimumExperience: experienceFilter,
+    }) : searchQuery.trim();
     if (!semanticQuery) { setSearchResponse(null); setFallbackQuery(""); setSearchError(""); return; }
     setSearchBusy(true); setSearchError(""); setFallbackQuery("");
     try {
+      const filters = {
+        required_skills: requiredSkillIds,
+        preferred_skills: preferredSkillIds,
+        minimum_experience: experienceFilter,
+      };
       const response = await request<CandidateSearchResponse>("/api/candidate-profiles/search", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: semanticQuery,
           filters: {
-            required_skill_ids: requiredSkills.split(",").map(value => value.trim()).filter(Boolean),
-            preferred_skill_ids: preferredSkills.split(",").map(value => value.trim()).filter(Boolean),
-            minimum_experience: minimumExperience ? Number(minimumExperience) : null,
+            required_skill_ids: filters.required_skills,
+            preferred_skill_ids: filters.preferred_skills,
+            minimum_experience: filters.minimum_experience,
             latest_cv_only: latestCvOnly,
           },
           limit: 20,
         }),
       });
-      setSearchResponse(response);
+      setSearchResponse(response); setCrawlMessage("");
+      setLastSearchLabel(searchMode === "JOB" && selectedSearchJob ? `JD: ${selectedSearchJob.title}` : semanticQuery);
       setFeedbackByResult({});
     } catch (error) {
-      setSearchResponse(null); setFallbackQuery(semanticQuery);
-      setSearchError(`${error instanceof Error ? error.message : "Semantic Search chưa sẵn sàng"}. Đang dùng tìm kiếm chính xác trong kho.`);
+      setSearchResponse(null);
+      setSearchError(error instanceof Error ? error.message : "Semantic Search từ Kho CV chưa sẵn sàng");
     } finally { setSearchBusy(false); }
   };
 
   const resetSearch = () => {
-    setSearchQuery(""); setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience(""); setMinimumRankingScore(0); setMaximumRankingScore(100); setLatestCvOnly(false);
-    setSearchResponse(null); setFallbackQuery(""); setSearchError(""); setFeedbackByResult({});
+    setSelectedSearchJobId(""); setSearchQuery(""); setRequiredSkills(""); setPreferredSkills(""); setMinimumExperience(""); setMinimumRankingScore(0); setMaximumRankingScore(100); setLatestCvOnly(false);
+    setReviewedSearchJobId(""); setCriteriaReviewJob(null);
+    setSearchResponse(null); setCrawlMessage(""); setFallbackQuery(""); setSearchError(""); setLastSearchLabel(""); setFeedbackByResult({});
+  };
+
+  const syncWarehouseCvs = async () => {
+    setCrawlBusy(true); setCrawlMessage(""); setSearchError("");
+    try {
+      const result = await request<WarehouseImportReport>("/api/cv-warehouse/sync", { method: "POST" });
+      setCrawlMessage(`Đồng bộ hoàn tất: ${result.summary.imported} CV mới · ${result.summary.skipped} CV đã có · ${result.summary.conflicts + result.summary.failed} conflict/lỗi.`);
+      setWarehouseImportReport(result);
+      setProfiles(await request<CandidateProfile[]>("/api/candidate-profiles?limit=100"));
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Không lấy được CV vào TalentFlow";
+      setSearchError(message); return null;
+    } finally { setCrawlBusy(false); }
   };
 
   const submitSearchFeedback = async (resultId: string, relevance: number) => {
@@ -3689,17 +3787,23 @@ function CandidateProfilesView({ query, onOpenApplication }: {
       <article><span>Ứng viên quay lại</span><strong>{returningCandidates}</strong><small>Có từ 2 phiên bản CV trở lên</small></article>
     </section>
     <section className="panel talent-pool">
-      <div className="panel-head"><div><h2>Kho ứng viên</h2><p>Mỗi người là một hồ sơ duy nhất, gom toàn bộ CV và lịch sử ứng tuyển.</p></div><span className="pool-count">{searchResponse ? semanticResults.length : visibleProfiles.length} hồ sơ</span></div>
+      <div className="panel-head"><div><h2>Hồ sơ ứng viên</h2><p>Chỉ tìm trên hồ sơ và CV version đã được đưa vào, chuẩn hoá và lập chỉ mục trong TalentFlow.</p></div><div className="candidate-pool-actions"><span className="pool-count">{searchResponse ? semanticResults.length : visibleProfiles.length} hồ sơ</span><button type="button" className="primary compact" disabled={crawlBusy} onClick={() => void syncWarehouseCvs()}><Icon name="upload"/>{crawlBusy ? "Đang lấy CV..." : "Lấy CV từ kho"}</button></div></div>
+      {warehouseImportReport && <WarehouseSyncReport report={warehouseImportReport}/>}
       <form className="talent-search" onSubmit={runSemanticSearch}>
-        <div className="talent-search-main"><Icon name="spark"/><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="Mô tả ứng viên cần tìm, ví dụ: Frontend có React, TypeScript và từng làm ERP..."/><button className="primary compact" disabled={searchBusy}>{searchBusy ? "Đang tìm..." : "Tìm bằng AI"}</button>{(searchQuery || searchResponse) && <button type="button" className="search-reset" onClick={resetSearch} aria-label="Xoá tìm kiếm">×</button>}</div>
+        <div className="talent-search-local-source"><Icon name="check"/><span>Nguồn tìm kiếm: hồ sơ ứng viên nội bộ của TalentFlow</span></div>
+        <div className="talent-search-modes" role="tablist" aria-label="Cách tìm ứng viên"><button type="button" role="tab" aria-selected={searchMode === "TEXT"} className={searchMode === "TEXT" ? "active" : ""} onClick={() => changeSearchMode("TEXT")}><Icon name="search"/><span><b>Nhập mô tả</b><small>Tìm trên CV đã chuẩn hoá</small></span></button><button type="button" role="tab" aria-selected={searchMode === "JOB"} className={searchMode === "JOB" ? "active" : ""} onClick={() => changeSearchMode("JOB")}><Icon name="briefcase"/><span><b>Chọn tin tuyển dụng</b><small>Đối chiếu JD với hồ sơ TalentFlow</small></span></button></div>
+        {searchMode === "TEXT" ? <div className="talent-search-main"><Icon name="spark"/><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="Mô tả ứng viên cần tìm, ví dụ: Frontend có React, TypeScript và từng làm ERP..."/><button className="primary compact" disabled={searchBusy}>{searchBusy ? "Đang tìm..." : "Tìm bằng AI"}</button>{(searchQuery || searchResponse) && <button type="button" className="search-reset" onClick={resetSearch} aria-label="Xoá tìm kiếm">×</button>}</div>
+        : <div className="talent-search-job"><Icon name="briefcase"/><label><span>Tin tuyển dụng đã duyệt</span><select value={selectedSearchJobId} onChange={event => selectSearchJob(event.target.value)}><option value="">Chọn tin tuyển dụng...</option>{approvedJobs.map(job => <option key={job.id} value={job.id}>{job.title}{job.department ? ` · ${job.department}` : ""}</option>)}</select></label><button className="primary compact" disabled={searchBusy || !selectedSearchJob || reviewedSearchJobId !== selectedSearchJob.id}>{searchBusy ? "Đang tìm..." : "Tìm ứng viên"}</button>{(selectedSearchJobId || searchResponse) && <button type="button" className="search-reset" onClick={resetSearch} aria-label="Xoá tìm kiếm">×</button>}</div>}
+        {searchMode === "JOB" && <div className={`job-search-source ${selectedSearchJob && reviewedSearchJobId === selectedSearchJob.id ? "ready" : ""}`}>{selectedSearchJob ? <><div><b>{selectedSearchJob.title}</b><span>{selectedSearchJob.department || "Chưa có phòng ban"}{selectedSearchJob.location ? ` · ${selectedSearchJob.location}` : ""}</span></div><small>{reviewedSearchJobId === selectedSearchJob.id ? <>HR đã xác nhận tiêu chí cho lần tìm kiếm này. <button type="button" onClick={() => setCriteriaReviewJob(selectedSearchJob)}>Duyệt lại</button></> : "Đang chờ HR xác nhận tiêu chí bắt buộc và không bắt buộc."}</small></> : <><div><b>Chưa chọn tin tuyển dụng</b><span>{approvedJobs.length ? `${approvedJobs.length} tin có tiêu chí đã duyệt` : "Chưa có tin nào đã duyệt tiêu chí"}</span></div><small>Chọn tin để mở bước duyệt tiêu chí trước khi tìm.</small></>}</div>}
         <div className="talent-search-criteria"><label>Kỹ năng bắt buộc <input value={requiredSkills} onChange={event => setRequiredSkills(event.target.value)} placeholder="React, TypeScript"/></label><label>Kỹ năng ưu tiên <input value={preferredSkills} onChange={event => setPreferredSkills(event.target.value)} placeholder="ERP, Next.js"/></label></div>
         <div className="talent-search-filters"><label>Kinh nghiệm tối thiểu <input type="number" min="0" max="50" value={minimumExperience} onChange={event => setMinimumExperience(event.target.value)} placeholder="Năm"/></label><label className="score-range-field"><span>Điểm xếp hạng <b>{minimumRankingScore}–{maximumRankingScore}</b></span><div className="score-range-control"><div className="score-range-track"><i style={{ left: `${minimumRankingScore}%`, right: `${100 - maximumRankingScore}%` }}/></div><input aria-label="Điểm tối thiểu" type="range" min="0" max="100" step="1" value={minimumRankingScore} onChange={event => setMinimumRankingScore(Math.min(Number(event.target.value), maximumRankingScore))}/><input aria-label="Điểm tối đa" type="range" min="0" max="100" step="1" value={maximumRankingScore} onChange={event => setMaximumRankingScore(Math.max(Number(event.target.value), minimumRankingScore))}/></div><small><i>0</i><i>100</i></small></label><label className="search-check"><input type="checkbox" checked={latestCvOnly} onChange={event => setLatestCvOnly(event.target.checked)}/> Chỉ CV mới nhất</label><span>Kỹ năng bắt buộc và kinh nghiệm tối thiểu là điều kiện loại.</span></div>
       </form>
-      {searchResponse && <div className="search-summary"><div><Icon name="spark"/><b>{semanticResults.length} kết quả</b><span>cho “{searchResponse.query}”{minimumRankingScore > 0 || maximumRankingScore < 100 ? ` · điểm ${minimumRankingScore}–${maximumRankingScore}` : ""}</span></div><i>{searchResponse.mode === "SEMANTIC" ? "Semantic Search" : searchResponse.mode}</i></div>}
+      {crawlMessage && <div className="search-fallback warehouse-success"><Icon name="check"/>{crawlMessage}</div>}
+      {searchResponse && <div className="search-summary"><div><Icon name="spark"/><b>{semanticResults.length} kết quả</b><span>cho “{lastSearchLabel || searchResponse.query}”{minimumRankingScore > 0 || maximumRankingScore < 100 ? ` · điểm ${minimumRankingScore}–${maximumRankingScore}` : ""}</span></div><i>{searchMode === "JOB" ? "JD Search" : searchResponse.mode === "SEMANTIC" ? "Semantic Search" : searchResponse.mode}</i></div>}
       {searchResponse?.warning && <div className="search-fallback"><Icon name="search"/>{searchResponse.warning}</div>}
       {searchError && <div className="search-fallback"><Icon name="search"/>{searchError}</div>}
       {profileError && !selectedProfile && <div className="error-banner"><b>Không tải được kho ứng viên.</b> {profileError}</div>}
-      {searchBusy ? <div className="semantic-loading"><i/><div><b>Đang tìm trong các phiên bản CV</b><span>BGE-M3 đang đối chiếu nội dung đa ngôn ngữ và evidence đã lưu.</span></div></div>
+      {searchBusy ? <div className="semantic-loading"><i/><div><b>Đang tìm trong hồ sơ TalentFlow</b><span>Đối chiếu các CV version đã được nhập và evidence đã lưu.</span></div></div>
       : searchResponse ? <div className="semantic-results">
         {semanticResults.map((result, index) => {
           const profile = result.candidate_profile;
@@ -3773,7 +3877,80 @@ function CandidateProfilesView({ query, onOpenApplication }: {
       </aside>
     </div>}
     {versionResume && <ResumeViewer resume={versionResume} candidateName={selectedProfile?.name || "Ứng viên"} onClose={() => setVersionResume(null)}/>}
+    {criteriaReviewJob && <SearchCriteriaReviewModal
+      job={criteriaReviewJob}
+      initialRequired={reviewedSearchJobId === criteriaReviewJob.id ? requiredSkills.split(",").map(value => value.trim()).filter(Boolean) : criteriaReviewJob.requirements?.required_skills || []}
+      initialPreferred={reviewedSearchJobId === criteriaReviewJob.id ? preferredSkills.split(",").map(value => value.trim()).filter(Boolean) : criteriaReviewJob.requirements?.preferred_skills || []}
+      initialExperience={reviewedSearchJobId === criteriaReviewJob.id && minimumExperience !== "" ? Number(minimumExperience) : criteriaReviewJob.requirements?.minimum_experience ?? null}
+      onClose={closeSearchCriteriaReview}
+      onConfirm={confirmSearchCriteria}
+    />}
   </>;
+}
+
+function WarehouseSyncReport({ report }: { report: WarehouseImportReport }) {
+  return <div className="warehouse-import-report warehouse-sync-report">
+    <div className="warehouse-import-summary"><span><b>{report.summary.new_profiles}</b> hồ sơ mới</span><span><b>{report.summary.new_versions}</b> version mới</span><span><b>{report.summary.skipped}</b> đã có/bỏ qua</span><span className={report.summary.conflicts || report.summary.failed ? "warn" : ""}><b>{report.summary.conflicts + report.summary.failed}</b> conflict/lỗi</span></div>
+    {!!report.imported.length && <section><h3>Đã cập nhật</h3>{report.imported.map(item => <p key={`${item.cv_id}-${item.resume_version_id}`}><b>{item.profile_name}</b><span>{item.status === "NEW_PROFILE" ? "Tạo hồ sơ mới" : `Tạo CV version ${item.version}`}</span>{item.warnings.map(warning => <small key={warning.type}>{warning.message}</small>)}</p>)}</section>}
+    {!!report.skipped.length && <details><summary>{report.skipped.length} CV đã tồn tại — không tải lại</summary><section>{report.skipped.map(item => <p key={item.cv_id}><b>{item.filename || item.cv_id}</b><span>{item.message}</span></p>)}</section></details>}
+    {!!report.conflicts.length && <section className="conflicts"><h3>Conflict cần xử lý</h3>{report.conflicts.map(item => <p key={`${item.cv_id}-${item.type}`}><b>{item.filename || item.cv_id}</b><span>{item.message}</span><small>{item.type}</small></p>)}</section>}
+    {!!report.failed.length && <section className="conflicts"><h3>Lỗi đồng bộ</h3>{report.failed.map(item => <p key={item.cv_id}><b>{item.cv_id}</b><span>{item.error}</span></p>)}</section>}
+  </div>;
+}
+
+function SearchCriteriaReviewModal({ job, initialRequired, initialPreferred, initialExperience, onClose, onConfirm }: {
+  job: Job;
+  initialRequired: string[];
+  initialPreferred: string[];
+  initialExperience: number | null;
+  onClose: () => void;
+  onConfirm: (criteria: { requiredSkills: string[]; preferredSkills: string[]; minimumExperience: number | null }) => void;
+}) {
+  const [items, setItems] = useState(() => {
+    const unique = new Map<string, { value: string; required: boolean }>();
+    initialRequired.forEach(value => unique.set(value.toLocaleLowerCase("vi"), { value, required: true }));
+    initialPreferred.forEach(value => {
+      const key = value.toLocaleLowerCase("vi");
+      if (!unique.has(key)) unique.set(key, { value, required: false });
+    });
+    return Array.from(unique.values());
+  });
+  const [newCriterion, setNewCriterion] = useState("");
+  const [newRequired, setNewRequired] = useState(true);
+  const [experience, setExperience] = useState(initialExperience == null ? "" : String(initialExperience));
+  const addCriterion = () => {
+    const value = newCriterion.trim();
+    if (!value) return;
+    setItems(current => current.some(item => item.value.toLocaleLowerCase("vi") === value.toLocaleLowerCase("vi"))
+      ? current.map(item => item.value.toLocaleLowerCase("vi") === value.toLocaleLowerCase("vi") ? { ...item, required: newRequired } : item)
+      : [...current, { value, required: newRequired }]);
+    setNewCriterion("");
+  };
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    onConfirm({
+      requiredSkills: items.filter(item => item.required).map(item => item.value),
+      preferredSkills: items.filter(item => !item.required).map(item => item.value),
+      minimumExperience: experience === "" ? null : Number(experience),
+    });
+  };
+  return <div className="modal-layer"><form className="modal form-modal search-criteria-review" onSubmit={submit}>
+    <button type="button" className="close" onClick={onClose}>×</button>
+    <span className="eyebrow">DUYỆT TRƯỚC KHI TÌM</span><h2>Tiêu chí · {job.title}</h2>
+    <p>Hệ thống đã extraction các kỹ năng dưới đây. HR tick những tiêu chí thực sự bắt buộc; tiêu chí bỏ tick vẫn được dùng để ưu tiên kết quả và không loại ứng viên.</p>
+    <div className="search-criteria-list">
+      {items.map((item, index) => <label className={item.required ? "required" : "preferred"} key={`${item.value}-${index}`}>
+        <input type="checkbox" checked={item.required} onChange={event => setItems(current => current.map((entry, currentIndex) => currentIndex === index ? { ...entry, required: event.target.checked } : entry))}/>
+        <span><b>{item.value}</b><small>{item.required ? "Bắt buộc — có thể loại ứng viên" : "Không bắt buộc — chỉ dùng để ưu tiên"}</small></span>
+        <button type="button" aria-label={`Xoá ${item.value}`} onClick={() => setItems(current => current.filter((_, currentIndex) => currentIndex !== index))}>×</button>
+      </label>)}
+      {!items.length && <div className="search-criteria-empty">Chưa có tiêu chí. HR có thể bổ sung bên dưới.</div>}
+    </div>
+    <div className="search-criteria-add"><input value={newCriterion} onChange={event => setNewCriterion(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); addCriterion(); } }} placeholder="Thêm kỹ năng hoặc tiêu chí"/><select value={newRequired ? "required" : "preferred"} onChange={event => setNewRequired(event.target.value === "required")}><option value="required">Bắt buộc</option><option value="preferred">Không bắt buộc</option></select><button type="button" className="secondary compact" onClick={addCriterion}>Thêm</button></div>
+    <label className="search-experience"><span>Kinh nghiệm tối thiểu</span><input type="number" min="0" max="50" value={experience} onChange={event => setExperience(event.target.value)} placeholder="Số năm"/></label>
+    <div className="search-criteria-review-summary"><span><b>{items.filter(item => item.required).length}</b> bắt buộc</span><span><b>{items.filter(item => !item.required).length}</b> không bắt buộc</span></div>
+    <div className="search-criteria-actions"><button type="button" className="secondary compact" onClick={onClose}>Huỷ</button><button className="primary compact">Xác nhận và tiếp tục</button></div>
+  </form></div>;
 }
 
 function BatchStatusPanel({ batch, actionBusy, pendingAction, onRetry }: { batch: BatchResult; actionBusy: boolean; pendingAction: PendingAction | null; onRetry: (batchId: string, itemId: string) => Promise<void> }) {

@@ -1,0 +1,45 @@
+services:
+  frontend:
+    build: ./frontend
+    ports: ["3100:3100"]
+    environment:
+      NEXT_PUBLIC_CV_WAREHOUSE_API_URL: http://localhost:8100
+    depends_on: [backend]
+
+  backend:
+    build: ./backend
+    ports: ["8100:8100"]
+    environment:
+      DATABASE_URL: postgresql://cvwarehouse:cvwarehouse@postgres:5432/cvwarehouse
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      CV_WAREHOUSE_API_KEY: ${CV_WAREHOUSE_API_KEY:-local-cv-warehouse-key}
+      DEFAULT_TENANT_ID: ${CV_WAREHOUSE_DEFAULT_TENANT_ID:-00000000-0000-0000-0000-000000000001}
+      EMBEDDING_ENABLED: ${EMBEDDING_ENABLED:-true}
+      EMBEDDING_MODEL_PATH: /app/models/bge-m3
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-false}
+      RERANKER_MODEL_PATH: /app/models/bge-reranker-v2-m3
+    volumes:
+      - cv_uploads:/app/uploads
+      - ../backend/models:/app/models:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cvwarehouse
+      POSTGRES_USER: cvwarehouse
+      POSTGRES_PASSWORD: cvwarehouse
+    volumes: [cv_postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cvwarehouse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  cv_postgres:
+  cv_uploads:

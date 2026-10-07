@@ -11,6 +11,11 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+*.tsbuildinfo
+cv-warehouse/frontend/node_modules/
+cv-warehouse/frontend/.next/
+cv-warehouse/backend/uploads/
+cv-warehouse/backend/models/
 backend/uploads/
 backend/backups/
 backend/evals/private/

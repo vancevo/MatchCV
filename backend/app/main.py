@@ -40,6 +40,7 @@ from .auth import (
     current_user_id, require_tenant_role,
 )
 from .config import get_settings
+from .cv_warehouse_client import CvWarehouseClient, CvWarehouseError
 from .database import SessionLocal, session_scope
 from .llm import extract_requirements_ai, generate_interview_kit_ai, llm_config, screen_candidate_ai, transcribe_audio_ai
 from .master_seed import create_master_user, has_master_seed_config
@@ -58,7 +59,7 @@ from .models import (
 )
 from .candidate_profiles import (
     candidate_phone, candidate_profile_dict, create_resume_version, resolve_candidate_profile,
-    resume_extraction_snapshot,
+    normalize_email, normalize_phone, resume_extraction_snapshot,
 )
 from .resume_comparison import comparison_dict, ensure_resume_version_comparison, sync_resume_version_skills
 from .candidate_search import (
@@ -263,6 +264,30 @@ class CandidateSearchRequest(BaseModel):
         if len(cleaned) < 2:
             raise ValueError("query must contain at least 2 visible characters")
         return cleaned
+
+
+class CvWarehouseFilters(BaseModel):
+    required_skills: list[str] = Field(default_factory=list, max_length=30)
+    preferred_skills: list[str] = Field(default_factory=list, max_length=30)
+    minimum_experience: float | None = Field(default=None, ge=0, le=60)
+    maximum_experience: float | None = Field(default=None, ge=0, le=60)
+    specialization: str | None = Field(default=None, max_length=40)
+    location: str | None = Field(default=None, max_length=200)
+    source: str | None = Field(default=None, max_length=120)
+
+
+class CvWarehouseSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=5000)
+    filters: CvWarehouseFilters = Field(default_factory=CvWarehouseFilters)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class CvWarehouseCrawlRequest(BaseModel):
+    cv_ids: list[str] = Field(min_length=1, max_length=20)
+
+
+class CvWarehouseImportRequest(BaseModel):
+    cv_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 class CandidateSearchFeedbackCreate(BaseModel):
@@ -2155,6 +2180,341 @@ def rebuild_resume_version_comparisons(
                 if comparison:
                     rebuilt.append(comparison.id)
         return {"profile_id": profile_id, "rebuilt": len(rebuilt), "comparison_ids": rebuilt}
+
+
+def _warehouse_http_error(exc: CvWarehouseError) -> HTTPException:
+    return HTTPException(503, str(exc))
+
+
+@app.get("/api/cv-warehouse/status")
+async def cv_warehouse_status(owner_id: str = Depends(current_tenant_id)) -> dict:
+    try:
+        remote = await CvWarehouseClient().status(owner_id)
+    except CvWarehouseError as exc:
+        if not settings.cv_warehouse_enabled:
+            return {"enabled": False, "ready": False, "detail": str(exc)}
+        raise _warehouse_http_error(exc) from exc
+    return {"enabled": True, "ready": remote.get("status") == "ready", "remote": remote}
+
+
+@app.get("/api/cv-warehouse/cvs")
+async def list_cv_warehouse(
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=100, ge=1, le=100),
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    try:
+        result = await CvWarehouseClient().list_cvs(owner_id, query=q, limit=limit)
+    except CvWarehouseError as exc:
+        raise _warehouse_http_error(exc) from exc
+    return {**result, "source": "CV_WAREHOUSE"}
+
+
+@app.post("/api/cv-warehouse/import")
+async def import_cv_warehouse_profiles(
+    payload: CvWarehouseImportRequest,
+    owner_id: str = Depends(current_tenant_id),
+    actor: dict[str, str] = Depends(current_actor),
+) -> dict:
+    """Import warehouse CVs into the tenant talent pool without creating job applications."""
+    unique_ids = list(dict.fromkeys(payload.cv_ids))
+    imported: list[dict] = []
+    skipped: list[dict] = []
+    conflicts: list[dict] = []
+    failed: list[dict] = []
+    client = CvWarehouseClient()
+    for cv_id in unique_ids:
+        try:
+            remote = await client.get_cv(owner_id, cv_id)
+            content = await client.download_cv(owner_id, cv_id)
+            text = str(remote.get("extracted_text") or "").strip()
+            if len(text) < 20:
+                raise CvWarehouseError("CV không có đủ nội dung đã trích xuất")
+            digest = str(remote.get("checksum") or hashlib.sha256(content).hexdigest())
+            name = str(remote.get("full_name") or "Ứng viên chưa xác định").strip()
+            email = str(remote.get("email") or "").strip()
+            phone = str(remote.get("phone") or "").strip()
+            normalized_email = normalize_email(email)
+            normalized_phone = normalize_phone(phone)
+            with session_scope() as db:
+                by_email = db.scalar(select(CandidateProfile).where(
+                    CandidateProfile.owner_id == owner_id,
+                    CandidateProfile.normalized_email == normalized_email,
+                )) if normalized_email else None
+                by_phone = db.scalar(select(CandidateProfile).where(
+                    CandidateProfile.owner_id == owner_id,
+                    CandidateProfile.normalized_phone == normalized_phone,
+                )) if normalized_phone else None
+                if by_email and by_phone and by_email.id != by_phone.id:
+                    conflicts.append({
+                        "cv_id": cv_id, "filename": remote.get("original_filename"),
+                        "type": "IDENTITY_SPLIT", "blocking": True,
+                        "message": "Email và số điện thoại đang thuộc hai hồ sơ TalentFlow khác nhau.",
+                        "profile_ids": [by_email.id, by_phone.id],
+                    })
+                    continue
+                identity_profile = by_email or by_phone
+                duplicate = db.scalar(select(CandidateResumeVersion).where(
+                    CandidateResumeVersion.owner_id == owner_id,
+                    CandidateResumeVersion.checksum == digest,
+                ).order_by(CandidateResumeVersion.submitted_at.desc()))
+                if duplicate:
+                    if identity_profile and duplicate.candidate_profile_id != identity_profile.id:
+                        conflicts.append({
+                            "cv_id": cv_id, "filename": remote.get("original_filename"),
+                            "type": "CHECKSUM_IDENTITY_CONFLICT", "blocking": True,
+                            "message": "Nội dung CV đã tồn tại nhưng đang gắn với một hồ sơ khác.",
+                            "profile_ids": [duplicate.candidate_profile_id, identity_profile.id],
+                        })
+                    else:
+                        skipped.append({
+                            "cv_id": cv_id, "filename": remote.get("original_filename"),
+                            "profile_id": duplicate.candidate_profile_id,
+                            "resume_version_id": duplicate.id,
+                            "reason": "DUPLICATE_CONTENT",
+                            "message": "File có checksum trùng với một CV version đã có.",
+                        })
+                    continue
+                warnings = []
+                if identity_profile and name.casefold() != identity_profile.full_name.casefold():
+                    warnings.append({
+                        "type": "NAME_MISMATCH",
+                        "message": f"Tên trong Kho CV ({name}) khác tên hồ sơ TalentFlow ({identity_profile.full_name}).",
+                    })
+                if not normalized_email and not normalized_phone:
+                    same_name = list(db.scalars(select(CandidateProfile).where(
+                        CandidateProfile.owner_id == owner_id,
+                        func.lower(CandidateProfile.full_name) == name.casefold(),
+                    )))
+                    if same_name:
+                        warnings.append({
+                            "type": "POSSIBLE_NAME_DUPLICATE",
+                            "message": "Không có email/SĐT để xác minh; TalentFlow đã tạo hồ sơ riêng dù có người trùng tên.",
+                            "profile_ids": [item.id for item in same_name],
+                        })
+                profile = resolve_candidate_profile(
+                    db, owner_id=owner_id,
+                    name=identity_profile.full_name if identity_profile else name,
+                    email=email, phone=phone,
+                )
+                storage_key = f"warehouse-{uuid4()}"
+                extraction = {
+                    "candidate": {"name": name, "email": email, "phone": phone},
+                    "profile": {
+                        "skills": list(remote.get("skills") or []),
+                        "experience_years": float(remote.get("experience_years") or 0),
+                        "education": [],
+                        "summary": str(remote.get("job_title") or ""),
+                        "specialization": str(remote.get("specialization") or ""),
+                        "extraction_source": "cv_warehouse",
+                    },
+                    "evidence": [], "screening_source": "cv_warehouse",
+                    "source": {"system": "CV_WAREHOUSE", "cv_id": cv_id,
+                               "warehouse_updated_at": remote.get("updated_at")},
+                }
+                version = create_resume_version(
+                    db, profile=profile, storage_key=storage_key,
+                    original_filename=str(remote.get("original_filename") or f"{cv_id}.txt"),
+                    file_size=int(remote.get("file_size") or len(content)), checksum=digest,
+                    extracted_text=text, extraction=extraction,
+                )
+                store_resume_file(owner_id, storage_key, version.version_filename, content)
+                status = "NEW_VERSION" if version.version_number > 1 else "NEW_PROFILE"
+                audit(db, owner_id, None, "CV_WAREHOUSE_IMPORTED", {
+                    "cv_id": cv_id, "profile_id": profile.id, "resume_version_id": version.id,
+                    "version": version.version_number, "status": status, "warnings": warnings,
+                }, actor=actor)
+                imported.append({
+                    "cv_id": cv_id, "filename": remote.get("original_filename"),
+                    "profile_id": profile.id, "profile_name": profile.full_name,
+                    "resume_version_id": version.id, "version": version.version_number,
+                    "status": status, "warnings": warnings,
+                })
+        except (CvWarehouseError, ValueError, TypeError, OSError) as exc:
+            failed.append({"cv_id": cv_id, "type": "IMPORT_FAILED", "error": str(exc)})
+    return {
+        "source": "CV_WAREHOUSE", "imported": imported, "skipped": skipped,
+        "conflicts": conflicts, "failed": failed,
+        "summary": {"requested": len(unique_ids), "imported": len(imported),
+                    "new_profiles": sum(item["status"] == "NEW_PROFILE" for item in imported),
+                    "new_versions": sum(item["status"] == "NEW_VERSION" for item in imported),
+                    "skipped": len(skipped), "conflicts": len(conflicts), "failed": len(failed)},
+    }
+
+
+@app.post("/api/cv-warehouse/sync")
+async def sync_all_cv_warehouse_profiles(
+    owner_id: str = Depends(current_tenant_id),
+    actor: dict[str, str] = Depends(current_actor),
+) -> dict:
+    """Pull every CV missing from TalentFlow; compare checksums before downloading files."""
+    client = CvWarehouseClient()
+    remote_items: list[dict] = []
+    offset = 0
+    try:
+        while True:
+            page = await client.list_cvs(owner_id, limit=100, offset=offset)
+            items = list(page.get("items") or [])
+            remote_items.extend(items)
+            if len(items) < 100:
+                break
+            offset += len(items)
+    except CvWarehouseError as exc:
+        raise _warehouse_http_error(exc) from exc
+
+    with session_scope() as db:
+        existing_checksums = set(db.scalars(select(CandidateResumeVersion.checksum).where(
+            CandidateResumeVersion.owner_id == owner_id,
+        )))
+    pending_ids: list[str] = []
+    already_present: list[dict] = []
+    seen_remote_checksums: set[str] = set()
+    for item in remote_items:
+        cv_id = str(item.get("id") or "")
+        digest = str(item.get("checksum") or "")
+        if digest and (digest in existing_checksums or digest in seen_remote_checksums):
+            already_present.append({
+                "cv_id": cv_id, "filename": item.get("original_filename"),
+                "reason": "ALREADY_IMPORTED",
+                "message": "CV đã có trong TalentFlow nên không tải lại.",
+            })
+            continue
+        if cv_id:
+            pending_ids.append(cv_id)
+        if digest:
+            seen_remote_checksums.add(digest)
+
+    result = {
+        "source": "CV_WAREHOUSE", "imported": [], "skipped": [],
+        "conflicts": [], "failed": [],
+        "summary": {"requested": 0, "imported": 0, "new_profiles": 0,
+                    "new_versions": 0, "skipped": 0, "conflicts": 0, "failed": 0},
+    }
+    for start in range(0, len(pending_ids), 100):
+        batch = await import_cv_warehouse_profiles(
+            CvWarehouseImportRequest(cv_ids=pending_ids[start:start + 100]),
+            owner_id=owner_id, actor=actor,
+        )
+        for key in ("imported", "skipped", "conflicts", "failed"):
+            result[key].extend(batch.get(key) or [])
+        for key in ("requested", "imported", "new_profiles", "new_versions", "skipped", "conflicts", "failed"):
+            result["summary"][key] += int(batch["summary"].get(key) or 0)
+    result["skipped"] = already_present + list(result.get("skipped") or [])
+    result["summary"] = {
+        **result["summary"], "warehouse_total": len(remote_items),
+        "requested": len(remote_items), "already_present": len(already_present),
+        "skipped": len(result["skipped"]),
+    }
+    return result
+
+
+@app.post("/api/cv-warehouse/search")
+async def search_cv_warehouse(
+    payload: CvWarehouseSearchRequest,
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    try:
+        result = await CvWarehouseClient().search(owner_id, payload.model_dump())
+    except CvWarehouseError as exc:
+        raise _warehouse_http_error(exc) from exc
+    return {**result, "source": "CV_WAREHOUSE"}
+
+
+@app.post("/api/jobs/{job_id}/cv-warehouse/search")
+async def search_cv_warehouse_for_job(
+    job_id: str,
+    filters: CvWarehouseFilters = CvWarehouseFilters(),
+    owner_id: str = Depends(current_tenant_id),
+) -> dict:
+    with session_scope() as db:
+        job = require_job(db, job_id, owner_id)
+        criteria = latest_criteria(db, job.id, approved_only=True)
+        requirements = criteria.criteria if criteria else (job.requirements or {})
+        required = filters.required_skills or list(requirements.get("required_skills") or [])
+        preferred = filters.preferred_skills or list(requirements.get("preferred_skills") or [])
+        minimum = filters.minimum_experience
+        if minimum is None:
+            minimum = requirements.get("minimum_experience")
+        query_parts = [
+            f"Vị trí {job.title}",
+            f"Kỹ năng bắt buộc: {', '.join(required)}" if required else "",
+            f"Kỹ năng ưu tiên: {', '.join(preferred)}" if preferred else "",
+            f"Kinh nghiệm tối thiểu {minimum} năm" if minimum is not None else "",
+            job.description,
+        ]
+        query = ". ".join(value.strip() for value in query_parts if value and value.strip())[:5000]
+    payload = {
+        "query": query,
+        "filters": {
+            **filters.model_dump(), "required_skills": required,
+            "preferred_skills": preferred, "minimum_experience": minimum,
+        },
+        "limit": 20,
+    }
+    try:
+        result = await CvWarehouseClient().search(owner_id, payload)
+    except CvWarehouseError as exc:
+        raise _warehouse_http_error(exc) from exc
+    return {**result, "source": "CV_WAREHOUSE", "job_id": job_id, "generated_query": query}
+
+
+@app.post("/api/jobs/{job_id}/cv-warehouse/crawl")
+async def crawl_cv_warehouse_into_job(
+    job_id: str,
+    payload: CvWarehouseCrawlRequest,
+    owner_id: str = Depends(current_tenant_id),
+    actor: dict[str, str] = Depends(current_actor),
+) -> dict:
+    with session_scope() as db:
+        require_job(db, job_id, owner_id)
+    unique_ids = list(dict.fromkeys(payload.cv_ids))
+    imported: list[dict] = []
+    skipped: list[dict] = []
+    failed: list[dict] = []
+    client = CvWarehouseClient()
+    for cv_id in unique_ids:
+        try:
+            remote = await client.get_cv(owner_id, cv_id)
+            text = str(remote.get("extracted_text") or "").strip()
+            digest = str(remote.get("checksum") or hashlib.sha256(text.encode()).hexdigest())
+            if len(text) < 20:
+                raise CvWarehouseError("CV không có đủ nội dung đã trích xuất")
+            with session_scope() as db:
+                job = require_job(db, job_id, owner_id)
+                duplicate = db.scalar(select(Application).where(
+                    Application.owner_id == owner_id,
+                    Application.job_id == job.id,
+                    Application.resume_checksum == digest,
+                ))
+                if duplicate:
+                    skipped.append({"cv_id": cv_id, "application_id": duplicate.id, "reason": "DUPLICATE"})
+                    continue
+                item = await build_application(
+                    db, owner_id, job,
+                    str(remote.get("full_name") or "Ứng viên chưa xác định"),
+                    str(remote.get("email") or ""), text,
+                    filename=str(remote.get("original_filename") or f"{cv_id}.txt"),
+                    size=int(remote.get("file_size") or len(text.encode())), digest=digest,
+                )
+                item.screening = {
+                    **(item.screening or {}),
+                    "candidate_source": {
+                        "system": "CV_WAREHOUSE", "cv_id": cv_id,
+                        "warehouse_updated_at": remote.get("updated_at"), "checksum": digest,
+                    },
+                }
+                audit(db, owner_id, item.id, "CV_WAREHOUSE_CRAWLED", {
+                    "job_id": job.id, "cv_id": cv_id, "checksum": digest,
+                }, actor=actor)
+                imported.append({"cv_id": cv_id, "application_id": item.id, "status": item.status})
+        except (CvWarehouseError, ValueError, TypeError) as exc:
+            failed.append({"cv_id": cv_id, "error": str(exc)})
+    return {
+        "job_id": job_id, "source": "CV_WAREHOUSE",
+        "imported": imported, "skipped": skipped, "failed": failed,
+        "summary": {"requested": len(unique_ids), "imported": len(imported),
+                    "skipped": len(skipped), "failed": len(failed)},
+    }
 
 
 @app.post("/api/jobs", status_code=201)

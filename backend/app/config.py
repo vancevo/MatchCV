@@ -74,6 +74,10 @@ class Settings:
     talentflow_max_input_tokens: int
     talentflow_max_new_tokens: int
     candidate_search_lexical_weight: float
+    cv_warehouse_enabled: bool
+    cv_warehouse_api_url: str
+    cv_warehouse_api_key: str
+    cv_warehouse_timeout_seconds: int
     max_upload_mb: int
     resume_storage_dir: str
     resume_storage_backend: str
@@ -199,6 +203,10 @@ class Settings:
             candidate_search_lexical_weight=_bounded_float(
                 "CANDIDATE_SEARCH_LEXICAL_WEIGHT", 0.20, 0.0, 1.0
             ),
+            cv_warehouse_enabled=_boolean("CV_WAREHOUSE_ENABLED", False),
+            cv_warehouse_api_url=os.getenv("CV_WAREHOUSE_API_URL", "http://localhost:8100").strip().rstrip("/"),
+            cv_warehouse_api_key=os.getenv("CV_WAREHOUSE_API_KEY", "").strip(),
+            cv_warehouse_timeout_seconds=_positive_int("CV_WAREHOUSE_TIMEOUT_SECONDS", 20, 120),
             max_upload_mb=_positive_int("MAX_UPLOAD_MB", 10, 100),
             resume_storage_dir=os.getenv("RESUME_STORAGE_DIR", "uploads").strip() or "uploads",
             resume_storage_backend=resume_storage_backend,

@@ -1,0 +1,1 @@
+"""Kho CV IT service."""
