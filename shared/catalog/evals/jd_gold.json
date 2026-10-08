@@ -1,0 +1,1270 @@
+[
+ {
+  "id": "ai-01-en",
+  "lang": "en",
+  "text": "Machine Learning Engineer\n\nWe build ranking and recommendation models for a marketplace with 5M users.\n\nRequirements:\n- 3+ years of experience building machine learning systems in production\n- Strong Python; hands-on with PyTorch and scikit-learn\n- Experience with MLflow or similar experiment tracking\n- Solid SQL and statistics\n- Bachelor's degree in Computer Science or related field\n\nNice to have:\n- Experience with Kubernetes and Airflow\n- Familiarity with LLMs and RAG pipelines",
+  "expected": {
+   "required": [
+    "Machine Learning",
+    "Python",
+    "PyTorch",
+    "scikit-learn",
+    "MLflow",
+    "SQL",
+    "Statistics"
+   ],
+   "preferred": [
+    "Kubernetes",
+    "Airflow",
+    "LLM",
+    "RAG"
+   ],
+   "minimum_experience": 3,
+   "category": "AI_ML",
+   "level": null,
+   "education": "Bachelor"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "ai-02-vi",
+  "lang": "vi",
+  "text": "Tuyển dụng AI Engineer (NLP)\n\nMô tả công việc:\nXây dựng hệ thống xử lý ngôn ngữ tự nhiên tiếng Việt cho chatbot chăm sóc khách hàng.\n\nYêu cầu:\n- Ít nhất 2 năm kinh nghiệm với Python và học sâu\n- Thành thạo PyTorch, Hugging Face Transformers\n- Hiểu biết về NLP, embeddings và tìm kiếm ngữ nghĩa\n- Biết Docker để đóng gói mô hình\n\nƯu tiên:\n- Có kinh nghiệm fine-tuning LLM, LoRA\n- Biết FastAPI để triển khai mô hình\n- Có chứng chỉ IELTS 6.5 trở lên\n\nQuyền lợi: lương cạnh tranh, thưởng dự án, bảo hiểm sức khỏe, làm việc hybrid.",
+  "expected": {
+   "required": [
+    "Python",
+    "Deep Learning",
+    "PyTorch",
+    "Transformers",
+    "NLP",
+    "Embeddings",
+    "Vector Database",
+    "Docker"
+   ],
+   "preferred": [
+    "LLM",
+    "FastAPI"
+   ],
+   "minimum_experience": 2,
+   "category": "AI_ML",
+   "languages": [
+    "English"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "ai-03-mixed",
+  "lang": "mixed",
+  "text": "Computer Vision Engineer (Junior/Mid)\nChúng tôi cần một kỹ sư thị giác máy tính để phát triển hệ thống nhận diện vật thể cho nhà máy.\nYêu cầu: 1-3 năm kinh nghiệm, Python, OpenCV, YOLO, PyTorch. Có kinh nghiệm triển khai mô hình với ONNX hoặc TensorRT là lợi thế.\nBiết C++ là một điểm cộng. Tiếng Anh đọc hiểu tài liệu kỹ thuật.",
+  "expected": {
+   "required": [
+    "Computer Vision",
+    "Python",
+    "OpenCV",
+    "YOLO",
+    "PyTorch"
+   ],
+   "preferred": [
+    "ONNX",
+    "TensorRT",
+    "C++"
+   ],
+   "minimum_experience": 1,
+   "category": "AI_ML",
+   "languages": [
+    "English"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "de-01-en",
+  "lang": "en",
+  "text": "Senior Data Engineer\n\nAbout us: a fintech scale-up processing 40M transactions a month on AWS.\n\nWhat you will do\n- Design and operate batch and streaming data pipelines\n- Own our lakehouse and data quality checks\n\nWhat we are looking for\n- 5+ years in data engineering\n- Expert SQL and Python\n- Apache Spark, Airflow and dbt in production\n- Experience with Snowflake or BigQuery\n- Kafka for event streaming\n\nBonus points: Databricks, Terraform, Great Expectations.",
+  "expected": {
+   "required": [
+    "Data Pipeline",
+    "Data Lake",
+    "Data Quality",
+    "SQL",
+    "Python",
+    "Apache Spark",
+    "Airflow",
+    "dbt",
+    "Snowflake",
+    "BigQuery",
+    "Kafka",
+    "Stream Processing"
+   ],
+   "preferred": [
+    "Databricks",
+    "Terraform",
+    "Great Expectations"
+   ],
+   "minimum_experience": 5,
+   "category": "DATA_ENGINEERING",
+   "level": "Senior"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "de-02-vi",
+  "lang": "vi",
+  "text": "Data Engineer (ETL)\n\nYêu cầu:\n- Có 2 năm kinh nghiệm xây dựng pipeline ETL\n- Thành thạo SQL, Python\n- Đã dùng Airflow hoặc NiFi\n- Hiểu mô hình hóa dữ liệu (star schema) và kho dữ liệu\n- Biết PostgreSQL, Redshift hoặc ClickHouse\n\nLà lợi thế: Spark, Kafka, AWS Glue.\nMức lương 25-40 triệu. Làm việc tại Hà Nội.",
+  "expected": {
+   "required": [
+    "ETL",
+    "SQL",
+    "Python",
+    "Airflow",
+    "NiFi",
+    "Data Modeling",
+    "Data Warehouse",
+    "PostgreSQL",
+    "Redshift",
+    "ClickHouse"
+   ],
+   "preferred": [
+    "Apache Spark",
+    "Kafka",
+    "AWS Glue"
+   ],
+   "minimum_experience": 2,
+   "category": "DATA_ENGINEERING"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "de-03-en",
+  "lang": "en",
+  "text": "Analytics Engineer\nYou will own the transformation layer of our warehouse. Must have: dbt, advanced SQL, Git and CI/CD. Experience with BigQuery is required. Looker or Metabase exposure is a plus. At least 3 years in analytics or data roles.",
+  "expected": {
+   "required": [
+    "dbt",
+    "SQL",
+    "Git",
+    "CI/CD",
+    "BigQuery"
+   ],
+   "preferred": [
+    "Looker",
+    "Metabase"
+   ],
+   "minimum_experience": 3,
+   "category": "DATA_ENGINEERING"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "bi-01-vi",
+  "lang": "vi",
+  "text": "Chuyên viên Phân tích dữ liệu / BI Analyst\n\nYêu cầu bắt buộc:\n- Tối thiểu 2 năm kinh nghiệm phân tích dữ liệu kinh doanh\n- Thành thạo SQL và Excel\n- Sử dụng Power BI hoặc Tableau, biết DAX\n- Kỹ năng thuyết trình và trình bày kết quả\n\nƯu tiên ứng viên biết Python (pandas) và có tư duy về A/B testing.\nTốt nghiệp đại học chuyên ngành Thống kê, Kinh tế hoặc CNTT.",
+  "expected": {
+   "required": [
+    "Data Analysis",
+    "SQL",
+    "Excel",
+    "Power BI",
+    "Tableau",
+    "DAX"
+   ],
+   "preferred": [
+    "Python",
+    "Pandas",
+    "A/B Testing"
+   ],
+   "minimum_experience": 2,
+   "category": "DATA_ANALYTICS_BI",
+   "education": "Bachelor"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "bi-02-en",
+  "lang": "en",
+  "text": "Junior Data Analyst\n\nYou will build dashboards and ad-hoc analyses for the marketing team.\nRequirements\n* 0-2 years of experience\n* SQL (joins, window functions)\n* Excel / Google Sheets\n* Looker Studio or Power BI\nGood to have: Python or R for statistics, Google Analytics 4.",
+  "expected": {
+   "required": [
+    "Data Analysis",
+    "Dashboard Design",
+    "SQL",
+    "Excel",
+    "Google Sheets",
+    "Looker Studio",
+    "Power BI"
+   ],
+   "preferred": [
+    "Python",
+    "R",
+    "Statistics",
+    "Google Analytics"
+   ],
+   "minimum_experience": 0,
+   "category": "DATA_ANALYTICS_BI",
+   "level": "Junior"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "bi-03-mixed",
+  "lang": "mixed",
+  "text": "Senior BI Developer\nPhụ trách semantic model và báo cáo quản trị cho ban giám đốc. Requirements: 5+ years with Power BI, DAX, Power Query and SQL Server. Kinh nghiệm RLS, incremental refresh. Knowledge of Snowflake is a plus. Chứng chỉ PL-300 được ưu tiên.",
+  "expected": {
+   "required": [
+    "Business Intelligence",
+    "Power BI",
+    "DAX",
+    "Power Query",
+    "SQL Server",
+    "Data Modeling"
+   ],
+   "preferred": [
+    "Snowflake"
+   ],
+   "minimum_experience": 5,
+   "category": "DATA_ANALYTICS_BI",
+   "level": "Senior",
+   "certifications": [
+    "Microsoft PL-300"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "sec-01-en",
+  "lang": "en",
+  "text": "SOC Analyst (Tier 2)\n\nResponsibilities: monitor alerts in our SIEM, triage incidents, run threat hunts and write detection rules.\n\nRequirements:\n- 2+ years in a SOC or incident response role\n- Hands-on with Splunk or Microsoft Sentinel and KQL\n- Knowledge of MITRE ATT&CK and Windows Event Logs\n- Experience with EDR such as CrowdStrike or Microsoft Defender\n\nPreferred: CEH, Security+ or CySA+; scripting in Python or PowerShell.",
+  "expected": {
+   "required": [
+    "SOC",
+    "SIEM",
+    "Incident Response",
+    "Threat Hunting",
+    "Splunk",
+    "Microsoft Sentinel",
+    "KQL",
+    "MITRE ATT&CK",
+    "Windows Event Logs",
+    "EDR",
+    "CrowdStrike",
+    "Microsoft Defender",
+    "Detection Engineering"
+   ],
+   "preferred": [
+    "Python",
+    "PowerShell"
+   ],
+   "minimum_experience": 2,
+   "category": "CYBERSECURITY",
+   "certifications": [
+    "CEH",
+    "CompTIA Security+"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "sec-02-vi",
+  "lang": "vi",
+  "text": "Chuyên viên Pentest / An ninh mạng\n\n- Tối thiểu 3 năm kinh nghiệm kiểm thử xâm nhập ứng dụng web và hạ tầng\n- Thành thạo Burp Suite, Nmap, Metasploit\n- Nắm vững OWASP Top 10\n- Có chứng chỉ OSCP hoặc CEH\n- Viết báo cáo lỗ hổng rõ ràng\n\nƯu tiên: kinh nghiệm bảo mật cloud (AWS), Kali Linux, ISO 27001.",
+  "expected": {
+   "required": [
+    "Penetration Testing",
+    "Burp Suite",
+    "Nmap",
+    "Metasploit",
+    "OWASP Top 10"
+   ],
+   "preferred": [
+    "Cloud Security",
+    "AWS",
+    "Kali Linux",
+    "ISO 27001"
+   ],
+   "minimum_experience": 3,
+   "category": "CYBERSECURITY",
+   "certifications": [
+    "OSCP",
+    "CEH"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "sec-03-en",
+  "lang": "en",
+  "text": "GRC / Information Security Analyst\nYou will lead our ISO 27001 and SOC 2 programmes, run risk assessments and vendor reviews, and maintain security policies. Experience with NIST CSF is required. CISA or CISSP preferred. 4 or more years in governance, risk and compliance.",
+  "expected": {
+   "required": [
+    "ISO 27001",
+    "SOC 2",
+    "Risk Assessment",
+    "GRC",
+    "NIST"
+   ],
+   "preferred": [],
+   "minimum_experience": 4,
+   "category": "CYBERSECURITY",
+   "certifications": [
+    "CISA",
+    "CISSP"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "cld-01-en",
+  "lang": "en",
+  "text": "Cloud Engineer (AWS)\n\nYou will design and run our multi-account AWS landing zone.\n\nMust have\n- 3+ years with AWS (EC2, S3, VPC, IAM, RDS)\n- Infrastructure as code with Terraform or CloudFormation\n- Linux administration and networking fundamentals (TCP/IP, DNS)\n- Cost optimization experience\n\nNice to have: Kubernetes (EKS), Python scripting, AWS Solutions Architect Associate.",
+  "expected": {
+   "required": [
+    "AWS",
+    "AWS EC2",
+    "AWS S3",
+    "AWS VPC",
+    "IAM",
+    "AWS RDS",
+    "Landing Zone",
+    "Infrastructure as Code",
+    "Terraform",
+    "AWS CloudFormation",
+    "Linux",
+    "Computer Networking",
+    "TCP/IP",
+    "DNS",
+    "FinOps"
+   ],
+   "preferred": [
+    "Kubernetes",
+    "AWS EKS",
+    "Python"
+   ],
+   "minimum_experience": 3,
+   "category": "CLOUD",
+   "certifications": [
+    "AWS Solutions Architect Associate"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "cld-02-vi",
+  "lang": "vi",
+  "text": "Kỹ sư Cloud Azure\n\nYêu cầu:\n- Từ 2 năm kinh nghiệm triển khai hạ tầng Azure (VM, VNet, Azure Monitor)\n- Biết Bicep hoặc Terraform\n- Có kiến thức về sao lưu và khôi phục thảm họa\n- Có chứng chỉ AZ-104 hoặc AZ-900\n\nĐiểm cộng: Entra ID, PowerShell, Ansible.",
+  "expected": {
+   "required": [
+    "Azure",
+    "Azure VNet",
+    "Azure Monitor",
+    "Bicep",
+    "Terraform",
+    "Disaster Recovery"
+   ],
+   "preferred": [
+    "Microsoft Entra ID",
+    "PowerShell",
+    "Ansible"
+   ],
+   "minimum_experience": 2,
+   "category": "CLOUD",
+   "certifications": [
+    "Azure AZ-104",
+    "Azure AZ-900"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "cld-03-mixed",
+  "lang": "mixed",
+  "text": "GCP Cloud Architect (Lead)\nDẫn dắt đội 4 kỹ sư, thiết kế kiến trúc trên Google Cloud: GKE, Cloud Run, Cloud SQL, Pub/Sub. Required: 6+ years, Terraform, networking, security best practices. Hybrid cloud migration experience is a plus. Cloud Architect certification is preferred.",
+  "expected": {
+   "required": [
+    "Google Cloud",
+    "GKE",
+    "Cloud Run",
+    "Cloud SQL",
+    "Pub/Sub",
+    "Terraform",
+    "Computer Networking"
+   ],
+   "preferred": [
+    "Cloud Computing"
+   ],
+   "minimum_experience": 6,
+   "category": "CLOUD",
+   "level": "Lead"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "dev-01-en",
+  "lang": "en",
+  "text": "Site Reliability Engineer\n\nRequirements:\n- 4+ years running production systems on Kubernetes\n- Prometheus, Grafana and OpenTelemetry for observability\n- Define SLOs and run incident reviews / postmortems\n- Terraform and Helm; GitOps with Argo CD\n- Solid Linux and Bash/Python scripting\n\nNice to have: Istio, Vault, chaos engineering.",
+  "expected": {
+   "required": [
+    "Kubernetes",
+    "Prometheus",
+    "Grafana",
+    "OpenTelemetry",
+    "SLO/SLI",
+    "Incident Management",
+    "Monitoring",
+    "Terraform",
+    "Helm",
+    "GitOps",
+    "Argo CD",
+    "Linux",
+    "Bash",
+    "Python"
+   ],
+   "preferred": [
+    "Istio",
+    "Vault"
+   ],
+   "minimum_experience": 4,
+   "category": "DEVOPS_SRE"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "dev-02-vi",
+  "lang": "vi",
+  "text": "DevOps Engineer\n\nMô tả: xây dựng và vận hành pipeline CI/CD cho 20 microservice.\nYêu cầu: 2 năm kinh nghiệm DevOps; Docker, Kubernetes; Jenkins hoặc GitLab CI; Linux; Ansible. Biết Prometheus/Grafana. Ưu tiên có kinh nghiệm AWS và Terraform.",
+  "expected": {
+   "required": [
+    "CI/CD",
+    "Microservices",
+    "Docker",
+    "Kubernetes",
+    "Jenkins",
+    "GitLab CI",
+    "Linux",
+    "Ansible",
+    "Prometheus",
+    "Grafana"
+   ],
+   "preferred": [
+    "AWS",
+    "Terraform"
+   ],
+   "minimum_experience": 2,
+   "category": "DEVOPS_SRE"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "dev-03-en",
+  "lang": "en",
+  "text": "Platform Engineer (Junior)\nHelp us build an internal developer platform. You know Git and Docker, have used GitHub Actions, and can write Bash. Kubernetes basics are a plus. No prior professional experience required.",
+  "expected": {
+   "required": [
+    "Backstage",
+    "Git",
+    "Docker",
+    "GitHub Actions",
+    "Bash"
+   ],
+   "preferred": [
+    "Kubernetes"
+   ],
+   "minimum_experience": 0,
+   "category": "DEVOPS_SRE",
+   "level": "Junior"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "be-01-en",
+  "lang": "en",
+  "text": "Backend Engineer (Go)\n\nWe run payment APIs handling 3k requests per second.\n\nRequirements\n- 3+ years of backend development, 2+ years with Go\n- PostgreSQL and Redis\n- gRPC and REST API design\n- Experience with Kafka or RabbitMQ\n- Docker; deployment on Kubernetes\n\nGood to have: Terraform, GraphQL.",
+  "expected": {
+   "required": [
+    "Go",
+    "PostgreSQL",
+    "Redis",
+    "gRPC",
+    "REST API",
+    "Kafka",
+    "RabbitMQ",
+    "Docker",
+    "Kubernetes"
+   ],
+   "preferred": [
+    "Terraform",
+    "GraphQL"
+   ],
+   "minimum_experience": 3,
+   "category": "BACKEND"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "be-02-vi",
+  "lang": "vi",
+  "text": "Lập trình viên Backend Java\n\nYêu cầu:\n- Ít nhất 2 năm kinh nghiệm Java, Spring Boot\n- Hiểu microservices, REST API\n- Làm việc tốt với MySQL hoặc PostgreSQL, Redis\n- Biết Git, Maven\n\nƯu tiên: Kafka, Docker, JUnit.",
+  "expected": {
+   "required": [
+    "Java",
+    "Spring Boot",
+    "Microservices",
+    "REST API",
+    "MySQL",
+    "PostgreSQL",
+    "Redis",
+    "Git",
+    "Maven"
+   ],
+   "preferred": [
+    "Kafka",
+    "Docker",
+    "JUnit"
+   ],
+   "minimum_experience": 2,
+   "category": "BACKEND"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "be-03-mixed",
+  "lang": "mixed",
+  "text": "Senior Backend Developer (Python)\nJoin our core platform team. 5+ năm kinh nghiệm backend. Thành thạo Python, FastAPI hoặc Django, PostgreSQL, Celery. Hiểu rõ system design, caching và message queue. AWS (S3, Lambda) is a plus.",
+  "expected": {
+   "required": [
+    "Python",
+    "FastAPI",
+    "Django",
+    "PostgreSQL",
+    "Celery",
+    "System Design",
+    "Message Queue"
+   ],
+   "preferred": [
+    "AWS",
+    "AWS S3",
+    "AWS Lambda"
+   ],
+   "minimum_experience": 5,
+   "category": "BACKEND",
+   "level": "Senior"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "fs-01-en",
+  "lang": "en",
+  "text": "Full-stack Developer (React / Node.js)\n\nRequirements:\n- 3+ years of full-stack development\n- React and TypeScript on the front end\n- Node.js with Express or NestJS\n- PostgreSQL or MongoDB\n- REST APIs; Git\n\nNice to have: Next.js, Docker, Cypress.",
+  "expected": {
+   "required": [
+    "React",
+    "TypeScript",
+    "Node.js",
+    "Express.js",
+    "NestJS",
+    "PostgreSQL",
+    "MongoDB",
+    "REST API",
+    "Git"
+   ],
+   "preferred": [
+    "Next.js",
+    "Docker",
+    "Cypress"
+   ],
+   "minimum_experience": 3,
+   "category": "FULLSTACK"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "fs-02-vi",
+  "lang": "vi",
+  "text": "Lập trình viên Fullstack\n\nYêu cầu: 1-2 năm kinh nghiệm; HTML, CSS, JavaScript; Vue.js hoặc React; Laravel (PHP); MySQL. Giao diện responsive.\nƯu tiên biết Tailwind, Docker.",
+  "expected": {
+   "required": [
+    "HTML",
+    "CSS",
+    "JavaScript",
+    "Vue.js",
+    "React",
+    "Laravel",
+    "PHP",
+    "MySQL",
+    "Responsive Design"
+   ],
+   "preferred": [
+    "Tailwind",
+    "Docker"
+   ],
+   "minimum_experience": 1,
+   "category": "FULLSTACK"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "fs-03-en",
+  "lang": "en",
+  "text": "Senior Fullstack Engineer, .NET + Angular\nWe need someone with 5+ years shipping production web apps: ASP.NET Core, Entity Framework, SQL Server, Angular. Azure DevOps CI/CD pipelines are used daily. Knowledge of Redis is nice to have.",
+  "expected": {
+   "required": [
+    "ASP.NET Core",
+    "EF Core",
+    "SQL Server",
+    "Angular",
+    ".NET",
+    "CI/CD",
+    "Azure DevOps"
+   ],
+   "preferred": [
+    "Redis"
+   ],
+   "minimum_experience": 5,
+   "category": "FULLSTACK",
+   "level": "Senior"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "mob-01-en",
+  "lang": "en",
+  "text": "Mobile Developer (Flutter)\n\nRequirements:\n- 2+ years building Flutter apps with Dart\n- State management (Riverpod or Bloc)\n- REST APIs, Firebase (FCM, Crashlytics)\n- Published apps on App Store and Google Play\n\nNice to have: native Android (Kotlin) or iOS (Swift) experience, unit and widget testing.",
+  "expected": {
+   "required": [
+    "Flutter",
+    "Dart",
+    "Riverpod",
+    "REST API",
+    "Firebase",
+    "Crashlytics",
+    "App Store",
+    "Bloc"
+   ],
+   "preferred": [
+    "Android",
+    "Kotlin",
+    "iOS",
+    "Swift",
+    "flutter_test"
+   ],
+   "minimum_experience": 2,
+   "category": "MOBILE"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "mob-02-vi",
+  "lang": "vi",
+  "text": "Lập trình viên Android\n\nYêu cầu:\n- Từ 3 năm kinh nghiệm Android với Kotlin\n- Jetpack Compose, Coroutines, Room, Retrofit\n- Kiến trúc MVVM, Hilt\n- Có kinh nghiệm publish ứng dụng lên Google Play\n\nƯu tiên: Kotlin Multiplatform, CI/CD cho mobile.",
+  "expected": {
+   "required": [
+    "Android",
+    "Kotlin",
+    "Jetpack Compose",
+    "Coroutines",
+    "Room",
+    "Retrofit",
+    "MVVM",
+    "Dependency Injection",
+    "App Store"
+   ],
+   "preferred": [
+    "KMP",
+    "CI/CD"
+   ],
+   "minimum_experience": 3,
+   "category": "MOBILE"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "mob-03-mixed",
+  "lang": "mixed",
+  "text": "iOS Engineer\nDevelop our consumer banking app. 3+ years Swift, SwiftUI and UIKit; REST API integration; Core Data. Biết XCTest và Instruments để tối ưu hiệu năng. Objective-C là lợi thế.",
+  "expected": {
+   "required": [
+    "iOS",
+    "Swift",
+    "SwiftUI",
+    "UIKit",
+    "REST API",
+    "Core Data",
+    "XCTest",
+    "Instruments"
+   ],
+   "preferred": [
+    "Objective-C"
+   ],
+   "minimum_experience": 3,
+   "category": "MOBILE",
+   "domains": [
+    "Fintech"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "qa-01-en",
+  "lang": "en",
+  "text": "QA Automation Engineer\n\nRequirements\n- 3+ years in test automation\n- Selenium or Playwright (Cypress is a plus)\n- API testing with Postman or REST Assured\n- JMeter for performance tests\n- Jira, TestRail; CI/CD with Jenkins\n- ISTQB Foundation preferred",
+  "expected": {
+   "required": [
+    "Test Automation",
+    "Selenium",
+    "Playwright",
+    "API Testing",
+    "Postman",
+    "REST Assured",
+    "JMeter",
+    "Performance Testing",
+    "Jira",
+    "TestRail",
+    "CI/CD",
+    "Jenkins"
+   ],
+   "preferred": [
+    "Cypress"
+   ],
+   "minimum_experience": 3,
+   "category": "QA_AUTOMATION",
+   "certifications": [
+    "ISTQB"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "qa-02-vi",
+  "lang": "vi",
+  "text": "Kỹ sư kiểm thử tự động (SDET)\n\nYêu cầu:\n- 2+ năm kinh nghiệm kiểm thử phần mềm, viết test case và báo cáo bug trên Jira\n- Thành thạo Selenium (Java hoặc Python), TestNG\n- Biết kiểm thử API bằng Postman\n- Hiểu Agile/Scrum\n\nƯu tiên: Appium, Cucumber (BDD), Docker.",
+  "expected": {
+   "required": [
+    "Quality Assurance",
+    "Test Case Design",
+    "Jira",
+    "Bug Tracking",
+    "Selenium",
+    "Java",
+    "Python",
+    "TestNG",
+    "API Testing",
+    "Postman",
+    "Agile",
+    "Scrum"
+   ],
+   "preferred": [
+    "Appium",
+    "Cucumber",
+    "BDD",
+    "Docker"
+   ],
+   "minimum_experience": 2,
+   "category": "QA_AUTOMATION"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "qa-03-en",
+  "lang": "en",
+  "text": "Manual QA Tester (Intern / Fresher)\nYou will write test cases, execute manual and regression tests and log defects. Training provided. SQL basics and familiarity with Postman are a plus. English reading skills required. Students in their final year welcome.",
+  "expected": {
+   "required": [
+    "Test Case Design",
+    "Manual Testing",
+    "Regression Testing"
+   ],
+   "preferred": [
+    "SQL",
+    "Postman"
+   ],
+   "minimum_experience": 0,
+   "category": "QA_AUTOMATION",
+   "level": "Intern",
+   "languages": [
+    "English"
+   ]
+  },
+  "split": "dev"
+ },
+ {
+  "id": "trap-go-vn",
+  "lang": "vi",
+  "text": "Backend Developer\nCông ty đang go live sản phẩm mới trên Google Cloud vào quý sau, nên cần người go the extra mile.\nYêu cầu: Golang hoặc Java, 3 năm kinh nghiệm, MongoDB. Không yêu cầu biết Kubernetes.\nQuyền lợi: Macbook, bảo hiểm, thưởng tháng 13, du lịch hằng năm, học Docker và AWS miễn phí.",
+  "expected": {
+   "required": [
+    "Go",
+    "Java",
+    "MongoDB",
+    "Google Cloud"
+   ],
+   "preferred": [],
+   "minimum_experience": 3,
+   "category": "BACKEND"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "trap-java",
+  "lang": "en",
+  "text": "Frontend Developer\nJavaScript and TypeScript, React, HTML/CSS. PostgreSQL knowledge is helpful but not required. 2 years experience. Java is not needed.",
+  "expected": {
+   "required": [
+    "JavaScript",
+    "TypeScript",
+    "React",
+    "HTML",
+    "CSS"
+   ],
+   "preferred": [
+    "PostgreSQL"
+   ],
+   "minimum_experience": 2,
+   "category": "FRONTEND"
+  },
+  "split": "dev"
+ },
+ {
+  "id": "trap-r-data",
+  "lang": "en",
+  "text": "Data Analyst, R&D Analytics\nYou will analyse lab results for our R&D unit using R and SQL. Visualisation in Tableau. A degree in statistics is required; Master's preferred. 3 years' experience.",
+  "expected": {
+   "required": [
+    "R",
+    "SQL",
+    "Tableau"
+   ],
+   "preferred": [],
+   "minimum_experience": 3,
+   "category": "DATA_ANALYTICS_BI",
+   "education": null
+  },
+  "split": "dev"
+ },
+ {
+  "id": "h01-en-prose",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Our pricing team is looking for a modeller. Day to day you will write Python (pandas, scikit-learn, some XGBoost) and SQL. We would love someone who has also used Spark, but it is not mandatory. Three years in a modelling role minimum.",
+  "expected": {
+   "required": [
+    "Python",
+    "Pandas",
+    "scikit-learn",
+    "XGBoost",
+    "SQL"
+   ],
+   "preferred": [
+    "Apache Spark"
+   ],
+   "minimum_experience": 3,
+   "category": "AI_ML"
+  }
+ },
+ {
+  "id": "h02-vi-prose",
+  "lang": "vi",
+  "split": "holdout",
+  "text": "Công ty fintech cần một kỹ sư backend để xây dựng dịch vụ thanh toán. Bạn sẽ viết code bằng Java 17 với Spring Boot, lưu dữ liệu trong Oracle và dùng RabbitMQ để xử lý bất đồng bộ. Nếu từng làm việc với Kubernetes thì càng tốt. Cần tối thiểu 4 năm kinh nghiệm backend.",
+  "expected": {
+   "required": [
+    "Java",
+    "Spring Boot",
+    "Oracle Database",
+    "RabbitMQ"
+   ],
+   "preferred": [
+    "Kubernetes"
+   ],
+   "minimum_experience": 4,
+   "category": "BACKEND",
+   "domains": [
+    "Fintech"
+   ]
+  }
+ },
+ {
+  "id": "h03-en-sections",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Software Development Engineer in Test (SDET)\n\nResponsibilities\n- Build and maintain UI and API test frameworks\n- Mentor junior testers\n\nBasic Qualifications\n- Bachelor's degree in Computer Science or equivalent\n- 4+ years of experience in automated testing\n- Proficiency in Java and TestNG\n- Experience with Selenium WebDriver and REST Assured\n- Jenkins pipelines\n\nPreferred Qualifications\n- Experience with Docker and Kubernetes\n- Performance testing with Gatling\n\nBenefits\n- Stock options\n- Learning budget for AWS certifications",
+  "expected": {
+   "required": [
+    "Test Automation",
+    "Java",
+    "TestNG",
+    "Selenium",
+    "REST Assured",
+    "Jenkins"
+   ],
+   "preferred": [
+    "Docker",
+    "Kubernetes",
+    "Performance Testing",
+    "Gatling"
+   ],
+   "minimum_experience": 4,
+   "category": "QA_AUTOMATION",
+   "education": "Bachelor"
+  }
+ },
+ {
+  "id": "h04-vi-emoji",
+  "lang": "mixed",
+  "split": "holdout",
+  "text": "🚀 Mobile Engineer – React Native\n📍 HCMC / Remote\n\n✅ Bạn cần có:\n• 2-3 năm kinh nghiệm React Native & TypeScript\n• Biết Redux, REST API\n• Đã publish app lên App Store/Google Play\n\n⭐ Ưu tiên:\n• Native module (Swift/Kotlin)\n• Detox hoặc Jest để test\n\n💰 Quyền lợi: lương 30-50tr, thưởng, remote 2 ngày/tuần.",
+  "expected": {
+   "required": [
+    "React Native",
+    "TypeScript",
+    "Redux",
+    "REST API",
+    "App Store"
+   ],
+   "preferred": [
+    "Swift",
+    "Kotlin",
+    "Jest"
+   ],
+   "minimum_experience": 2,
+   "category": "MOBILE"
+  }
+ },
+ {
+  "id": "h05-en-inline",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Senior DevOps / Cloud Engineer (GCP)\n\nYou should be comfortable with: Terraform, GKE and Cloud Build style CI, Prometheus + Grafana. Cloud SQL and Pub/Sub experience is a nice-to-have. 5 years minimum. Python or Go for tooling.",
+  "expected": {
+   "required": [
+    "Google Cloud",
+    "Terraform",
+    "GKE",
+    "Prometheus",
+    "Grafana",
+    "Python",
+    "Go"
+   ],
+   "preferred": [
+    "Cloud SQL",
+    "Pub/Sub"
+   ],
+   "minimum_experience": 5,
+   "category": "DEVOPS_SRE",
+   "level": "Senior"
+  }
+ },
+ {
+  "id": "h06-vi-formal",
+  "lang": "vi",
+  "split": "holdout",
+  "text": "THÔNG BÁO TUYỂN DỤNG – CHUYÊN VIÊN AN TOÀN THÔNG TIN\n\n1. Mô tả công việc\nGiám sát an ninh hệ thống qua SIEM (Splunk), đánh giá rủi ro theo ISO 27001.\n\n2. Yêu cầu\n- Tốt nghiệp đại học chuyên ngành CNTT, An toàn thông tin\n- Từ 1 đến 3 năm kinh nghiệm\n- Hiểu biết về firewall, IDS/IPS, VPN\n- Có chứng chỉ Security+ hoặc CEH là một lợi thế\n\n3. Quyền lợi\n- Phụ cấp chứng chỉ, bảo hiểm",
+  "expected": {
+   "required": [
+    "SIEM",
+    "Splunk",
+    "Risk Assessment",
+    "ISO 27001",
+    "Firewall",
+    "IDS/IPS",
+    "VPN"
+   ],
+   "preferred": [],
+   "minimum_experience": 1,
+   "category": "CYBERSECURITY",
+   "education": "Bachelor",
+   "certifications": [
+    "CompTIA Security+",
+    "CEH"
+   ]
+  }
+ },
+ {
+  "id": "h07-en-tools-line",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Marketing Data Analyst — Contract\n\nTools we use: BigQuery, Looker Studio, GA4, and a lot of Google Sheets. SQL fluency is a must. R is great but optional. 2 years minimum, ideally in e-commerce.",
+  "expected": {
+   "required": [
+    "BigQuery",
+    "Looker Studio",
+    "Google Analytics",
+    "Google Sheets",
+    "SQL"
+   ],
+   "preferred": [
+    "R"
+   ],
+   "minimum_experience": 2,
+   "category": "DATA_ANALYTICS_BI",
+   "domains": [
+    "E-commerce"
+   ]
+  }
+ },
+ {
+  "id": "h08-en-mixed-heads",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Node.js Developer (mid-level)\nResponsibilities: design GraphQL APIs on top of PostgreSQL; write unit tests with Jest; deploy to AWS Lambda.\nRequirements: strong JavaScript/TypeScript, 3 years with Node, Docker. Familiarity with Redis would be appreciated.\nWe offer: remote-first, 25 days PTO.",
+  "expected": {
+   "required": [
+    "Node.js",
+    "GraphQL",
+    "PostgreSQL",
+    "Unit Testing",
+    "Jest",
+    "AWS Lambda",
+    "JavaScript",
+    "TypeScript",
+    "Docker"
+   ],
+   "preferred": [
+    "Redis"
+   ],
+   "minimum_experience": 3,
+   "category": "BACKEND",
+   "level": "Mid-level"
+  }
+ },
+ {
+  "id": "h09-vi-ds",
+  "lang": "vi",
+  "split": "holdout",
+  "text": "Data Scientist (Junior)\n\nMô tả: Xây dựng mô hình dự báo nhu cầu bán lẻ.\nBắt buộc: Python, pandas, thống kê, SQL.\nCó thêm điểm cộng: Prophet/ARIMA, Power BI.\nKhông yêu cầu kinh nghiệm thực tế, sinh viên năm cuối có thể ứng tuyển.",
+  "expected": {
+   "required": [
+    "Python",
+    "Pandas",
+    "Statistics",
+    "SQL",
+    "Time Series Forecasting"
+   ],
+   "preferred": [
+    "Power BI"
+   ],
+   "minimum_experience": 0,
+   "category": "AI_ML",
+   "level": "Junior"
+  }
+ },
+ {
+  "id": "h10-en-azure",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Infrastructure Engineer – Azure\nMust have: Azure (VMs, Functions, AKS), Bicep or Terraform, Azure DevOps pipelines, PowerShell. Nice to have: Entra ID, Azure Monitor. AZ-104 or equivalent strongly preferred. 3+ years.",
+  "expected": {
+   "required": [
+    "Azure",
+    "Azure Functions",
+    "AKS",
+    "Bicep",
+    "Terraform",
+    "Azure DevOps",
+    "PowerShell"
+   ],
+   "preferred": [
+    "Microsoft Entra ID",
+    "Azure Monitor"
+   ],
+   "minimum_experience": 3,
+   "category": "CLOUD",
+   "certifications": [
+    "Azure AZ-104"
+   ]
+  }
+ },
+ {
+  "id": "h11-en-ignore",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Fullstack Engineer\nAbout the company: we are a 200-person fintech built on Rails, Postgres and Kafka — you do not need to know these.\nYou: know React and TypeScript well; have shipped GraphQL APIs; comfortable with SQL. 6+ years. Remote.",
+  "expected": {
+   "required": [
+    "React",
+    "TypeScript",
+    "GraphQL",
+    "SQL"
+   ],
+   "preferred": [],
+   "minimum_experience": 6,
+   "category": "FULLSTACK"
+  }
+ },
+ {
+  "id": "h12-en-qa-manual",
+  "lang": "en",
+  "split": "holdout",
+  "text": "QA Engineer (Manual → Automation)\nResponsibilities\n* Write test cases and run regression\n* Report bugs in Jira\nSkills: Postman, SQL, basic Python. Cypress or Playwright experience preferred but not required.\nEntry level OK; 1 year of testing experience is a plus.",
+  "expected": {
+   "required": [
+    "Test Case Design",
+    "Regression Testing",
+    "Jira",
+    "Postman",
+    "SQL",
+    "Python"
+   ],
+   "preferred": [
+    "Cypress",
+    "Playwright"
+   ],
+   "minimum_experience": 0,
+   "category": "QA_AUTOMATION"
+  }
+ },
+ {
+  "id": "h13-vi-android",
+  "lang": "mixed",
+  "split": "holdout",
+  "text": "[HOT] Senior Android Dev (Kotlin) - Hà Nội\nJob requirements:\n+ Tối thiểu 5 năm làm Android native\n+ Jetpack Compose, Coroutines/Flow, Hilt, Room\n+ Từng lead team nhỏ (3-5 người)\nNice to have:\n+ KMP\n+ CI/CD (Bitrise/Fastlane)",
+  "expected": {
+   "required": [
+    "Android",
+    "Kotlin",
+    "Jetpack Compose",
+    "Coroutines",
+    "Dependency Injection",
+    "Room"
+   ],
+   "preferred": [
+    "KMP",
+    "CI/CD"
+   ],
+   "minimum_experience": 5,
+   "category": "MOBILE",
+   "level": "Senior"
+  }
+ },
+ {
+  "id": "h14-en-dataplatform",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Data Platform Engineer\nYou will own ingestion from Postgres and Kafka into Snowflake using dbt and Airflow. Experience with Terraform for the infra is expected. Bonus: Iceberg, Flink. 4+ years building data platforms.",
+  "expected": {
+   "required": [
+    "PostgreSQL",
+    "Kafka",
+    "Snowflake",
+    "dbt",
+    "Airflow",
+    "Terraform"
+   ],
+   "preferred": [
+    "Apache Iceberg",
+    "Flink"
+   ],
+   "minimum_experience": 4,
+   "category": "DATA_ENGINEERING"
+  }
+ },
+ {
+  "id": "h15-en-appsec",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Security Engineer (Application Security)\nWe need hands-on AppSec: threat modelling, SAST/DAST in CI, and secure code review for Python and Go services. OWASP knowledge expected. No penetration-testing background needed. CISSP is a plus. 5+ years. Hybrid.",
+  "expected": {
+   "required": [
+    "Threat Modeling",
+    "SAST",
+    "DAST",
+    "CI/CD",
+    "Secure Coding",
+    "Python",
+    "Go",
+    "OWASP Top 10"
+   ],
+   "preferred": [],
+   "minimum_experience": 5,
+   "category": "CYBERSECURITY",
+   "certifications": [
+    "CISSP"
+   ]
+  }
+ },
+ {
+  "id": "h16-mixed-lead-qa",
+  "lang": "mixed",
+  "split": "holdout",
+  "text": "Lead QA (Automation) — Tuyển gấp\nBạn sẽ dẫn dắt nhóm 5 QA, xây dựng framework Playwright + TypeScript, tích hợp vào GitHub Actions. Yêu cầu 6 năm kinh nghiệm test, ISTQB Advanced là điểm cộng. Quen thuộc với k6 hoặc JMeter.",
+  "expected": {
+   "required": [
+    "Playwright",
+    "TypeScript",
+    "GitHub Actions",
+    "k6",
+    "JMeter"
+   ],
+   "preferred": [],
+   "minimum_experience": 6,
+   "category": "QA_AUTOMATION",
+   "level": "Lead",
+   "certifications": [
+    "ISTQB"
+   ]
+  }
+ },
+ {
+  "id": "fe-01-en",
+  "lang": "en",
+  "split": "holdout",
+  "text": "Frontend Developer (React)\n\nRequirements:\n- 2+ years of experience building web apps with React and TypeScript\n- Solid HTML, CSS and responsive design\n- Experience with Jest or Cypress\n\nNice to have:\n- Next.js, Tailwind\n- Web accessibility (WCAG)",
+  "expected": {
+   "required": [
+    "React",
+    "TypeScript",
+    "HTML",
+    "CSS",
+    "Responsive Design",
+    "Jest",
+    "Cypress"
+   ],
+   "preferred": [
+    "Next.js",
+    "Tailwind",
+    "Accessibility"
+   ],
+   "minimum_experience": 2,
+   "category": "FRONTEND"
+  }
+ },
+ {
+  "id": "fe-02-vi",
+  "lang": "vi",
+  "split": "holdout",
+  "text": "Lập trình viên Frontend Vue.js\n\nYêu cầu:\n- Ít nhất 1 năm kinh nghiệm Vue.js, JavaScript, HTML và CSS\n- Biết Git\n\nƯu tiên: TypeScript, Figma.",
+  "expected": {
+   "required": [
+    "Vue.js",
+    "JavaScript",
+    "HTML",
+    "CSS",
+    "Git"
+   ],
+   "preferred": [
+    "TypeScript",
+    "Figma"
+   ],
+   "minimum_experience": 1,
+   "category": "FRONTEND"
+  }
+ },
+ {
+  "id": "fe-03-mixed",
+  "lang": "mixed",
+  "split": "holdout",
+  "text": "Junior Front-end Engineer (Angular)\nCần 0-2 năm kinh nghiệm Angular, RxJS và TypeScript. Kiến thức về PWA và Web Performance là lợi thế.",
+  "expected": {
+   "required": [
+    "Angular",
+    "TypeScript"
+   ],
+   "preferred": [
+    "PWA",
+    "Web Performance"
+   ],
+   "minimum_experience": 0,
+   "category": "FRONTEND",
+   "level": "Junior"
+  }
+ }
+]

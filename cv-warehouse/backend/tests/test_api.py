@@ -96,12 +96,53 @@ def test_semantic_search_path_backfills_chunk_embeddings(monkeypatch) -> None:
         assert response.json()["results"][0]["semantic_score"] > 0.9
 
 
-def test_bulk_upload_is_limited_to_twenty_files() -> None:
+def test_bulk_upload_is_limited_to_fifty_files() -> None:
     with TestClient(app) as client:
         files = [
             ("files", (f"cv-{index}.txt", f"Candidate {index}\n3 năm Python FastAPI PostgreSQL".encode(), "text/plain"))
-            for index in range(21)
+            for index in range(51)
         ]
         response = client.post("/api/v1/cvs/bulk-upload", files=files)
         assert response.status_code == 422
-        assert response.json()["detail"] == "Mỗi batch tối đa 20 CV"
+        assert response.json()["detail"] == "Mỗi batch tối đa 50 CV"
+
+
+def test_name_skips_avatar_initials() -> None:
+    from app.extraction import extract_metadata
+
+    text = "NH\nPhạm Ngọc Hương\nQA Intern\nHà Nội | a@b.com | Phone: +84 000 000 494"
+    assert extract_metadata(text, "QA_494_EN.pdf")["full_name"] == "Phạm Ngọc Hương"
+    assert extract_metadata("Dương Bảo Ngân\nQA Intern\na@b.com", "x.pdf")["full_name"] == "Dương Bảo Ngân"
+
+
+def test_taxonomy_has_eleven_fixed_categories_and_classifies_titles() -> None:
+    from app.taxonomy import CATEGORIES, classify, detect_for_query
+
+    assert len(CATEGORIES) == 11
+    assert classify("Frontend Intern", "") == "FRONTEND"
+    assert classify("Mobile Developer", "Android Kotlin") == "MOBILE"
+    assert classify("Cloud Security Engineer", "") == "CYBERSECURITY"
+    assert classify("React / Python Full-stack Developer", "") == "FULLSTACK"
+    assert classify("", "no relevant words here") == "UNCLASSIFIED"
+    assert detect_for_query("AI ML Engineer") == "AI_ML"
+    assert detect_for_query("Python developer") is None
+
+
+def test_upload_is_filed_into_its_category_and_search_routes_by_query() -> None:
+    with TestClient(app) as client:
+        for name, title in (("An Nguyen", "Data Engineer"), ("Binh Tran", "QA Automation Engineer")):
+            text = f"{name}\n{title}\nHà Nội | {name.split()[0].lower()}@example.com\n3 năm kinh nghiệm Python SQL"
+            created = client.post("/api/v1/cvs", files={"file": (f"{name}.txt", text.encode(), "text/plain")})
+            assert created.status_code == 201
+        assert created.json()["specialization"] == "QA_AUTOMATION"
+        categories = {item["code"]: item["count"] for item in client.get("/api/v1/filters").json()["categories"]}
+        assert categories["DATA_ENGINEERING"] >= 1 and categories["QA_AUTOMATION"] >= 1
+        result = client.post("/api/v1/cvs/search", json={"query": "Data Engineer"}).json()
+        # The category the query targets only boosts; it never hides the other categories.
+        assert result["specialization_filter"] is None
+        assert result["specialization_boost"]["code"] == "DATA_ENGINEERING"
+        assert result["results"][0]["specialization"] == "DATA_ENGINEERING"
+        pinned = client.post("/api/v1/cvs/search", json={"query": "Data Engineer", "filters": {"specialization": "DATA_ENGINEERING"}}).json()
+        assert pinned["specialization_filter"]["source"] == "EXPLICIT"
+        assert pinned["results"] and all(item["specialization"] == "DATA_ENGINEERING" for item in pinned["results"])
+        assert client.post("/api/v1/cvs/search", json={"query": "x y", "filters": {"specialization": "nope"}}).status_code == 422

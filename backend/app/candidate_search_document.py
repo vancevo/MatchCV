@@ -126,9 +126,13 @@ def build_candidate_search_document(
     if isinstance(candidate, Mapping):
         pii.extend(str(candidate.get(key) or "") for key in ("name", "email", "phone"))
 
+    catalog = profile.get("catalog") if isinstance(profile.get("catalog"), Mapping) else {}
     sections = [
+        ("specialization", _strings(catalog.get("category_label"))),
         ("roles", roles),
+        ("level", _strings(catalog.get("level"))),
         ("canonical skills", skills),
+        ("certifications", _strings(catalog.get("certifications"))),
         ("experience years", [f"{years:g}"] if years else []),
         ("industries", industries),
         ("responsibilities", responsibilities),

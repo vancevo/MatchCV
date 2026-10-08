@@ -77,6 +77,16 @@ class CvWarehouseClient:
         except httpx.HTTPError as exc:
             raise CvWarehouseError(f"Không thể tải file CV {cv_id}: {exc}") from exc
 
+    async def catalog(self) -> dict:
+        self._assert_configured()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f"{self.base_url}/api/v1/catalog", headers=self._headers(""))
+                response.raise_for_status()
+                return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise CvWarehouseError(f"Không đọc được catalog của Kho CV: {exc}") from exc
+
     async def status(self, tenant_id: str) -> dict:
         self._assert_configured()
         try:

@@ -41,6 +41,7 @@ class CandidateVersionMatch:
     experience_years: float = 0.0
     submitted_at: datetime | None = None
     evidence: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
+    category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class RankedCandidate:
     pre_rerank_score: float | None = None
     reranker_score: float | None = None
     confidence: float | None = None
+    matched_preferred_skills: tuple[str, ...] = ()
+    category: str | None = None
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -105,6 +108,9 @@ def rank_candidate_versions(
     lexical_weight: float = DEFAULT_LEXICAL_WEIGHT,
     now: datetime | None = None,
     limit: int = 20,
+    category: str | None = None,
+    category_weight: float = 0.0,
+    category_is_hard_filter: bool = False,
 ) -> list[RankedCandidate]:
     if not 0 <= lexical_weight <= 1:
         raise ValueError("lexical_weight must be between 0 and 1")
@@ -121,6 +127,8 @@ def rank_candidate_versions(
         active_weights["preferred_skills"] = weights.preferred_skills
     if minimum_experience is not None and minimum_experience > 0:
         active_weights["experience"] = weights.experience
+    if category and category_weight > 0:
+        active_weights["category"] = category_weight
     active_total = sum(active_weights.values())
     normalized_weights = {
         name: value / active_total for name, value in active_weights.items()
@@ -130,6 +138,8 @@ def rank_candidate_versions(
         if required_skills_are_hard_filter and not required.issubset(item.skill_ids):
             continue
         if minimum_experience_is_hard_filter and minimum_experience is not None and item.experience_years < minimum_experience:
+            continue
+        if category_is_hard_filter and category and (item.category or "UNCLASSIFIED") != category:
             continue
         # Cosine is [-1, 1]; ranking components use a stable [0, 1] range.
         dense = min(1.0, max(0.0, (item.semantic_similarity + 1.0) / 2.0))
@@ -145,6 +155,9 @@ def rank_candidate_versions(
             all_components["preferred_skills"] = _coverage(item.skill_ids, preferred)
         if "experience" in normalized_weights:
             all_components["experience"] = _experience_score(item.experience_years, minimum_experience)
+        if "category" in normalized_weights:
+            # A CV filed in no category is neither a match nor a miss.
+            all_components["category"] = 0.5 if item.category is None else float(item.category == category)
         components = {name: all_components[name] for name in normalized_weights}
         score = sum(components[name] * normalized_weights[name] for name in components)
         scored.append((item, score, components))
@@ -176,6 +189,8 @@ def rank_candidate_versions(
             applied_weights={key: round(value * 100, 2) for key, value in normalized_weights.items()},
             matched_required_skills=tuple(sorted(best.skill_ids & required)),
             missing_required_skills=tuple(sorted(required - best.skill_ids)),
+            matched_preferred_skills=tuple(sorted(best.skill_ids & preferred)),
+            category=best.category,
             other_matching_version_ids=tuple(value[0].resume_version_id for value in versions[1:]),
             evidence=best.evidence,
         ))

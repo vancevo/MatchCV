@@ -9,70 +9,13 @@ import re
 from dataclasses import dataclass, asdict
 from functools import lru_cache
 
+from .catalog import catalog as shared
 
-SKILL_ALIASES = {
-    "aws": ("aws", "amazon web services"),
-    "blockchain": ("blockchain",),
-    "cloud computing": ("cloud computing", "cloud"),
-    "digital ocean": ("digital ocean", "digitalocean"),
-    "docker": ("docker", "container"),
-    "english": ("english", "tiếng anh"),
-    "postgresql": ("postgresql", "postgres", "psql"),
-    "fastapi": ("fastapi",),
-    "golang": ("golang", "go language"),
-    "google cloud": ("google cloud", "gcp"),
-    "linux": ("linux",),
-    "monitoring": ("monitoring", "prometheus", "grafana", "observability"),
-    "nosql": ("nosql", "dynamodb"),
-    "python": ("python",),
-    "redis": ("redis",),
-    "rest api": ("rest api", "restful", "http api", "web service"),
-    "self-learning": ("tự học", "tự học hỏi", "self-learning"),
-    "sql optimization": ("tối ưu hóa sql", "sql optimization", "query optimization", "optimize sql"),
-    "teamwork": ("làm việc nhóm", "teamwork"),
-    "problem solving": ("giải quyết vấn đề", "problem solving"),
-    "web3": ("web3", "web 3"),
-    "javascript": ("javascript", "js", "es6"),
-    "typescript": ("typescript", "ts"),
-    "react": ("react", "react.js", "reactjs"),
-    "vue": ("vue", "vue.js", "vuejs"),
-    "angular": ("angular", "angularjs"),
-    "next.js": ("next.js", "nextjs"),
-    "node.js": ("node.js", "nodejs", "node"),
-    "css": ("css", "css3", "scss", "sass"),
-    "html": ("html", "html5"),
-    "git": ("git", "github", "gitlab", "bitbucket"),
-    "kubernetes": ("kubernetes", "k8s", "openshift"),
-    "ci/cd": ("ci/cd", "cicd", "jenkins", "github actions", "gitlab ci"),
-    "mysql": ("mysql", "mariadb"),
-    "mongodb": ("mongodb", "mongo"),
-    "java": ("java",),
-    "spring boot": ("spring boot", "spring framework"),
-    "c#": ("c#", ".net", "dotnet", "asp.net"),
-    "php": ("php",),
-    "testing": ("unit test", "jest", "pytest", "junit", "testing"),
-    "responsive design": ("responsive", "responsive design", "mobile-first"),
-    "sql": ("sql",),
-    "graphql": ("graphql",),
-}
 
-# The rules path runs whenever the model is not configured, and it can only ever find a skill it
-# has been told about. Nine entries meant a frontend job description listing HTML, CSS, JavaScript,
-# React, REST API and Git produced exactly two criteria, and every candidate then scored the same.
-KNOWN_SKILLS = [
-    "Python", "FastAPI", "Django", "Flask", "Java", "Spring Boot", "Golang", "Node.js", "C#",
-    "PHP", "Laravel", "Ruby on Rails",
-    "JavaScript", "TypeScript", "React", "Vue.js", "Angular", "Next.js", "HTML", "CSS",
-    "Tailwind", "Redux", "responsive design",
-    "PostgreSQL", "MySQL", "MongoDB", "NoSQL", "Redis", "SQL optimization", "SQL", "Elasticsearch",
-    "Docker", "Kubernetes", "AWS", "Azure", "Google Cloud", "Digital Ocean", "Cloud computing",
-    "CI/CD", "Jenkins", "Terraform", "Linux", "Monitoring",
-    "REST API", "GraphQL", "gRPC", "Microservices", "Kafka", "RabbitMQ",
-    "Git", "Agile", "Scrum", "unit test", "Jest", "Pytest", "Selenium",
-    "Machine Learning", "TensorFlow", "PyTorch", "Pandas", "NumPy", "Spark", "Airflow",
-    "Blockchain", "Web3", "English", "Self-learning", "Problem solving", "Teamwork",
-    "Figma", "Power BI", "Excel",
-]
+# The vocabulary is the shared catalog (shared/catalog), the same one the CV warehouse extracts with.
+# These names stay so existing imports keep working; they are views over the catalog, not copies.
+KNOWN_SKILLS = [entry.name for entry in shared.load_catalog().entries_of(shared.TECH_KINDS)]
+SKILL_ALIASES = {entry.name.lower(): entry.aliases for entry in shared.load_catalog().entries_of(shared.TECH_KINDS)}
 
 
 @dataclass
@@ -84,75 +27,44 @@ class Evidence:
 
 
 def extract_requirements(description: str) -> dict:
-    text = description.lower()
-    # Prefer the longest overlapping match. For example, "SQL optimization" must not also create
-    # a second generic "SQL" criterion at the same position.
-    candidates = [(found[0], found[1], skill) for skill in KNOWN_SKILLS
-                  if (found := find_skill(text, skill))]
-    accepted: list[tuple[int, int, str]] = []
-    for start, length, skill in sorted(candidates, key=lambda item: (item[0], -item[1])):
-        end = start + length
-        if any(start < other_start + other_length and end > other_start
-               for other_start, other_length, _ in accepted):
-            continue
-        accepted.append((start, length, skill))
-    accepted.sort(key=lambda item: item[0])
-    skills = [skill for _, _, skill in accepted]
+    """Required / preferred skills, minimum years and the other criteria the shared catalog reads from a JD.
 
-    section_markers = ("ưu tiên", "plus", "nice to have")
-    marker_positions = [text.find(marker) for marker in section_markers if text.find(marker) >= 0]
-    first_section_marker = min(marker_positions) if marker_positions else -1
-    preferred: list[str] = []
-    for position, length, skill in accepted:
-        tail = text[position : position + 80] if position >= 0 else ""
-        sentence_start = max(text.rfind(".", 0, position), text.rfind("\n", 0, position)) + 1 if position >= 0 else 0
-        sentence_end_candidates = [idx for idx in (text.find(".", position), text.find("\n", position)) if idx >= 0]
-        sentence_end = min(sentence_end_candidates) if sentence_end_candidates else len(text)
-        sentence = text[sentence_start:sentence_end]
-        if first_section_marker >= 0 and position >= first_section_marker:
-            preferred.append(skill)
-        elif re.search(rf"^{re.escape(text[position:position + length])}\s+(?:là|is).{{0,20}}(?:lợi thế|plus)", tail):
-            preferred.append(skill)
-        elif skill in {"Blockchain", "Web3"} and re.search(r"blockchain.{0,20}web3.{0,30}lợi thế", sentence):
-            preferred.append(skill)
-    if "Docker" in preferred and "Golang" in preferred and "golang" in text and "docker là lợi thế" in text:
-        preferred = [skill for skill in preferred if skill != "Golang"]
-    required = [s for s in skills if s not in preferred]
-    # "Ít nhất 2 năm", "tối thiểu 2 năm", "2+ năm", "2-4 năm" all state the same floor.
-    years = (re.search(r"(?:có|ít nhất|tối thiểu|minimum|min\.?|từ)\s*(\d+)\s*(?:\+)?\s*(?:năm|years?)", text)
-             or re.search(r"(\d+)\s*\+\s*(?:năm|years?)", text)
-             or re.search(r"(\d+)\s*[-–]\s*\d+\s*(?:năm|years?)", text)
-             or re.search(r"(\d+)\+?\s*(?:năm|years?).{0,30}(?:trở lên|kinh nghiệm)", text))
+    `minimum_experience` stays a whole number of years (months round down, so "6 tháng" is 0);
+    `minimum_experience_years` keeps the exact figure in half years."""
+    found = shared.extract_jd_requirements(description)
+    required, preferred = found["required_skills"], found["preferred_skills"]
+    if not required:
+        # A job that names skills but never says which are required still needs something to screen on:
+        # the first few move to required, they are not counted twice.
+        required, preferred = preferred[:3], preferred[3:]
     return {
-        "required_skills": required or skills[:3],
+        "required_skills": required,
         "preferred_skills": preferred,
-        "minimum_experience": int(years.group(1)) if years else 0,
+        "minimum_experience": int(found["minimum_experience"]),
+        "minimum_experience_years": found["minimum_experience"],
+        **{key: found[key] for key in (
+            "required_skill_ids", "preferred_skill_ids", "category", "secondary_category", "level", "education",
+            "languages", "certifications", "domains", "soft_skills", "catalog_version")},
     }
 
 
 @lru_cache(maxsize=512)
-def _alias_pattern(alias: str) -> re.Pattern[str]:
-    """Match a whole token, never a fragment of a longer word.
-
-    Plain substring search read "java" out of "javascript" and "gin" out of "debugging", so a
-    frontend job description was credited with Java and Go. Punctuation inside a name such as
-    "node.js", "ci/cd" or "c#" still has to survive, hence lookarounds rather than \b.
-    """
-    return re.compile(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", re.I)
+def _literal_pattern(skill: str) -> re.Pattern[str]:
+    """Whole-token pattern for a criterion the catalog does not know (typed by a recruiter or an LLM)."""
+    return re.compile(rf"(?<![a-z0-9]){re.escape(skill.lower())}(?![a-z0-9])", re.I)
 
 
 def find_skill(text: str, skill: str) -> tuple[int, int] | None:
-    """Where the skill is first mentioned, as (offset, length), or None."""
-    best: tuple[int, int] | None = None
-    for alias in _aliases(skill):
-        found = _alias_pattern(alias).search(text)
-        if found and (best is None or found.start() < best[0]):
-            best = (found.start(), len(found.group(0)))
-    return best
+    """Where the skill is first mentioned, as (offset, length), or None.
 
-
-def _aliases(skill: str) -> tuple[str, ...]:
-    return SKILL_ALIASES.get(skill.lower(), (skill.lower(),))
+    Catalog skills match by name, alias or id with the catalog's ambiguity rules (so `Go` is not "go to");
+    anything else falls back to a literal whole-token search. Pass the CV text as written: the catalog
+    reads capitalisation to tell "Go" the language from "go".
+    """
+    if shared.load_catalog().resolve(skill):
+        return shared.first_span(text, skill)
+    found = _literal_pattern(skill).search(text)
+    return (found.start(), len(found.group(0))) if found else None
 
 
 def _snippet(text: str, at: int, length: int) -> str:
@@ -171,10 +83,9 @@ def analyze_evidence(cv_text: str, requirements: list[str]) -> list[dict]:
     # Searched as one line: a PDF decides its own line breaks, and a requirement written as two
     # words ("REST API") could never be found while each word sat on a line of its own.
     flat = re.sub(r"\s+", " ", cv_text).strip()
-    lowered = flat.lower()
     evidence: list[Evidence] = []
     for requirement in requirements:
-        found = find_skill(lowered, requirement)
+        found = find_skill(flat, requirement)
         evidence.append(Evidence(
             requirement=requirement,
             matched=found is not None,
@@ -201,7 +112,7 @@ def screen_candidate(cv_text: str, requirements: dict) -> dict:
 
     # Lightweight lexical semantic proxy for the offline MVP.
     tokens = set(re.findall(r"[a-zA-Z][a-zA-Z+#.]{1,}", cv_text.lower()))
-    semantic_hits = sum(any(alias in cv_text.lower() for alias in _aliases(skill)) for skill in required)
+    semantic_hits = sum(find_skill(cv_text, skill) is not None for skill in required)
     semantic_score = min(100, 35 + semantic_hits * 65 / max(len(required), 1) + min(len(tokens), 80) / 8)
 
     # A component with nothing to judge used to award full marks: a job that states no minimum

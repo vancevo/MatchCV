@@ -142,6 +142,7 @@ async def _execute(task_id: str) -> None:
                     email=application.candidate_email,
                     phone=application.candidate_phone,
                     screening=result,
+                    resume_text=application.resume_text or "",
                 )
                 version.extracted_at = finished
             if version and version.extraction:

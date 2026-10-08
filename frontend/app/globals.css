@@ -582,3 +582,73 @@ header { height:72px; background:#fff; border-bottom:1px solid var(--line); disp
 @media (max-width:700px){.talent-search{margin:0 12px 13px}.talent-search-modes{grid-template-columns:1fr}.talent-search-main,.talent-search-job{flex-wrap:wrap}.talent-search-main>input{flex-basis:calc(100% - 30px)}.talent-search-main .primary,.talent-search-job .primary{margin-left:26px}.talent-search-job>label{flex-basis:calc(100% - 30px)}.job-search-source{display:grid;margin-left:0}.job-search-source>small{text-align:left}.talent-search-criteria{grid-template-columns:1fr;margin-left:0}.talent-search-filters{margin-left:0}.talent-search-filters>span{flex-basis:100%;margin-left:0}.semantic-result{grid-template-columns:24px 34px 1fr;padding:14px 12px}.semantic-actions{grid-column:3;flex-direction:row;flex-wrap:wrap}.search-explanation li{grid-template-columns:1fr}.search-explanation li>small,.search-explanation li>span{grid-column:1}.comparison-group li{grid-template-columns:1fr}.comparison-group li>small{grid-column:1}}
 @media (max-width:700px){.mobile-menu-button{display:grid;place-items:center;flex:none}.mobile-brand{display:none}.sidebar.mobile-open{display:flex;position:fixed;inset:0 auto 0 0;z-index:81;width:min(286px,84vw);height:100vh;box-shadow:18px 0 50px #1f183b33;animation:sidebar-in .2s ease-out}.mobile-nav-backdrop{display:block;position:fixed;inset:0;z-index:80;border:0;background:#1a18334d;backdrop-filter:blur(2px)}header{gap:9px}.search{min-width:0}.sidebar .brand{padding-bottom:18px}.sidebar .agent-card{display:none}}
 @keyframes sidebar-in{from{transform:translateX(-100%)}to{transform:translateX(0)}}
+
+/* Candidate list redesign: one aligned grid, compact icon actions, readable score + status. */
+.candidates-panel{--actions-w:140px}
+.table-head{display:grid;grid-template-columns:minmax(0,1fr) var(--actions-w);gap:12px;padding:11px 20px 8px}
+.head-cols,.candidate-open{display:grid;grid-template-columns:minmax(0,2.1fr) minmax(0,1.2fr) minmax(0,1fr);align-items:center;gap:16px}
+.head-actions{text-align:right}
+.candidate-row{display:grid;grid-template-columns:minmax(0,1fr) var(--actions-w);align-items:center;gap:12px;padding:0 20px;min-height:68px}
+.candidate-row:hover{transform:none}
+.candidate-open{padding:12px 0;cursor:pointer;min-width:0}
+.candidate-open .person{gap:12px}
+.candidate-open .person b{font-size:12px}
+.candidate-open .person small{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.candidate-open .match{gap:10px}
+.candidate-open .match b{font-size:11px}
+.candidate-open .match small{font-size:10px}
+.candidate-open .score-ring{flex:none;width:40px;height:40px;font-size:10px}
+.candidate-open .score-ring:before{content:none}
+.candidate-open .status{font-size:9px;padding:5px 10px}
+.candidate-open .status-when{font-size:9px}
+.candidate-row .row-actions{display:grid;grid-template-columns:repeat(4,32px);gap:6px;justify-content:end}
+.candidate-row .row-actions .why-button{width:32px;height:32px;padding:0;border-radius:9px}
+.candidate-row .row-actions .why-button .icon{width:15px}
+.candidate-row .row-actions .btn-label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.candidate-row .row-actions .why-button.reject:hover:not(:disabled){background:#fdecec;border-color:#f0c4c4}
+@media (max-width:1100px){.head-cols,.candidate-open{grid-template-columns:minmax(0,1.8fr) minmax(0,1fr) minmax(0,.9fr);gap:10px}}
+@media (max-width:700px){
+  .table-head{display:none}
+  .candidate-row{grid-template-columns:1fr;gap:0;padding:0 14px}
+  .candidate-open{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);padding:12px 0 6px}
+  .candidate-open>span:nth-child(3){display:flex}
+  .candidate-open .status-cell{grid-column:1/-1;flex-direction:row;align-items:center;gap:8px}
+  .candidate-row .row-actions{justify-content:end;padding-bottom:12px}
+}
+
+/* Agent status card: a single icon that morphs open like a macOS widget. */
+.agent-card{--spring:cubic-bezier(.32,1.25,.52,1);--ease:cubic-bezier(.22,1,.36,1);position:relative;align-self:flex-start;width:44px;padding:7px;border-radius:15px;overflow:hidden;transform-origin:bottom left;
+  box-shadow:0 1px 2px #6c4de61a;transition:width .55s var(--spring),padding .35s var(--ease),border-radius .35s var(--ease),box-shadow .35s var(--ease)}
+.agent-card.open{width:100%;padding:13px 14px;border-radius:16px;box-shadow:0 14px 34px #6c4de626,0 2px 6px #6c4de614}
+.agent-toggle{display:flex;align-items:center;gap:10px;width:100%;padding:0;border:0;background:transparent;text-align:left;cursor:pointer;color:inherit;min-width:0}
+.agent-toggle .agent-icon{position:relative;flex:none;width:30px;height:30px;margin:0;border-radius:9px;transition:transform .35s var(--spring)}
+.agent-toggle:hover .agent-icon{transform:scale(1.08)}
+.agent-toggle:active .agent-icon{transform:scale(.94)}
+.agent-card.open .agent-toggle:hover .agent-icon{transform:none}
+.agent-toggle b{flex:1;min-width:0;font-size:12px;line-height:1.25;white-space:nowrap;opacity:0;transform:translateX(-6px);transition:opacity .2s var(--ease),transform .4s var(--ease)}
+.agent-card.open .agent-toggle b{opacity:1;transform:none;transition-delay:.12s}
+.agent-live{position:absolute;right:-3px;top:-3px;width:9px;height:9px;border-radius:50%;background:#45ac80;border:2px solid #f7f4ff;box-sizing:border-box;animation:agent-pulse 2.2s ease-out infinite}
+@keyframes agent-pulse{0%{box-shadow:0 0 0 0 #45ac8066}70%,100%{box-shadow:0 0 0 6px #45ac8000}}
+.agent-chevron{flex:none;display:grid;place-items:center;width:20px;height:20px;border-radius:6px;color:#8170c3;opacity:0;transition:opacity .2s var(--ease),transform .4s var(--spring),background .15s}
+.agent-chevron .icon{width:12px;transform:rotate(90deg)}
+.agent-card.open .agent-chevron{opacity:1;transition-delay:.12s}
+.agent-toggle:hover .agent-chevron{background:#ebe6ff}
+.agent-toggle:focus-visible{outline:2px solid #7358df;outline-offset:3px;border-radius:10px}
+.agent-details{display:grid;grid-template-rows:0fr;visibility:hidden;transition:grid-template-rows .5s var(--ease),visibility 0s .5s}
+.agent-card.open .agent-details{grid-template-rows:1fr;visibility:visible;transition:grid-template-rows .5s var(--ease),visibility 0s}
+.agent-details-inner{min-height:0;overflow:hidden;opacity:0;transform:translateY(8px) scale(.97);transform-origin:top left;filter:blur(3px);transition:opacity .3s var(--ease),transform .5s var(--ease),filter .35s var(--ease)}
+.agent-card.open .agent-details-inner{opacity:1;transform:none;filter:none;transition-delay:.1s}
+.agent-details-inner::before{content:"";display:block;height:1px;background:#ebe6ff;margin:11px 0 10px}
+.agent-details-inner p{margin:0 0 10px}
+@media (prefers-reduced-motion:reduce){.agent-card,.agent-card *{transition-duration:.01s!important;transition-delay:0s!important;animation:none!important}}
+
+/* Mời phỏng vấn từ kho hồ sơ ứng viên */
+.semantic-actions{display:flex;flex-direction:column;align-items:stretch;gap:6px}
+.semantic-actions .primary.compact,.semantic-actions .secondary.compact{display:inline-flex;align-items:center;justify-content:center;gap:5px;white-space:nowrap}
+.resume-window header .resume-header-actions{display:flex;align-items:center;gap:10px;margin-left:auto;flex:none}
+.resume-window header .resume-header-actions .close{margin-left:0}
+.resume-window header .resume-header-actions .primary.compact{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.profile-invite-modal{max-width:460px}
+.profile-invite-modal p{color:#7c8291;font-size:11px;line-height:1.55;margin:6px 0 16px}
+.profile-invite-field{display:grid;gap:6px;color:#52606b;font-size:11px;font-weight:700}
+.profile-invite-field select{padding:10px 12px;border:1px solid #d9dde6;border-radius:9px;background:white;font:inherit;font-size:12px;color:#28333e}

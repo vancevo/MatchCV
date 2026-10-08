@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
@@ -48,7 +50,7 @@ from .models import (
     AgentRun, AgentStep, AgentTask, Application, ApprovalRequest, AuditLog, BatchItem, BusyBlock,
     CandidateProfile, CandidateResumeVersion, CandidateSearchCalibration, CandidateSearchChunk,
     CandidateSearchEvent, CandidateSearchFeedback, CandidateSearchResultEvent,
-    ResumeVersionComparison, ResumeVersionEmbedding, ResumeVersionSkill,
+    ResumeVersionComparison, ResumeVersionEmbedding, ResumeVersionSkill, Skill,
     CriteriaVersion, EmailTemplate, FeedbackSummary, IntegrationConnection, Interview,
     InterviewClaim, InterviewCrossAnalysisRun, InterviewPolicy, InterviewQAClaimLink,
     InterviewQAPair, InterviewQARequirementLink, InterviewScorecard, InterviewTranscriptSession,
@@ -57,9 +59,10 @@ from .models import (
     TenantMembership, TenantPolicy, TenantUsage, ModelPolicy, OperationalAlert, OperationalSLOPolicy,
     ReleaseGate, UploadBatch,
 )
+from .catalog import catalog as shared
 from .candidate_profiles import (
     candidate_phone, candidate_profile_dict, create_resume_version, resolve_candidate_profile,
-    normalize_email, normalize_phone, resume_extraction_snapshot,
+    enrich_profile, normalize_email, normalize_phone, resume_extraction_snapshot, warehouse_extraction,
 )
 from .resume_comparison import comparison_dict, ensure_resume_version_comparison, sync_resume_version_skills
 from .candidate_search import (
@@ -75,6 +78,7 @@ from .candidate_search_calibration import CALIBRATION_METHOD, fit_platt_calibrat
 from .embedding_service import EmbeddingUnavailable, get_embedding_service
 from .reranker_service import RerankerUnavailable, get_reranker_service
 from .semantic_index import index_resume_versions
+from .skill_catalog import display_name, resolve_filter_keys, seed_skill_catalog, skill_keys
 from .pipeline import extract_requirements, generate_interview_kit, screen_candidate
 from .resume import (
     CONTENT_TYPES,
@@ -133,8 +137,26 @@ def ensure_local_hr_membership() -> None:
         db.add(TenantMembership(tenant_id=LEADER_USER_ID, user_id=HR_USER_ID, role="ADMIN", status="ACTIVE"))
 
 
+async def warn_if_catalog_differs_from_warehouse() -> None:
+    """Non-fatal: both services must read the same catalog, so say loudly when they do not."""
+    if not settings.cv_warehouse_enabled:
+        return
+    try:
+        remote = (await CvWarehouseClient().catalog()).get("fingerprint") or {}
+    except CvWarehouseError as exc:
+        logger.info("Catalog check skipped, warehouse not reachable: %s", exc)
+        return
+    local = shared.catalog_fingerprint()
+    if (remote.get("json_sha256"), remote.get("py_sha256")) != (local["json_sha256"], local["py_sha256"]):
+        logger.warning("Skill catalog differs from the CV warehouse's (here %s, there %s): run `make catalog-sync` "
+                       "and restart both services", local["version"], remote.get("version"))
+
+
 async def lifespan(_: FastAPI):
     ensure_resume_bucket()
+    with session_scope() as db:
+        seed_skill_catalog(db.connection())
+    await warn_if_catalog_differs_from_warehouse()
     if not settings.auth_required:
         ensure_local_hr_membership()
     if settings.auto_seed:
@@ -248,8 +270,15 @@ class ClearRecruitmentData(BaseModel):
 class CandidateSearchFilters(BaseModel):
     minimum_experience: float | None = Field(default=None, ge=0, le=60)
     latest_cv_only: bool = False
+    # Catalog ids, names or aliases ("k8s" finds Kubernetes); ids from the skills table work too.
     required_skill_ids: list[str] = Field(default_factory=list, max_length=30)
     preferred_skill_ids: list[str] = Field(default_factory=list, max_length=30)
+    # Share of required_skill_ids a CV must carry; 1.0 keeps "all of them".
+    minimum_skill_coverage: float = Field(default=1.0, ge=0, le=1)
+    # Category code / label / role: a hard filter. Without it the category the query clearly targets
+    # only boosts matching CVs, and `auto_specialization=false` switches even that off.
+    specialization: str | None = Field(default=None, max_length=80)
+    auto_specialization: bool = True
 
 
 class CandidateSearchRequest(BaseModel):
@@ -272,6 +301,8 @@ class CvWarehouseFilters(BaseModel):
     minimum_experience: float | None = Field(default=None, ge=0, le=60)
     maximum_experience: float | None = Field(default=None, ge=0, le=60)
     specialization: str | None = Field(default=None, max_length=40)
+    auto_specialization: bool = True
+    minimum_skill_coverage: float = Field(default=1.0, ge=0, le=1)
     location: str | None = Field(default=None, max_length=200)
     source: str | None = Field(default=None, max_length=120)
 
@@ -658,6 +689,24 @@ def decided_by(actor: dict[str, str] | None) -> dict[str, str | None]:
             "decided_by_email": (actor or {}).get("email") or None}
 
 
+def close_evidence_approvals(db, owner_id: str, application_id: str, decision: str,
+                             actor: dict[str, str] | None) -> int:
+    """A recruiter decision on the candidate settles the pending "check the evidence" request.
+
+    Without this the inbox kept showing a candidate who had already been rejected or invited, with
+    the action buttons greyed out and no way left to clear the card."""
+    pending = db.scalars(select(ApprovalRequest).where(
+        ApprovalRequest.owner_id == owner_id, ApprovalRequest.application_id == application_id,
+        ApprovalRequest.request_type == "EVIDENCE", ApprovalRequest.status == "PENDING",
+    )).all()
+    for request in pending:
+        request.status = "APPROVED"
+        request.resolution = {"note": f"Recruiter đã quyết định ứng viên: {decision}",
+                              "via": "application_review", **decided_by(actor)}
+        request.decided_at = utcnow()
+    return len(pending)
+
+
 def application_dict(item: Application) -> dict:
     screening = item.screening or {}
     if "final_score" not in screening:
@@ -825,7 +874,7 @@ async def build_application(db, owner_id: str, job: Job, name: str, email: str, 
         db, profile=profile, storage_key=application_id, original_filename=filename,
         file_size=size, checksum=digest, extracted_text=text,
         extraction=resume_extraction_snapshot(
-            name=name, email=email, phone=phone, screening=result,
+            name=name, email=email, phone=phone, screening=result, resume_text=text,
         ),
     )
     item = Application(id=application_id, owner_id=owner_id, job_id=job.id, batch_id=batch_id,
@@ -1357,7 +1406,8 @@ def live() -> dict:
 def health() -> dict:
     queue = queue_summary()
     return {"status": "ok" if queue["reachable"] else "degraded", "service": "talentflow-api", "ai": llm_config(),
-            "queue": queue, "embedding": get_embedding_service().status(),
+            "catalog_version": shared.catalog_version(),
+            "catalog_sha256": shared.catalog_fingerprint(), "queue": queue, "embedding": get_embedding_service().status(),
             "auth_required": get_settings().auth_required,
             "environment": get_settings().environment,
             "integrations": {"provider": get_settings().integration_provider,
@@ -1371,7 +1421,16 @@ def ready(response: Response) -> dict:
         report = readiness_report(db, get_settings(), queue_summary())
     if report["status"] != "ready":
         response.status_code = 503
-    return report
+    return {**report, "catalog_version": shared.catalog_version(), "catalog_sha256": shared.catalog_fingerprint()}
+
+
+@app.get("/api/catalog")
+def catalog_summary() -> dict:
+    """The shared skill catalog (same file the CV warehouse uses) and how much of it is loaded in the database."""
+    catalog = shared.load_catalog()
+    return {"version": catalog.version, "entries": len(catalog.entries), "fingerprint": shared.catalog_fingerprint(),
+            "categories": [{"code": item.code, "label": item.label, "role": item.role} for item in catalog.categories],
+            "kinds": dict(sorted(Counter(entry.kind for entry in catalog.entries).items()))}
 
 
 @app.get("/api/operations/readiness")
@@ -1670,11 +1729,71 @@ def list_candidate_profiles(
         return [candidate_profile_dict(db, value) for value in values]
 
 
+@dataclass(frozen=True)
+class SearchIntent:
+    """What a search is asking for, after reading the query and the filters with the shared catalog."""
+    required: tuple[str, ...] = ()
+    preferred: tuple[str, ...] = ()
+    category: str | None = None
+    category_is_explicit: bool = False
+
+
+def _coverage_report(ranked, wanted: SearchIntent | None) -> dict:
+    required = len(wanted.required) if wanted else 0
+    preferred = len(wanted.preferred) if wanted else 0
+    return {
+        "required": round(len(ranked.matched_required_skills) / required, 4) if required else None,
+        "required_total": required,
+        "preferred": round(len(ranked.matched_preferred_skills) / preferred, 4) if preferred else None,
+        "preferred_matched": [display_name(key) for key in ranked.matched_preferred_skills],
+    }
+
+
+def _category_report(ranked, wanted: SearchIntent | None) -> dict:
+    label = shared.category_by_code().get(ranked.category or "")
+    query_label = shared.category_by_code().get(wanted.category) if wanted and wanted.category else None
+    return {
+        "candidate": ranked.category, "candidate_label": label.label if label else None,
+        "query": wanted.category if wanted else None, "query_label": query_label.label if query_label else None,
+        "matched": None if not (wanted and wanted.category and ranked.category) else ranked.category == wanted.category,
+        "filter": "EXPLICIT" if wanted and wanted.category_is_explicit else ("BOOST" if wanted and wanted.category else None),
+    }
+
+
+def _version_category(version: CandidateResumeVersion) -> str | None:
+    extraction = version.extraction if isinstance(version.extraction, dict) else {}
+    profile = extraction.get("profile") if isinstance(extraction.get("profile"), dict) else {}
+    catalog = profile.get("catalog") if isinstance(profile.get("catalog"), dict) else {}
+    value = catalog.get("category")
+    return value if value in shared.category_by_code() else None
+
+
+CATEGORY_BOOST = 0.12
+
+
+def _search_intent(db, payload: CandidateSearchRequest, query: str) -> SearchIntent:
+    """Explicit filters win; otherwise skills and category are read from the query text like a JD."""
+    explicit_required = resolve_filter_keys(db, payload.filters.required_skill_ids)
+    explicit_preferred = resolve_filter_keys(db, payload.filters.preferred_skill_ids)
+    stated = payload.filters.specialization
+    category = (shared.normalize_code(stated) or (shared.UNCLASSIFIED if stated.strip().upper() == shared.UNCLASSIFIED else None)) if stated else None
+    if stated and not category:
+        raise HTTPException(422, "Ngành không thuộc 10 nhóm cố định")
+    from_query = extract_requirements(query)
+    required = explicit_required or shared.technical_ids(from_query["required_skill_ids"])
+    preferred = [key for key in (explicit_preferred or shared.technical_ids(from_query["preferred_skill_ids"]))
+                 if key not in required]
+    if not category and payload.filters.auto_specialization:
+        category = from_query["category"]
+    return SearchIntent(tuple(required), tuple(preferred), category, bool(stated))
+
+
 def _search_result(db, ranked, profiles: dict[str, CandidateProfile],
                    versions: dict[str, CandidateResumeVersion],
                    entries: dict[str, ResumeVersionEmbedding], *, mode: str,
                    result_event_id: str | None = None,
-                   calibration_version: str | None = None) -> dict:
+                   calibration_version: str | None = None,
+                   wanted: "SearchIntent | None" = None) -> dict:
     profile = profiles[ranked.candidate_profile_id]
     version = versions[ranked.matched_version_id]
     other_versions = [versions[value] for value in ranked.other_matching_version_ids if value in versions]
@@ -1708,10 +1827,12 @@ def _search_result(db, ranked, profiles: dict[str, CandidateProfile],
         "business": {
             key: value for key, value in ranked.score_components.items() if key != "semantic"
         },
-        "matched_skills": list(ranked.matched_required_skills) or list(
+        "matched_skills": [display_name(key) for key in ranked.matched_required_skills] or list(
             entries[version.id].canonical_skills or []
         ),
-        "missing_skills": list(ranked.missing_required_skills),
+        "missing_skills": [display_name(key) for key in ranked.missing_required_skills],
+        "coverage": _coverage_report(ranked, wanted),
+        "category": _category_report(ranked, wanted),
         "evidence": [dict(value) for value in ranked.evidence],
         "other_matching_versions": [
             {"id": value.id, "version": value.version_number, "filename": value.version_filename}
@@ -1760,7 +1881,7 @@ def _candidate_search_matches(
             # Keep semantic_similarity on the same [-1, 1] scale as cosine.
             similarity = overlap * 2 - 1
             lexical_overlap = overlap
-        skills = frozenset(str(value).casefold() for value in (entry.canonical_skills or []))
+        skills = frozenset(skill_keys(str(value) for value in (entry.canonical_skills or [])))
         if best_hit:
             evidence = ({
                 "text": best_hit.text,
@@ -1787,6 +1908,7 @@ def _candidate_search_matches(
             experience_years=entry.experience_years,
             submitted_at=version.submitted_at,
             evidence=evidence,
+            category=_version_category(version),
         ))
     return matches
 
@@ -1844,17 +1966,24 @@ def search_candidate_profiles(
             ),
             lexical_weight=get_settings().candidate_search_lexical_weight,
         )
-        required = [value.strip().casefold() for value in payload.filters.required_skill_ids if value.strip()]
-        preferred = [value.strip().casefold() for value in payload.filters.preferred_skill_ids if value.strip()]
+        intent = _search_intent(db, payload, query)
+        # Required skills named in the filters always gate; the query's own skills gate only when the
+        # caller sets minimum_skill_coverage, otherwise they just weigh on the score.
+        gate = resolve_filter_keys(db, payload.filters.required_skill_ids) or (
+            list(intent.required) if "minimum_skill_coverage" in payload.filters.model_fields_set else [])
+        matches = [item for item in matches
+                   if not gate or len(item.skill_ids & set(gate)) / len(gate) >= payload.filters.minimum_skill_coverage]
         ranked = rank_candidate_versions(
             matches,
-            required_skill_ids=required,
-            preferred_skill_ids=preferred,
+            required_skill_ids=intent.required,
+            preferred_skill_ids=intent.preferred,
             minimum_experience=payload.filters.minimum_experience,
-            required_skills_are_hard_filter=bool(required),
             minimum_experience_is_hard_filter=payload.filters.minimum_experience is not None,
             lexical_weight=get_settings().candidate_search_lexical_weight,
             limit=max(payload.limit, get_reranker_service().config.top_k),
+            category=intent.category,
+            category_weight=CATEGORY_BOOST,
+            category_is_hard_filter=intent.category_is_explicit,
         )
         if mode == "KEYWORD_FALLBACK":
             ranked = [value for value in ranked if value.score_components["semantic"] > 50]
@@ -1934,6 +2063,7 @@ def search_candidate_profiles(
                 db, value, profiles, versions_by_id, entries_by_version, mode=mode,
                 result_event_id=result_events[value.candidate_profile_id].id,
                 calibration_version=calibration.version if calibration else None,
+                wanted=intent,
             )
                         for value in ranked],
         }
@@ -2298,20 +2428,7 @@ async def import_cv_warehouse_profiles(
                     email=email, phone=phone,
                 )
                 storage_key = f"warehouse-{uuid4()}"
-                extraction = {
-                    "candidate": {"name": name, "email": email, "phone": phone},
-                    "profile": {
-                        "skills": list(remote.get("skills") or []),
-                        "experience_years": float(remote.get("experience_years") or 0),
-                        "education": [],
-                        "summary": str(remote.get("job_title") or ""),
-                        "specialization": str(remote.get("specialization") or ""),
-                        "extraction_source": "cv_warehouse",
-                    },
-                    "evidence": [], "screening_source": "cv_warehouse",
-                    "source": {"system": "CV_WAREHOUSE", "cv_id": cv_id,
-                               "warehouse_updated_at": remote.get("updated_at")},
-                }
+                extraction = warehouse_extraction(remote, cv_id, text)
                 version = create_resume_version(
                     db, profile=profile, storage_key=storage_key,
                     original_filename=str(remote.get("original_filename") or f"{cv_id}.txt"),
@@ -2342,25 +2459,25 @@ async def import_cv_warehouse_profiles(
     }
 
 
+async def _list_remote_cvs(client: CvWarehouseClient, owner_id: str) -> list[dict]:
+    items: list[dict] = []
+    try:
+        while True:
+            page = list((await client.list_cvs(owner_id, limit=100, offset=len(items))).get("items") or [])
+            items.extend(page)
+            if len(page) < 100:
+                return items
+    except CvWarehouseError as exc:
+        raise _warehouse_http_error(exc) from exc
+
+
 @app.post("/api/cv-warehouse/sync")
 async def sync_all_cv_warehouse_profiles(
     owner_id: str = Depends(current_tenant_id),
     actor: dict[str, str] = Depends(current_actor),
 ) -> dict:
     """Pull every CV missing from TalentFlow; compare checksums before downloading files."""
-    client = CvWarehouseClient()
-    remote_items: list[dict] = []
-    offset = 0
-    try:
-        while True:
-            page = await client.list_cvs(owner_id, limit=100, offset=offset)
-            items = list(page.get("items") or [])
-            remote_items.extend(items)
-            if len(items) < 100:
-                break
-            offset += len(items)
-    except CvWarehouseError as exc:
-        raise _warehouse_http_error(exc) from exc
+    remote_items = await _list_remote_cvs(CvWarehouseClient(), owner_id)
 
     with session_scope() as db:
         existing_checksums = set(db.scalars(select(CandidateResumeVersion.checksum).where(
@@ -2406,6 +2523,65 @@ async def sync_all_cv_warehouse_profiles(
         "skipped": len(result["skipped"]),
     }
     return result
+
+
+REFRESH_BATCH = 50
+
+
+def _refreshed_extraction(version: CandidateResumeVersion, remote: dict | None) -> dict:
+    """Re-read one stored CV: an imported CV takes the warehouse's current extraction, any other keeps its
+    own screening evidence and gains what the shared catalog reads from its text."""
+    old = version.extraction if isinstance(version.extraction, dict) else {}
+    if remote and old.get("screening_source") == "cv_warehouse":
+        return warehouse_extraction(remote, str(remote.get("id") or ""), version.extracted_text)
+    profile = old.get("profile") if isinstance(old.get("profile"), dict) else {}
+    roles = profile.get("roles") or []
+    return {**old, "profile": enrich_profile(profile, version.extracted_text,
+                                              title=str(roles[0]) if roles else "", provided=remote)}
+
+
+@app.post("/api/cv-warehouse/refresh")
+async def refresh_cv_warehouse_profiles(
+    reindex: bool = Query(default=True),
+    owner_id: str = Depends(require_tenant_role("OWNER", "ADMIN")),
+) -> dict:
+    """Update the extraction of CVs that are already in TalentFlow, in place and without new versions.
+
+    Imported CVs take the warehouse's current skills / category / level; every other CV is re-read from its
+    text with the shared catalog. Changed versions are re-indexed unless `reindex=false`.
+    """
+    remote_by_checksum = {str(item.get("checksum")): item
+                          for item in await _list_remote_cvs(CvWarehouseClient(), owner_id) if item.get("checksum")}
+    with session_scope() as db:
+        version_ids = list(db.scalars(select(CandidateResumeVersion.id).where(
+            CandidateResumeVersion.owner_id == owner_id,
+        ).order_by(CandidateResumeVersion.submitted_at)))
+    summary = {"versions": len(version_ids), "refreshed": 0, "unchanged": 0, "from_warehouse": 0,
+               "indexed": 0, "chunks_indexed": 0, "index_warnings": []}
+    for start in range(0, len(version_ids), REFRESH_BATCH):
+        with session_scope() as db:
+            versions = list(db.scalars(select(CandidateResumeVersion).where(
+                CandidateResumeVersion.id.in_(version_ids[start:start + REFRESH_BATCH]),
+            )))
+            changed: list[CandidateResumeVersion] = []
+            for version in versions:
+                remote = remote_by_checksum.get(version.checksum)
+                summary["from_warehouse"] += bool(remote)
+                refreshed = _refreshed_extraction(version, remote)
+                if refreshed == version.extraction:
+                    summary["unchanged"] += 1
+                    continue
+                version.extraction, version.extracted_at = refreshed, utcnow()
+                sync_resume_version_skills(db, version)
+                changed.append(version)
+            summary["refreshed"] += len(changed)
+            if reindex and changed:
+                result = index_resume_versions(db, changed)
+                summary["indexed"] += int(result.get("indexed") or 0)
+                summary["chunks_indexed"] += int(result.get("chunks_indexed") or 0)
+                if result.get("warning"):
+                    summary["index_warnings"].append(str(result["warning"]))
+    return {"source": "CV_WAREHOUSE", "summary": summary, "catalog_version": shared.catalog_version()}
 
 
 @app.post("/api/cv-warehouse/search")
@@ -3056,8 +3232,8 @@ async def get_interview_kit(application_id: str, owner_id: str = Depends(current
 
 @app.post("/api/application-batches", status_code=202)
 async def create_batch(job_id: str = Form(...), files: list[UploadFile] = File(...), owner_id: str = Depends(current_tenant_id)) -> dict:
-    if not 1 <= len(files) <= 20:
-        raise HTTPException(422, "Mỗi batch phải có từ 1 đến 20 CV")
+    if not 1 <= len(files) <= 50:
+        raise HTTPException(422, "Mỗi batch phải có từ 1 đến 50 CV")
     task_ids: list[str] = []
     with session_scope() as db:
         job = require_job(db, job_id, owner_id)
@@ -3296,8 +3472,54 @@ def review(application_id: str, payload: ReviewCreate, owner_id: str = Depends(c
         item.status = statuses[decision]; item.review = payload.model_dump(); item.pipeline = pipeline("completed")
         item.status_changed_at = utcnow()
         item.status_changed_by = actor.get("email") or actor.get("name") or ""
+        if decision in {ReviewDecision.REJECT.value, ReviewDecision.ARCHIVE.value, ReviewDecision.INTERVIEW.value}:
+            close_evidence_approvals(db, owner_id, item.id, decision, actor)
         audit(db, owner_id, item.id, "RECRUITER_REVIEWED", payload.model_dump(), actor=actor)
         return application_dict(item)
+
+
+class ProfileApplicationCreate(BaseModel):
+    job_id: str
+    resume_version_id: str | None = None
+
+
+@app.post("/api/candidate-profiles/{profile_id}/applications", status_code=201)
+async def create_application_from_profile(
+    profile_id: str, payload: ProfileApplicationCreate,
+    owner_id: str = Depends(current_tenant_id),
+    actor: dict[str, str] = Depends(current_actor),
+) -> dict:
+    """Put a talent-pool candidate into a job so they can be interviewed from the recruiting pipeline.
+
+    Re-uses the stored CV text (no re-upload) and returns the existing application when this candidate
+    is already attached to the job, so inviting twice never creates a duplicate card."""
+    with session_scope() as db:
+        profile = db.get(CandidateProfile, profile_id)
+        if not profile or profile.owner_id != owner_id:
+            raise HTTPException(404, "Candidate profile not found")
+        job = require_job(db, payload.job_id, owner_id)
+        if (job.requirements or {}).get("approval", {}).get("status") != "APPROVED":
+            raise HTTPException(409, "Tin tuyển dụng chưa được duyệt tiêu chí")
+        existing = db.scalar(select(Application).where(
+            Application.owner_id == owner_id, Application.job_id == job.id,
+            Application.candidate_profile_id == profile.id,
+        ).order_by(Application.created_at.desc()))
+        if existing:
+            return {"created": False, "application": application_dict(existing)}
+        versions = db.scalars(select(CandidateResumeVersion).where(
+            CandidateResumeVersion.candidate_profile_id == profile.id, CandidateResumeVersion.owner_id == owner_id,
+        ).order_by(CandidateResumeVersion.version_number.desc())).all()
+        version = next((item for item in versions if item.id == payload.resume_version_id), None) \
+            if payload.resume_version_id else (versions[0] if versions else None)
+        if not version or len((version.extracted_text or "").strip()) < 20:
+            raise HTTPException(409, "Hồ sơ chưa có CV đủ nội dung để đưa vào tin tuyển dụng")
+        item = await build_application(
+            db, owner_id, job, profile.full_name, profile.email or "", version.extracted_text,
+            filename=version.original_filename, size=version.file_size, digest=version.checksum,
+        )
+        audit(db, owner_id, item.id, "APPLICATION_CREATED_FROM_PROFILE",
+              {"profile_id": profile.id, "job_id": job.id, "resume_version_id": version.id}, actor=actor)
+        return {"created": True, "application": application_dict(item)}
 
 
 @app.delete("/api/applications/{application_id}")
@@ -4101,7 +4323,7 @@ def seed(owner_id: str = "00000000-0000-0000-0000-000000000001") -> None:
             extracted_text=SAMPLE_CV,
             extraction=resume_extraction_snapshot(
                 name="Nguyễn Minh Anh", email="minhanh@example.com", phone=seed_phone,
-                screening=screening,
+                screening=screening, resume_text=SAMPLE_CV,
             ),
         )
         db.add(Application(id="app-001", owner_id=owner_id, job_id=job.id,

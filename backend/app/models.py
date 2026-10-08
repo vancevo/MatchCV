@@ -149,6 +149,8 @@ class Skill(Base):
     canonical_name: Mapped[str] = mapped_column(String(120), unique=True)
     normalized_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     category: Mapped[str] = mapped_column(String(80), default="OTHER")
+    # Stable id in the shared catalog (shared/catalog/catalog.json); null for skills created by hand.
+    catalog_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

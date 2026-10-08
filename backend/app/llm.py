@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from .config import get_settings
+from .skill_catalog import skill_key
 from .pipeline import analyze_evidence, extract_requirements, generate_interview_kit, screen_candidate
 from .talentflow_model import (
     candidate_profile_from_schema,
@@ -115,17 +116,32 @@ def _requirements(value: dict[str, Any], fallback: dict[str, Any]) -> dict[str, 
     }
 
 
+def _dedupe_by_skill(*groups: list[str]) -> list[str]:
+    """One entry per catalog skill, in first-seen order, spelled the way the last group that named it did.
+
+    "Golang" from the model and "Go" from the rules are the same criterion; screening it twice doubled its weight.
+    """
+    spelling: dict[str, str] = {}
+    order: list[str] = []
+    for group in groups:
+        for item in group:
+            key = skill_key(item)
+            if key not in spelling:
+                order.append(key)
+            spelling[key] = item
+    return [spelling[key] for key in order]
+
+
 def _merge_talentflow_requirements(result: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
-    fallback_required = list(fallback.get("required_skills", []))
-    fallback_preferred = list(fallback.get("preferred_skills", []))
-    required = list(dict.fromkeys(fallback_required + result.get("required_skills", [])))
-    required_lookup = {item.casefold() for item in required}
-    preferred = list(dict.fromkeys(result.get("preferred_skills", []) + fallback_preferred))
-    preferred = [item for item in preferred if item.casefold() not in required_lookup]
-    if "sql optimization" in required_lookup:
-        preferred = [item for item in preferred if item.casefold() != "sql"]
+    required = _dedupe_by_skill(list(fallback.get("required_skills", [])), result.get("required_skills", []))
+    required_keys = {skill_key(item) for item in required}
+    preferred = _dedupe_by_skill(result.get("preferred_skills", []), list(fallback.get("preferred_skills", [])))
+    preferred = [item for item in preferred if skill_key(item) not in required_keys]
+    if "sql-optimization" in required_keys:
+        preferred = [item for item in preferred if skill_key(item) != "sql"]
     minimum_experience = max(int(result.get("minimum_experience", 0) or 0), int(fallback.get("minimum_experience", 0) or 0))
     return {
+        **{key: value for key, value in fallback.items() if key not in {"required_skills", "preferred_skills", "minimum_experience", "extraction_source"}},
         "required_skills": required,
         "preferred_skills": preferred,
         "minimum_experience": minimum_experience,

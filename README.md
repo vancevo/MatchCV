@@ -10,7 +10,7 @@ TalentFlow là MVP hỗ trợ recruiter tạo vị trí tuyển dụng, tiếp n
 Tạo JD
   -> trích xuất requirements bằng OpenRouter hoặc rules fallback
   -> recruiter duyệt tiêu chí
-  -> upload tối đa 20 CV PDF/DOCX/TXT
+  -> upload tối đa 50 CV PDF/DOCX/TXT
   -> extract text, nhận diện ứng viên và tạo durable task
   -> Redis/RQ worker đối chiếu kỹ năng + kinh nghiệm + evidence
   -> embedding + calibration; route anomaly/evidence yếu vào approval inbox
@@ -29,7 +29,7 @@ Tạo JD
 - Đăng ký/đăng nhập bằng Supabase Auth khi có cấu hình; chế độ local không bắt buộc auth.
 - Tạo job và trích xuất kỹ năng bắt buộc, ưu tiên, số năm kinh nghiệm từ JD.
 - Recruiter phê duyệt tiêu chí trước khi dùng cho quy trình tuyển dụng.
-- Upload một batch từ 1–20 CV, hỗ trợ PDF, DOCX, TXT; mỗi file tối đa 10 MB.
+- Upload một batch từ 1–50 CV, hỗ trợ PDF, DOCX, TXT; mỗi file tối đa 10 MB.
 - API trả `202 Accepted`; từng CV có task/run/step bền vững và được worker xử lý độc lập.
 - Retry có backoff, timeout, RQ failed registry và nút retry từng CV lỗi.
 - Dedupe bằng SHA-256 trong phạm vi recruiter + job; CV trùng liên kết về application đã có.

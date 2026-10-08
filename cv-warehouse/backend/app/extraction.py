@@ -7,20 +7,14 @@ from pathlib import Path
 from docx import Document
 from pypdf import PdfReader
 
+from .catalog import catalog as shared
+
 
 CONTENT_TYPES = {
     "application/pdf": ".pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
     "text/plain": ".txt",
 }
-
-SKILLS = (
-    "Python", "Java", "JavaScript", "TypeScript", "React", "Next.js", "Vue", "Angular",
-    "Node.js", "FastAPI", "Django", "Spring Boot", ".NET", "C#", "C++", "Go", "Rust",
-    "PHP", "Laravel", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Docker", "Kubernetes",
-    "AWS", "Azure", "GCP", "Terraform", "Jenkins", "GitHub Actions", "Kafka", "Spark",
-    "PyTorch", "TensorFlow", "Machine Learning", "NLP", "Computer Vision", "SQL", "Selenium",
-)
 
 
 def extract_text(data: bytes, content_type: str, filename: str) -> str:
@@ -35,39 +29,56 @@ def extract_text(data: bytes, content_type: str, filename: str) -> str:
     raise ValueError("Chỉ hỗ trợ PDF, DOCX và TXT")
 
 
+NON_NAME_LINES = {
+    "curriculum vitae", "resume", "cv", "profile", "summary", "contact", "skills", "experience",
+    "education", "technical skills", "hồ sơ", "lý lịch", "thông tin cá nhân",
+}
+
+
+def guess_name(lines: list[str], filename: str) -> str:
+    """Pick the candidate name from the header, skipping avatar initials, headings and contact lines."""
+    for line in lines[:8]:
+        words = line.split()
+        if not 2 <= len(words) <= 6 or len(line) > 60:
+            continue
+        if line.casefold() in NON_NAME_LINES or re.search(r"[@\d:/|]", line):
+            continue
+        if all(word[:1].isupper() and word.replace("'", "").replace("-", "").replace(".", "").isalpha() for word in words):
+            return line
+    return Path(filename).stem.replace("_", " ").replace("-", " ")[:200]
+
+
+def guess_title(lines: list[str], name: str) -> str:
+    """The headline right under the candidate name (e.g. "QA Intern"), or "" when there is none."""
+    if name not in lines:
+        return ""
+    for line in lines[lines.index(name) + 1:][:2]:
+        if len(line) <= 80 and not re.search(r"[@|:]|https?", line):
+            return line
+    return ""
+
+
 def extract_metadata(text: str, filename: str) -> dict:
+    """Header fields plus everything the shared catalog can read from the CV (skills, category, level...)."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     email_match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
     phone_match = re.search(r"(?<!\d)(?:\+?84|0)[\d .()-]{8,13}(?!\d)", text)
     years = [float(value) for value in re.findall(r"(\d+(?:\.\d+)?)\s*(?:\+\s*)?(?:years?|năm)", text, re.I)]
-    lowered = text.casefold()
-    skills = [skill for skill in SKILLS if skill.casefold() in lowered]
-    specialization = "OTHER"
-    groups = {
-        "AI_ML": ("machine learning", "pytorch", "tensorflow", "nlp", "computer vision", "ai engineer"),
-        "DATA": ("data engineer", "data analyst", "spark", "etl", "data warehouse"),
-        "DEVOPS": ("devops", "kubernetes", "terraform", "jenkins", "sre"),
-        "MOBILE": ("android", "ios", "flutter", "react native"),
-        "QA": ("qa engineer", "tester", "selenium", "quality assurance"),
-        "FRONTEND": ("frontend", "react", "vue", "angular"),
-        "BACKEND": ("backend", "fastapi", "django", "spring boot", "node.js"),
-        "FULLSTACK": ("fullstack", "full-stack", "full stack"),
-        "SECURITY": ("security engineer", "cybersecurity", "pentest"),
-    }
-    for name, terms in groups.items():
-        if any(term in lowered for term in terms):
-            specialization = name
-            break
-    name = lines[0][:200] if lines else Path(filename).stem
-    if "@" in name or len(name.split()) > 8:
-        name = Path(filename).stem.replace("_", " ").replace("-", " ")[:200]
+    name = guess_name(lines, filename)
+    job_title = guess_title(lines, name)
+    profile = shared.extract_cv_profile(text, job_title)
     return {
         "full_name": name or "Ứng viên chưa xác định",
         "email": email_match.group(0) if email_match else "",
         "phone": phone_match.group(0) if phone_match else "",
-        "skills": skills,
+        "job_title": job_title,
+        "skills": profile["skills"],
         "experience_years": max(years, default=0.0),
-        "specialization": specialization,
+        "specialization": profile["category"],
+        "education_level": profile["education_level"],
+        "languages": profile["languages"],
+        "level": profile["level"] or "",
+        "certifications": profile["certifications"],
     }
 
 

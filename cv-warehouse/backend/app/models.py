@@ -29,6 +29,10 @@ class CvDocument(Base):
     experience_years: Mapped[float] = mapped_column(Float, default=0.0, index=True)
     education_level: Mapped[str] = mapped_column(String(120), default="")
     languages: Mapped[list] = mapped_column(JSON, default=list)
+    level: Mapped[str] = mapped_column(String(40), default="")
+    certifications: Mapped[list] = mapped_column(JSON, default=list)
+    # Derived fields a person corrected by hand; re-extraction leaves them alone.
+    edited_fields: Mapped[list] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(120), default="UPLOAD", index=True)
     original_filename: Mapped[str] = mapped_column(String(255))
     storage_key: Mapped[str] = mapped_column(String(255), unique=True)

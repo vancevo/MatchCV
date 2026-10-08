@@ -461,6 +461,16 @@ function RecruiterApp() {
   const [me, setMe] = useState<{ role: string } | null>(null);
   const [criteriaJob, setCriteriaJob] = useState<Job | null>(null);
   const [candidateTab, setCandidateTab] = useState("all");
+  const [profileInvite, setProfileInvite] = useState<{ profile: { id: string; name: string }; versionId?: string; jobId: string } | null>(null);
+  const [goToInterviews, setGoToInterviews] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(false);
+  useEffect(() => {
+    try { if (localStorage.getItem("agentCardOpen") === "1") setAgentOpen(true); } catch { /* storage unavailable */ }
+  }, []);
+  const toggleAgent = () => setAgentOpen(open => {
+    try { localStorage.setItem("agentCardOpen", open ? "0" : "1"); } catch { /* storage unavailable */ }
+    return !open;
+  });
   const [slots, setSlots] = useState<{ start_at: string; duration_minutes: number }[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<ProgressState | null>(null);
@@ -644,6 +654,29 @@ function RecruiterApp() {
     });
   };
 
+  // Mời phỏng vấn từ kho hồ sơ ứng viên: đưa hồ sơ vào tin tuyển dụng đã chọn, rồi đi tiếp đúng luồng mời
+  // phỏng vấn (xem lịch bận -> gửi link chọn lịch) để hồ sơ nằm ở tab Phỏng vấn của Hồ sơ ứng tuyển.
+  const inviteFromProfile = async (jobId: string) => {
+    if (!profileInvite) return;
+    const { profile, versionId } = profileInvite;
+    await runAction(`profile-invite-${profile.id}`, "Đang đưa hồ sơ vào tin tuyển dụng", async () => {
+      const result = await request<{ created: boolean; application: Application }>(`/api/candidate-profiles/${profile.id}/applications`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId, resume_version_id: versionId || null }),
+      });
+      const application = result.application;
+      await loadDashboard();
+      setProfileInvite(null);
+      if (application.status.startsWith("INTERVIEW")) {
+        setActive("Ứng viên"); setCandidateTab("interview");
+        notify(`${profile.name} đã được mời phỏng vấn ở vị trí này`);
+        return;
+      }
+      if (application.status === "REJECTED" && !window.confirm(`${profile.name} đã bị từ chối ở vị trí này. Vẫn mời phỏng vấn?`)) return;
+      setGoToInterviews(true); setSelected(application); setModal("invite-schedule");
+    });
+  };
+
   // Mời phỏng vấn đi qua màn hình xem lịch bận (xem review ở trên) trước khi gửi lời mời thật sự.
   const confirmInterviewInvite = async () => {
     if (!current) return;
@@ -659,6 +692,7 @@ function RecruiterApp() {
       });
       if (navigator.clipboard) await navigator.clipboard.writeText(invitation.public_url).catch(() => undefined);
       setModal(null); setSelected(null); await loadDashboard();
+      if (goToInterviews) { setGoToInterviews(false); setActive("Ứng viên"); setCandidateTab("interview"); }
       notify("Đã gửi link chọn lịch cho ứng viên và sao chép link");
     });
   };
@@ -849,7 +883,21 @@ function RecruiterApp() {
           </div>;
         })}
       </nav>
-      <div className="agent-card"><div className="agent-icon"><Icon name="spark"/></div><b>Agent đang hoạt động</b><p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p><div className="agent-progress"><span/></div><small>Dữ liệu đồng bộ từ API</small></div>
+      <div className={`agent-card${agentOpen ? " open" : ""}`}>
+        <button type="button" className="agent-toggle" onClick={toggleAgent} aria-expanded={agentOpen} aria-controls="agent-details"
+                aria-label="Agent đang hoạt động" title={agentOpen ? "Thu gọn" : "Agent đang hoạt động"}>
+          <span className="agent-icon"><Icon name="spark"/><i className="agent-live" aria-hidden="true"/></span>
+          <b>Agent đang hoạt động</b>
+          <i className="agent-chevron" aria-hidden="true"><Icon name="arrow"/></i>
+        </button>
+        <div id="agent-details" className="agent-details" aria-hidden={!agentOpen}>
+          <div className="agent-details-inner">
+            <p>Pipeline đã xử lý {dashboard.metrics.candidates} CV.</p>
+            <div className="agent-progress"><span/></div>
+            <small>Dữ liệu đồng bộ từ API</small>
+          </div>
+        </div>
+      </div>
       <div className="profile"><div className="avatar dark">{localActor === "hr" ? "HR" : "VN"}</div><div><b>{session?.user.email || (localActor === "hr" ? "HR Admin" : LOCAL_ACTOR_NAME)}</b><span>{me?.role === "ADMIN" ? "HR · Admin" : localActor === "leader" ? "Leader" : "Recruiter"}</span></div><button aria-label="Đăng xuất" disabled={actionBusy} onClick={() => void signOut()}>↪</button></div>
     </aside>
     {mobileMenuOpen && <button className="mobile-nav-backdrop" aria-label="Đóng menu" onClick={() => setMobileMenuOpen(false)}/>}
@@ -898,7 +946,9 @@ function RecruiterApp() {
         </section>}
 
         {active === "Việc làm" ? <JobsView jobs={dashboard.jobs} applications={dashboard.applications} actionBusy={actionBusy} pendingAction={pendingAction} onCreate={() => setModal("job")} onDelete={deleteJob} onReviewCriteria={job => { setCriteriaJob(job); setModal("criteria"); }} onApproveShortlist={approveShortlist} onExportReport={exportReport} onJobChanged={loadDashboard}/>
-        : active === "Kho ứng viên" ? <CandidateProfilesView query={query} jobs={dashboard.jobs} onOpenApplication={applicationId => {
+        : active === "Kho ứng viên" ? <CandidateProfilesView query={query} jobs={dashboard.jobs}
+          onInvite={(profile, options) => setProfileInvite({ profile, versionId: options.versionId, jobId: options.jobId })}
+          onOpenApplication={applicationId => {
             const application = dashboard.applications.find(item => item.id === applicationId);
             if (application) { setSelected(application); setActive("Ứng viên"); }
           }}/>
@@ -925,12 +975,12 @@ function RecruiterApp() {
               ["rejected", "Từ chối", dashboard.applications.filter(item => item.status === "REJECTED").length],
               ["archived", "Lưu trữ", dashboard.applications.filter(item => item.status === "ARCHIVED").length],
             ].map(([key, label, count]) => <button key={key} className={candidateTab === key ? "active" : ""} onClick={() => setCandidateTab(String(key))}>{label}<span>{count}</span></button>)}</div>}
-            <div className="table-head"><span>ỨNG VIÊN</span><span>ĐỘ PHÙ HỢP</span><span>TRẠNG THÁI</span><span/></div><div className="candidate-list">
+            <div className="table-head"><div className="head-cols"><span>ỨNG VIÊN</span><span>ĐỘ PHÙ HỢP</span><span>TRẠNG THÁI</span></div><span className="head-actions">THAO TÁC</span></div><div className="candidate-list">
               {filtered.map((item, index) => <div className="candidate-row" key={item.id}>
                 <button className="candidate-open" onClick={() => setSelected(item)}>
                   <span className="person"><i className={`avatar ${["violet","blue","orange"][index%3]}`}>{initials(item.candidate.name)}</i><span>
-                    <b>{item.candidate.name}</b>
-                    <small>{item.candidate.email}</small>
+                    <b title={item.candidate.name}>{item.candidate.name}</b>
+                    <small title={item.candidate.email}>{item.candidate.email}</small>
                     {(() => {
                       const prior = priorSubmissions(item, dashboard.applications, dashboard.jobs);
                       if (!prior.length) return null;
@@ -953,18 +1003,18 @@ function RecruiterApp() {
                   </span>
                 </button>
                 <div className="row-actions">
-                  <button className="why-button" disabled={!item.screening.evidence?.length}
+                  <button className="why-button" aria-label="Vì sao?" disabled={!item.screening.evidence?.length}
                           title={item.screening.evidence?.length ? "Xem vì sao ứng viên được điểm này" : "Chưa có kết quả chấm điểm"}
-                          onClick={() => setExplained(item)}><Icon name="spark"/>Vì sao?</button>
+                          onClick={() => setExplained(item)}><Icon name="spark"/><span className="btn-label">Vì sao?</span></button>
                   <button className="why-button" disabled={resumeBusy === item.id}
                           title="Mở toàn bộ CV ứng viên đã nộp"
-                          onClick={() => void openResumeFor(item)}><Icon name="file"/>{resumeBusy === item.id ? "Đang mở" : "Xem CV"}</button>
+                          onClick={() => void openResumeFor(item)}><Icon name="file"/><span className="btn-label">{resumeBusy === item.id ? "Đang mở" : "Xem CV"}</span></button>
                   <button className="why-button reject" disabled={actionBusy || item.status === "REJECTED"}
                           title={item.status === "REJECTED" ? "Ứng viên này đã bị từ chối" : "Từ chối ngay, không cần mở hồ sơ"}
-                          onClick={() => setRejecting(item)}><Icon name="ban"/>Từ chối</button>
+                          onClick={() => setRejecting(item)}><Icon name="ban"/><span className="btn-label">Từ chối</span></button>
                   <button className="why-button delete" disabled={actionBusy}
                           title="Xoá vĩnh viễn CV và toàn bộ dữ liệu liên quan"
-                          onClick={() => void permanentlyDelete(item)}><Icon name="trash"/>Xoá vĩnh viễn</button>
+                          onClick={() => void permanentlyDelete(item)}><Icon name="trash"/><span className="btn-label">Xoá vĩnh viễn</span></button>
                 </div>
               </div>)}
               {!filtered.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp.</div>}
@@ -983,13 +1033,16 @@ function RecruiterApp() {
     {rejecting && <RejectCandidateDialog application={rejecting} busy={actionBusy}
                                          onClose={() => { if (!actionBusy) setRejecting(null); }}
                                          onConfirm={reason => void rejectFromRow(rejecting, reason)}/>}
-    {current && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
+    {current && !(modal === "invite-schedule" && goToInterviews) && <CandidateDrawer application={current} actionBusy={actionBusy} pendingAction={pendingAction} scoreClass={scoreClass} onClose={() => { if (!actionBusy) setSelected(null); }} onReview={review}/>}
     {modal === "job" && <JobModal submitting={submitting} progress={jobProgress} onClose={() => setModal(null)} onSubmit={createJob}/>}
     {modal === "upload" && <UploadModal jobs={dashboard.jobs} submitting={submitting} progress={uploadProgress} onClose={() => setModal(null)} onSubmit={uploadCV}/>}
     {modal === "criteria" && criteriaJob && <CriteriaModal job={criteriaJob} busy={actionBusy} onClose={() => { setModal(null); setCriteriaJob(null); }} onSubmit={criteria => saveCriteria(criteriaJob.id, criteria)}/>}
     {modal === "thresholds" && policy && <ScoreThresholdModal policy={policy} busy={actionBusy} onClose={() => setModal(null)} onSave={saveThresholds}/>}
     {modal === "invite-schedule" && current && <InviteScheduleModal application={current} dashboard={dashboard} myRole={me?.role || "OWNER"}
-                                                                    actionBusy={actionBusy} onClose={() => setModal(null)} onConfirm={confirmInterviewInvite}/>}
+                                                                    actionBusy={actionBusy} onClose={() => { setModal(null); if (goToInterviews) { setGoToInterviews(false); setSelected(null); } }} onConfirm={confirmInterviewInvite}/>}
+    {profileInvite && <ProfileInviteModal name={profileInvite.profile.name} busy={actionBusy}
+      jobs={dashboard.jobs.filter(job => job.requirements?.approval?.status === "APPROVED")} defaultJobId={profileInvite.jobId}
+      onClose={() => { if (!actionBusy) setProfileInvite(null); }} onConfirm={jobId => void inviteFromProfile(jobId)}/>}
     {modal === "schedule" && current && <div className="modal-layer"><div className="modal"><button className="close" disabled={actionBusy} onClick={() => setModal(null)}>×</button><span className="eyebrow">SCHEDULING AGENT</span><h2>Chọn lịch phỏng vấn</h2><p>Các lịch trống được lấy trực tiếp từ API.</p>{pendingAction?.key.startsWith("book-") && <InlineProgress label={pendingAction.label}/>}<div className="slots">{slots.map(slot => <button key={slot.start_at} disabled={actionBusy} onClick={() => void book(slot.start_at)}>{pendingAction?.key === `book-${slot.start_at}` ? "Đang đặt lịch..." : dateLabel(slot.start_at)}<Icon name="arrow"/></button>)}</div></div></div>}
     {toast && <div className="toast"><Icon name="check"/>{toast}</div>}
   </div>;
@@ -1150,8 +1203,8 @@ function RejectCandidateDialog({ application, busy, onClose, onConfirm }: {
   </div>;
 }
 
-function ResumeViewer({ resume, candidateName, onClose }: {
-  resume: Resume; candidateName: string; onClose: () => void;
+function ResumeViewer({ resume, candidateName, onClose, onInvite }: {
+  resume: Resume; candidateName: string; onClose: () => void; onInvite?: () => void;
 }) {
   const [showText, setShowText] = useState(false);
   const fileUrl = resume.file_url?.startsWith("/") ? `${API_URL}${resume.file_url}` : resume.file_url;
@@ -1172,7 +1225,10 @@ function ResumeViewer({ resume, candidateName, onClose }: {
           <p>{resume.filename || "Nộp trực tiếp dạng văn bản"}
             {resume.size ? ` · ${(resume.size / 1024).toFixed(0)} KB` : ""} · {words} từ</p>
         </div>
-        <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+        <div className="resume-header-actions">
+          {onInvite && <button className="primary compact" onClick={onInvite}><Icon name="calendar"/>Mời phỏng vấn</button>}
+          <button className="close" onClick={onClose} aria-label="Đóng">×</button>
+        </div>
       </header>
       {canEmbed && !showText
         ? <iframe className="resume-frame" src={fileUrl || undefined} title={`CV của ${candidateName}`}/>
@@ -3101,6 +3157,28 @@ function selectionToBlocks(selection: Set<string>): { start_at: string; end_at: 
   return blocks;
 }
 
+function ProfileInviteModal({ name, jobs, defaultJobId, busy, onClose, onConfirm }: {
+  name: string; jobs: Job[]; defaultJobId: string; busy: boolean;
+  onClose: () => void; onConfirm: (jobId: string) => void;
+}) {
+  const [jobId, setJobId] = useState(jobs.some(job => job.id === defaultJobId) ? defaultJobId : jobs[0]?.id || "");
+  return <div className="modal-layer"><div className="modal profile-invite-modal">
+    <button className="close" disabled={busy} onClick={onClose}>×</button>
+    <span className="eyebrow">MỜI PHỎNG VẤN</span>
+    <h2>Mời {name} cho vị trí nào?</h2>
+    <p>Hồ sơ sẽ được đưa vào tin tuyển dụng này (tab Hồ sơ ứng tuyển, mục Phỏng vấn), rồi bạn kiểm tra lịch bận trước khi gửi link chọn lịch.</p>
+    {jobs.length ? <label className="profile-invite-field"><span>Tin tuyển dụng đã duyệt</span>
+      <select value={jobId} onChange={event => setJobId(event.target.value)} disabled={busy}>
+        {jobs.map(job => <option key={job.id} value={job.id}>{job.title}{job.department ? ` · ${job.department}` : ""}</option>)}
+      </select></label>
+      : <div className="error-banner">Chưa có tin tuyển dụng nào đã duyệt tiêu chí. Hãy duyệt tiêu chí một tin trước.</div>}
+    <div className="invite-schedule-actions">
+      <button className="secondary" disabled={busy} onClick={onClose}>Để sau</button>
+      <button className="primary" disabled={busy || !jobId} onClick={() => onConfirm(jobId)}><Icon name="calendar"/>{busy ? "Đang xử lý..." : "Tiếp tục"}</button>
+    </div>
+  </div></div>;
+}
+
 function InviteScheduleModal({ application, dashboard, myRole, actionBusy, onClose, onConfirm }: {
   application: Application; dashboard: Dashboard; myRole: string; actionBusy: boolean;
   onClose: () => void; onConfirm: () => Promise<void>;
@@ -3582,10 +3660,20 @@ function ComparisonGroup({ tone, title, items }: {
   )}</ul></section>;
 }
 
-function CandidateProfilesView({ query, jobs, onOpenApplication }: {
+type ProfileSearchMemory = {
+  searchMode: CandidateSearchMode; selectedSearchJobId: string; reviewedSearchJobId: string; searchQuery: string;
+  requiredSkills: string; preferredSkills: string; minimumExperience: string; minimumRankingScore: number;
+  maximumRankingScore: number; latestCvOnly: boolean; searchResponse: CandidateSearchResponse | null;
+  fallbackQuery: string; lastSearchLabel: string; feedbackByResult: Record<string, number>;
+};
+// Module-level so it outlives the view: switching tabs unmounts CandidateProfilesView.
+let profileSearchMemory: Partial<ProfileSearchMemory> = {};
+
+function CandidateProfilesView({ query, jobs, onOpenApplication, onInvite }: {
   query: string;
   jobs: Job[];
   onOpenApplication: (applicationId: string) => void;
+  onInvite: (profile: { id: string; name: string }, options: { jobId: string; versionId?: string }) => void;
 }) {
   const [profiles, setProfiles] = useState<CandidateProfile[]>([]);
   const [selectedProfile, setSelectedProfile] = useState<CandidateProfile | null>(null);
@@ -3593,35 +3681,57 @@ function CandidateProfilesView({ query, jobs, onOpenApplication }: {
   const [profileError, setProfileError] = useState("");
   const [versionBusy, setVersionBusy] = useState("");
   const [versionResume, setVersionResume] = useState<Resume | null>(null);
+  const [viewerTarget, setViewerTarget] = useState<{ profile: { id: string; name: string }; versionId: string } | null>(null);
   const [comparisons, setComparisons] = useState<ResumeComparison[]>([]);
   const [comparisonBusy, setComparisonBusy] = useState(false);
   const [comparisonError, setComparisonError] = useState("");
-  const [searchMode, setSearchMode] = useState<CandidateSearchMode>("TEXT");
-  const [selectedSearchJobId, setSelectedSearchJobId] = useState("");
-  const [reviewedSearchJobId, setReviewedSearchJobId] = useState("");
+  const [searchMode, setSearchMode] = useState<CandidateSearchMode>(profileSearchMemory.searchMode ?? "TEXT");
+  const [selectedSearchJobId, setSelectedSearchJobId] = useState(profileSearchMemory.selectedSearchJobId ?? "");
+  const [reviewedSearchJobId, setReviewedSearchJobId] = useState(profileSearchMemory.reviewedSearchJobId ?? "");
   const [criteriaReviewJob, setCriteriaReviewJob] = useState<Job | null>(null);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [requiredSkills, setRequiredSkills] = useState("");
-  const [preferredSkills, setPreferredSkills] = useState("");
-  const [minimumExperience, setMinimumExperience] = useState("");
-  const [minimumRankingScore, setMinimumRankingScore] = useState(0);
-  const [maximumRankingScore, setMaximumRankingScore] = useState(100);
-  const [latestCvOnly, setLatestCvOnly] = useState(false);
-  const [searchResponse, setSearchResponse] = useState<CandidateSearchResponse | null>(null);
+  const [searchQuery, setSearchQuery] = useState(profileSearchMemory.searchQuery ?? "");
+  const [requiredSkills, setRequiredSkills] = useState(profileSearchMemory.requiredSkills ?? "");
+  const [preferredSkills, setPreferredSkills] = useState(profileSearchMemory.preferredSkills ?? "");
+  const [minimumExperience, setMinimumExperience] = useState(profileSearchMemory.minimumExperience ?? "");
+  const [minimumRankingScore, setMinimumRankingScore] = useState(profileSearchMemory.minimumRankingScore ?? 0);
+  const [maximumRankingScore, setMaximumRankingScore] = useState(profileSearchMemory.maximumRankingScore ?? 100);
+  const [latestCvOnly, setLatestCvOnly] = useState(profileSearchMemory.latestCvOnly ?? false);
+  const [searchResponse, setSearchResponse] = useState<CandidateSearchResponse | null>(profileSearchMemory.searchResponse ?? null);
   const [crawlBusy, setCrawlBusy] = useState(false);
   const [crawlMessage, setCrawlMessage] = useState("");
   const [warehouseImportReport, setWarehouseImportReport] = useState<WarehouseImportReport | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const [fallbackQuery, setFallbackQuery] = useState("");
-  const [lastSearchLabel, setLastSearchLabel] = useState("");
-  const [feedbackByResult, setFeedbackByResult] = useState<Record<string, number>>({});
+  const [fallbackQuery, setFallbackQuery] = useState(profileSearchMemory.fallbackQuery ?? "");
+  const [lastSearchLabel, setLastSearchLabel] = useState(profileSearchMemory.lastSearchLabel ?? "");
+  const [feedbackByResult, setFeedbackByResult] = useState<Record<string, number>>(profileSearchMemory.feedbackByResult ?? {});
   const [feedbackBusy, setFeedbackBusy] = useState("");
+
+  // Giữ kết quả tìm kiếm khi chuyển sang tab khác rồi quay lại (component bị gỡ khỏi cây khi đổi tab).
+  useEffect(() => {
+    profileSearchMemory = {
+      searchMode, selectedSearchJobId, reviewedSearchJobId, searchQuery, requiredSkills, preferredSkills,
+      minimumExperience, minimumRankingScore, maximumRankingScore, latestCvOnly, searchResponse,
+      fallbackQuery, lastSearchLabel, feedbackByResult,
+    };
+  }, [searchMode, selectedSearchJobId, reviewedSearchJobId, searchQuery, requiredSkills, preferredSkills,
+    minimumExperience, minimumRankingScore, maximumRankingScore, latestCvOnly, searchResponse,
+    fallbackQuery, lastSearchLabel, feedbackByResult]);
+
+  const loadAllProfiles = async () => {
+    const pageSize = 100;
+    const all: CandidateProfile[] = [];
+    for (let offset = 0; ; offset += pageSize) {
+      const page = await request<CandidateProfile[]>(`/api/candidate-profiles?limit=${pageSize}&offset=${offset}`);
+      all.push(...page);
+      if (page.length < pageSize) return all;
+    }
+  };
 
   useEffect(() => {
     let active = true;
     setLoadingProfiles(true);
-    void request<CandidateProfile[]>("/api/candidate-profiles?limit=100")
+    void loadAllProfiles()
       .then(items => { if (active) { setProfiles(items); setProfileError(""); } })
       .catch(error => { if (active) setProfileError(error instanceof Error ? error.message : "Không tải được kho ứng viên"); })
       .finally(() => { if (active) setLoadingProfiles(false); });
@@ -3685,10 +3795,11 @@ function CandidateProfilesView({ query, jobs, onOpenApplication }: {
     } finally { setComparisonBusy(false); }
   };
 
-  const openVersion = async (profileId: string, versionId: string) => {
+  const openVersion = async (profile: { id: string; name: string }, versionId: string) => {
     setVersionBusy(versionId); setProfileError("");
     try {
-      setVersionResume(await request<Resume>(`/api/candidate-profiles/${profileId}/resume-versions/${versionId}`));
+      setVersionResume(await request<Resume>(`/api/candidate-profiles/${profile.id}/resume-versions/${versionId}`));
+      setViewerTarget({ profile: { id: profile.id, name: profile.name }, versionId });
     } catch (error) {
       setProfileError(error instanceof Error ? error.message : "Không mở được phiên bản CV");
     } finally { setVersionBusy(""); }
@@ -3751,7 +3862,7 @@ function CandidateProfilesView({ query, jobs, onOpenApplication }: {
       const result = await request<WarehouseImportReport>("/api/cv-warehouse/sync", { method: "POST" });
       setCrawlMessage(`Đồng bộ hoàn tất: ${result.summary.imported} CV mới · ${result.summary.skipped} CV đã có · ${result.summary.conflicts + result.summary.failed} conflict/lỗi.`);
       setWarehouseImportReport(result);
-      setProfiles(await request<CandidateProfile[]>("/api/candidate-profiles?limit=100"));
+      setProfiles(await loadAllProfiles());
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Không lấy được CV vào TalentFlow";
@@ -3826,7 +3937,7 @@ function CandidateProfilesView({ query, jobs, onOpenApplication }: {
                 [0, "Không"], [1, "Một phần"], [2, "Phù hợp"], [3, "Rất phù hợp"],
               ] as const).map(([grade, label]) => <button type="button" key={grade} disabled={feedbackBusy === result.result_id} className={feedbackByResult[result.result_id!] === grade ? "active" : ""} onClick={() => void submitSearchFeedback(result.result_id!, grade)}>{label}</button>)}</div>{feedbackByResult[result.result_id] != null && <small>Đã lưu đánh giá · mức 2–3 được tính là phù hợp.</small>}</div>}
             </div>
-            <div className="semantic-actions"><button className="secondary compact" onClick={() => void openProfile(profile)}>Xem profile</button>{result.matched_version && <button className="secondary compact" disabled={versionBusy === result.matched_version.id} onClick={() => void openVersion(profile.id, result.matched_version!.id)}>{versionBusy === result.matched_version.id ? "Đang mở" : `Xem CV v${result.matched_version.version}`}</button>}</div>
+            <div className="semantic-actions"><button className="primary compact" onClick={() => onInvite({ id: profile.id, name: profile.name }, { jobId: searchMode === "JOB" ? selectedSearchJobId : "", versionId: result.matched_version?.id })}><Icon name="calendar"/>Mời phỏng vấn</button><button className="secondary compact" onClick={() => void openProfile(profile)}>Xem profile</button>{result.matched_version && <button className="secondary compact" disabled={versionBusy === result.matched_version.id} onClick={() => void openVersion(profile, result.matched_version!.id)}>{versionBusy === result.matched_version.id ? "Đang mở" : `Xem CV v${result.matched_version.version}`}</button>}</div>
           </article>;
         })}
         {!semanticResults.length && <div className="empty-state">Không tìm thấy ứng viên phù hợp. Hãy mô tả rộng hơn hoặc bỏ bớt bộ lọc.</div>}
@@ -3870,13 +3981,14 @@ function CandidateProfilesView({ query, jobs, onOpenApplication }: {
                 {application.job_title} · {statusLabel(application.status)}
               </button>)}
             </div>
-            <button className="secondary compact" disabled={versionBusy === version.id} onClick={() => void openVersion(selectedProfile.id, version.id)}>{versionBusy === version.id ? "Đang mở" : "Xem CV"}</button>
+            <button className="secondary compact" disabled={versionBusy === version.id} onClick={() => void openVersion(selectedProfile, version.id)}>{versionBusy === version.id ? "Đang mở" : "Xem CV"}</button>
           </article>)}
           {!selectedProfile.resume_versions.length && <p className="resume-history-empty">Ứng viên chưa có phiên bản CV.</p>}
         </section>
       </aside>
     </div>}
-    {versionResume && <ResumeViewer resume={versionResume} candidateName={selectedProfile?.name || "Ứng viên"} onClose={() => setVersionResume(null)}/>}
+    {versionResume && <ResumeViewer resume={versionResume} candidateName={viewerTarget?.profile.name || selectedProfile?.name || "Ứng viên"} onClose={() => setVersionResume(null)}
+      onInvite={viewerTarget ? () => { setVersionResume(null); onInvite(viewerTarget.profile, { jobId: searchMode === "JOB" ? selectedSearchJobId : "", versionId: viewerTarget.versionId }); } : undefined}/>}
     {criteriaReviewJob && <SearchCriteriaReviewModal
       job={criteriaReviewJob}
       initialRequired={reviewedSearchJobId === criteriaReviewJob.id ? requiredSkills.split(",").map(value => value.trim()).filter(Boolean) : criteriaReviewJob.requirements?.required_skills || []}
@@ -4050,5 +4162,5 @@ function UploadModal({ jobs, submitting, progress, onClose, onSubmit }: { jobs: 
   const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
   // Screening runs against approved criteria only, so an unapproved job cannot accept CVs yet.
   const openJobs = jobs.filter(job => job.requirements?.approval?.status === "APPROVED");
-  return <div className="modal-layer"><form className="modal form-modal" onSubmit={onSubmit}><button type="button" className="close" disabled={submitting} onClick={onClose}>×</button><span className="eyebrow">AI SCREENING</span><h2>Tải nhiều CV</h2><p>Chọn tối đa 20 file PDF, DOCX, TXT, mỗi file tối đa 10 MB. Chỉ text extract được lưu.</p><fieldset disabled={submitting}><label>Việc làm<select name="job_id" required disabled={!openJobs.length}>{openJobs.map(job => <option key={job.id} value={job.id}>{job.title}</option>)}</select></label>{!openJobs.length && <p className="upload-blocked">Chưa có vị trí nào duyệt xong tiêu chí. Vào tab “Phê duyệt” duyệt tiêu chí trước, rồi mới tải CV lên được.</p>}<label className={selectedFiles.length ? "file-drop selected" : "file-drop"} htmlFor="cv-file">{selectedFiles.length ? <><i className="file-check">✓</i><b>{selectedFiles.length} CV đã chọn</b><span>{(total / 1024 / 1024).toFixed(2)} MB · Bấm để chọn lại</span></> : <><Icon name="upload"/><b>Chọn nhiều CV từ máy</b><span>PDF, DOCX hoặc TXT</span></>}<input id="cv-file" name="files" type="file" multiple accept=".pdf,.docx,.txt" required onChange={event => setSelectedFiles(Array.from(event.target.files || []).slice(0, 20))}/></label>{selectedFiles.length > 0 && <div className="selected-files">{selectedFiles.map(file => <span key={`${file.name}-${file.size}`}>{file.name}<small>{(file.size / 1024).toFixed(0)} KB</small></span>)}</div>}</fieldset>{progress && <div className="upload-progress" role="status" aria-live="polite"><div><b>{progress.label}</b><strong>{progress.value}%</strong></div><div className="progress-track"><i style={{ width: `${progress.value}%` }}/></div><p>{progress.detail}</p><div className="progress-steps"><span className={progress.value >= 5 ? "done" : ""}>Upload</span><span className={progress.value >= 45 ? "done" : ""}>Extract</span><span className={progress.value >= 65 ? "done" : ""}>AI Profile</span><span className={progress.value >= 82 ? "done" : ""}>Evidence</span></div></div>}<button className="primary submit" disabled={submitting || !selectedFiles.length || !openJobs.length}>{submitting ? progress?.label || "Đang xử lý..." : `Extract ${selectedFiles.length || "nhiều"} CV`}</button></form></div>;
+  return <div className="modal-layer"><form className="modal form-modal" onSubmit={onSubmit}><button type="button" className="close" disabled={submitting} onClick={onClose}>×</button><span className="eyebrow">AI SCREENING</span><h2>Tải nhiều CV</h2><p>Chọn tối đa 50 file PDF, DOCX, TXT, mỗi file tối đa 10 MB. Chỉ text extract được lưu.</p><fieldset disabled={submitting}><label>Việc làm<select name="job_id" required disabled={!openJobs.length}>{openJobs.map(job => <option key={job.id} value={job.id}>{job.title}</option>)}</select></label>{!openJobs.length && <p className="upload-blocked">Chưa có vị trí nào duyệt xong tiêu chí. Vào tab “Phê duyệt” duyệt tiêu chí trước, rồi mới tải CV lên được.</p>}<label className={selectedFiles.length ? "file-drop selected" : "file-drop"} htmlFor="cv-file">{selectedFiles.length ? <><i className="file-check">✓</i><b>{selectedFiles.length} CV đã chọn</b><span>{(total / 1024 / 1024).toFixed(2)} MB · Bấm để chọn lại</span></> : <><Icon name="upload"/><b>Chọn nhiều CV từ máy</b><span>PDF, DOCX hoặc TXT</span></>}<input id="cv-file" name="files" type="file" multiple accept=".pdf,.docx,.txt" required onChange={event => setSelectedFiles(Array.from(event.target.files || []).slice(0, 20))}/></label>{selectedFiles.length > 0 && <div className="selected-files">{selectedFiles.map(file => <span key={`${file.name}-${file.size}`}>{file.name}<small>{(file.size / 1024).toFixed(0)} KB</small></span>)}</div>}</fieldset>{progress && <div className="upload-progress" role="status" aria-live="polite"><div><b>{progress.label}</b><strong>{progress.value}%</strong></div><div className="progress-track"><i style={{ width: `${progress.value}%` }}/></div><p>{progress.detail}</p><div className="progress-steps"><span className={progress.value >= 5 ? "done" : ""}>Upload</span><span className={progress.value >= 45 ? "done" : ""}>Extract</span><span className={progress.value >= 65 ? "done" : ""}>AI Profile</span><span className={progress.value >= 82 ? "done" : ""}>Evidence</span></div></div>}<button className="primary submit" disabled={submitting || !selectedFiles.length || !openJobs.length}>{submitting ? progress?.label || "Đang xử lý..." : `Extract ${selectedFiles.length || "nhiều"} CV`}</button></form></div>;
 }

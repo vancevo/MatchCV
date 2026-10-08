@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy import func, select
 
+from .catalog import catalog as shared
 from .models import Application, CandidateProfile, CandidateResumeVersion, Job, ResumeVersionComparison
 
 
@@ -109,6 +110,14 @@ def create_resume_version(
     extracted_text: str,
     extraction: dict | None = None,
 ) -> CandidateResumeVersion:
+    same_file = db.scalar(select(CandidateResumeVersion).where(
+        CandidateResumeVersion.candidate_profile_id == profile.id,
+        CandidateResumeVersion.owner_id == profile.owner_id,
+        CandidateResumeVersion.checksum == checksum,
+    ))
+    if same_file:
+        # The same bytes for the same candidate are the same CV, not a new version.
+        return same_file
     latest = db.scalar(select(func.max(CandidateResumeVersion.version_number)).where(
         CandidateResumeVersion.candidate_profile_id == profile.id
     )) or 0
@@ -138,8 +147,49 @@ def create_resume_version(
     return version
 
 
+def _merge_unique(*groups) -> list[str]:
+    return list(dict.fromkeys(str(item).strip() for group in groups for item in group if str(item).strip()))
+
+
+def enrich_profile(profile: dict, text: str, *, title: str = "", provided: dict | None = None) -> dict:
+    """Add what the shared catalog reads from the CV text: canonical skills and ids, category, level,
+    certifications and the sections (roles, responsibilities, projects...) that make search documents useful.
+
+    `provided` is the CV warehouse's own extraction. It is trusted when it was produced with the same
+    catalog version, so a CV is classified once; otherwise the text is read again here.
+    """
+    derived = shared.extract_cv_profile(text, title)
+    trusted = provided if provided and provided.get("catalog_version") == derived["catalog_version"] else {}
+    skills = _merge_unique(trusted.get("skills") or derived["skills"])
+    catalog = shared.load_catalog()
+    # Skills the catalog knows are replaced by what the text supports now; a previous run's false positives
+    # ("Go" read out of "Google") must not live on. Names the catalog cannot judge (a model's own) stay.
+    carried = [name for name in profile.get("skills") or [] if catalog.resolve(str(name)) is None]
+    skill_ids = [entry.id for name in skills if (entry := catalog.resolve(name))]
+    category = trusted.get("specialization") or derived["category"]
+    label = shared.category_by_code().get(category)
+    enriched = {
+        **profile,
+        "skills": _merge_unique(carried, skills),
+        "catalog": {
+            "version": derived["catalog_version"], "skill_ids": skill_ids, "category": category,
+            "category_label": f"{label.role} ({label.label})" if label else "",
+            "level": trusted.get("level") or derived["level"] or "",
+            "education_level": trusted.get("education_level") or derived["education_level"],
+            "languages": trusted.get("languages") or derived["languages"],
+            "certifications": trusted.get("certifications") or derived["certifications"],
+            "source": "cv_warehouse" if trusted else "local",
+        },
+    }
+    for key in ("roles", "summary", "responsibilities", "projects", "education"):
+        if not enriched.get(key):
+            enriched[key] = derived[key]
+    return enriched
+
+
 def resume_extraction_snapshot(
     *, name: str, email: str | None, phone: str | None, screening: dict | None,
+    resume_text: str = "", title: str = "", provided: dict | None = None,
 ) -> dict:
     """Freeze the structured extraction that belongs to one CV version."""
     value = screening or {}
@@ -157,11 +207,37 @@ def resume_extraction_snapshot(
             "summary": "",
             "extraction_source": value.get("screening_source", "rules"),
         }
+    if resume_text:
+        structured = enrich_profile(structured, resume_text, title=title, provided=provided)
     return {
         "candidate": {"name": name, "email": email or "", "phone": phone or ""},
         "profile": structured,
         "evidence": value.get("evidence", []) if isinstance(value.get("evidence"), list) else [],
         "screening_source": value.get("screening_source", structured.get("extraction_source", "rules")),
+    }
+
+
+def warehouse_extraction(remote: dict, cv_id: str, text: str) -> dict:
+    """The extraction snapshot for a CV that came from the warehouse, built from the warehouse's own fields."""
+    name = str(remote.get("full_name") or "Ứng viên chưa xác định").strip()
+    profile = enrich_profile(
+        {
+            "skills": list(remote.get("skills") or []),
+            "experience_years": float(remote.get("experience_years") or 0),
+            "education": [],
+            "summary": "",
+            "specialization": str(remote.get("specialization") or ""),
+            "extraction_source": "cv_warehouse",
+        },
+        text, title=str(remote.get("job_title") or ""), provided=remote,
+    )
+    return {
+        "candidate": {"name": name, "email": str(remote.get("email") or "").strip(),
+                      "phone": str(remote.get("phone") or "").strip()},
+        "profile": profile,
+        "evidence": [], "screening_source": "cv_warehouse",
+        "source": {"system": "CV_WAREHOUSE", "cv_id": cv_id,
+                   "warehouse_updated_at": remote.get("updated_at")},
     }
 
 

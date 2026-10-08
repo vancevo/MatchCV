@@ -57,7 +57,9 @@ def test_semantic_search_returns_one_candidate_with_the_best_cv_version():
         assert candidates[0]["result_id"]
         assert candidates[0]["confidence"] is None
         assert candidates[0]["retrieval"]["method"] == "HYBRID_BGE_M3_LEXICAL"
-        assert set(candidates[0]["score_components"]) == {"semantic", "freshness"}
+        # The query names React, so skill coverage joins the score even though no filter was set.
+        assert set(candidates[0]["score_components"]) == {"semantic", "freshness", "required_skills", "category"}
+        assert candidates[0]["coverage"]["required_total"] == 1
         assert sum(candidates[0]["applied_weights"].values()) == pytest.approx(100, abs=0.01)
         assert candidates[0]["matched_version"]["version"] == 2
         assert candidates[0]["other_matching_versions"]

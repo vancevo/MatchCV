@@ -4,10 +4,11 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import { supabase, token } from "../lib/supabase";
 
 type Cv = {
-  id: string; full_name: string; email: string; location: string; specialization: string;
+  id: string; full_name: string; email: string; location: string; specialization: string; specialization_label?: string; job_title?: string;
   skills: string[]; experience_years: number; original_filename: string; updated_at: string;
   ranking_score?: number; evidence?: { text: string }[];
 };
+type Category = { code: string; label: string; role: string; count: number };
 type ProcessState = {
   label: string; detail: string; current?: number; total?: number;
 };
@@ -69,15 +70,31 @@ export default function Home() {
   const [skills, setSkills] = useState("");
   const [experience, setExperience] = useState("");
   const [message, setMessage] = useState("");
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [unclassified, setUnclassified] = useState(0);
+  const [category, setCategory] = useState("");
   const [process, setProcess] = useState<ProcessState | null>(null);
   const busy = process !== null;
 
-  const load = useCallback(async () => {
+  const loadCategories = useCallback(async () => {
+    try {
+      const result = await api<{ categories: Category[]; unclassified: number }>("/api/v1/filters");
+      setCategories(result.categories); setUnclassified(result.unclassified);
+    } catch { /* tabs are optional; the list still works */ }
+  }, []);
+
+  const load = useCallback(async (selected = category) => {
     setProcess({ label: "Đang tải Kho CV", detail: "Đang đồng bộ danh sách CV mới nhất…" });
-    try { setItems((await api<{ items: Cv[] }>("/api/v1/cvs")).items); }
+    try {
+      const filter = selected ? `&specialization=${encodeURIComponent(selected)}` : "";
+      setItems((await api<{ items: Cv[] }>(`/api/v1/cvs?limit=100${filter}`)).items);
+      void loadCategories();
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Không tải được CV"); }
     finally { setProcess(null); }
-  }, []);
+  }, [category, loadCategories]);
+
+  const selectCategory = (code: string) => { setCategory(code); setQuery(""); setMessage(""); void load(code); };
 
   useEffect(() => {
     if (!supabase) return;
@@ -85,7 +102,7 @@ export default function Home() {
     const { data } = supabase.auth.onAuthStateChange((_event, session) => setLoggedIn(Boolean(session)));
     return () => data.subscription.unsubscribe();
   }, [load]);
-  useEffect(() => { if (loggedIn) load(); }, [loggedIn, load]);
+  useEffect(() => { if (loggedIn) void load(); }, [loggedIn]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!sessionReady) return <main className="loading">Đang kiểm tra phiên đăng nhập…</main>;
   if (!loggedIn) return <Login />;
@@ -96,7 +113,7 @@ export default function Home() {
     const formData = new FormData(form);
     const files = formData.getAll("files").filter((value): value is File => value instanceof File && value.size > 0);
     if (!files.length) return setMessage("Hãy chọn ít nhất 1 CV.");
-    if (files.length > 20) return setMessage("Mỗi lần chỉ được upload tối đa 20 CV.");
+    if (files.length > 50) return setMessage("Mỗi lần chỉ được upload tối đa 50 CV.");
     const source = String(formData.get("source") || "UPLOAD");
     let succeeded = 0;
     const failures: string[] = [];
@@ -120,17 +137,20 @@ export default function Home() {
   };
   const search = async (event: FormEvent) => {
     event.preventDefault();
-    if (!query.trim()) return load();
+    if (!query.trim()) return load(category);
     setProcess({ label: "Đang Semantic Search", detail: "BGE-M3 đang đối chiếu query với các chunk CV…" }); setMessage("");
     try {
-      const result = await api<{ mode: string; results: Cv[] }>("/api/v1/cvs/search", {
+      const result = await api<{ mode: string; results: Cv[]; specialization_filter?: { code: string; label: string; source: string } | null }>("/api/v1/cvs/search", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, filters: {
+          specialization: category || null,
           required_skills: skills.split(",").map(value => value.trim()).filter(Boolean),
           minimum_experience: experience ? Number(experience) : null,
         }, limit: 50 }),
       });
-      setItems(result.results); setMessage(`Chế độ tìm kiếm: ${result.mode}`);
+      setItems(result.results);
+      const filter = result.specialization_filter;
+      setMessage(`Chế độ tìm kiếm: ${result.mode}${filter ? ` · ${filter.source === "AUTO" ? "Tự nhận diện ngành" : "Ngành"}: ${filter.label}` : ""}`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Search thất bại"); }
     finally { setProcess(null); }
   };
@@ -147,17 +167,23 @@ export default function Home() {
       {supabase && <button className="ghost" disabled={busy} onClick={() => void logout()}>{process?.label === "Đang đăng xuất" ? "Đang đăng xuất…" : "Đăng xuất"}</button>}</header>
     <section className="hero"><div><small>PRIVATE IT TALENT SOURCE</small><h1>Kho CV tập trung</h1>
       <p>Semantic Search bằng BGE-M3, filter metadata và API riêng cho TalentFlow.</p></div>
-      <form className="upload" onSubmit={upload}><label className="file-picker"><span>Chọn tối đa 20 CV</span><input name="files" type="file" accept=".pdf,.docx,.txt" multiple required disabled={busy}/></label>
+      <form className="upload" onSubmit={upload}><label className="file-picker"><span>Chọn tối đa 50 CV</span><input name="files" type="file" accept=".pdf,.docx,.txt" multiple required disabled={busy}/></label>
         <input name="source" placeholder="Nguồn CV" defaultValue="UPLOAD" disabled={busy}/><button disabled={busy}>{process?.label.includes("upload") ? "Đang xử lý…" : "Thêm CV"}</button></form></section>
-    <form className="search" onSubmit={search}><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Tìm Backend Python, Data Engineer, DevOps…" />
+    <form className="search" onSubmit={search}><input value={query} onChange={event => setQuery(event.target.value)} placeholder={category ? `Tìm trong ngành đã chọn…` : "Tìm Backend Python, Data Engineer, DevOps…"} />
       <input value={skills} onChange={event => setSkills(event.target.value)} placeholder="Kỹ năng bắt buộc, cách nhau dấu phẩy" />
       <input className="years" value={experience} onChange={event => setExperience(event.target.value)} type="number" min="0" placeholder="Số năm" />
       <button disabled={busy}>Semantic Search</button></form>
+    <nav className="categories" aria-label="Ngành CV">
+      <button type="button" className={category === "" ? "active" : ""} onClick={() => selectCategory("")}>Tất cả<span>{categories.reduce((sum, item) => sum + item.count, 0) + unclassified}</span></button>
+      {categories.map((item, index) => <button type="button" key={item.code} title={item.role} className={category === item.code ? "active" : ""} onClick={() => selectCategory(item.code)}>
+        <i>{String(index + 1).padStart(2, "0")}</i>{item.label}<span>{item.count}</span></button>)}
+      {unclassified > 0 && <button type="button" className={category === "UNCLASSIFIED" ? "active" : ""} onClick={() => selectCategory("UNCLASSIFIED")}>Chưa phân loại<span>{unclassified}</span></button>}
+    </nav>
     {process && <ProcessPanel process={process}/>}
     {message && <div className="notice">{message}</div>}
     <section className="grid">{items.map(item => <article key={item.id} className="cv">
       <div className="avatar">{item.full_name.slice(0, 1).toUpperCase()}</div><div><h2>{item.full_name}</h2>
-      <p>{item.specialization} · {item.experience_years} năm {item.location ? `· ${item.location}` : ""}</p>
+      <p>{item.specialization_label || item.specialization}{item.job_title ? ` · ${item.job_title}` : ""} · {item.experience_years} năm {item.location ? `· ${item.location}` : ""}</p>
       <div className="tags">{item.skills.slice(0, 8).map(skill => <span key={skill}>{skill}</span>)}</div>
       {item.ranking_score != null && <b className="score">{item.ranking_score.toFixed(1)} điểm</b>}
       {item.evidence?.[0]?.text && <blockquote>{item.evidence[0].text}</blockquote>}
